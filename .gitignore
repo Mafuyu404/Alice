@@ -1,0 +1,28 @@
+# Claude Code
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment
+.env
+venv/
+.venv/
+
+# Local secrets override (API keys, local-only config)
+config.json
+
+# Generated data
+mem0_data/
+stt_error.log
+models/
+portrait_overlay_state.json
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,245 @@
+# Alice Chat 框架配置文件
+# 真实的 API 密钥不要提交到 git。空密钥会禁用对应的云功能。
+
+# ---------------------------------------------------------------------------
+# LLM 路由
+# ---------------------------------------------------------------------------
+
+# 本地/兼容 LLM 的 API 地址（兼容 OpenAI 格式）。
+llm_url = "http://127.0.0.1:11434"
+
+# 默认对话模型名称。
+llm_model = "deepseek-v4-flash"
+
+# 可用模型列表，供启动时选择或回退。
+available_models = [
+  "qwen2.5:0.5b",
+  "qwen2.5:1.5b",
+  "qwen2.5:7b",
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+]
+
+# DeepSeek API 密钥。模型名以 deepseek 开头时自动使用。
+# 也可以通过环境变量 DEEPSEEK_API_KEY 设置。
+deepseek_api_key = ""
+
+# 本地 transformers 模型名，作为 LLM 不可用时的后备。
+local_model = "Qwen/Qwen2.5-1.5B-Instruct"
+
+# ---------------------------------------------------------------------------
+# TTS — 文本转语音
+# ---------------------------------------------------------------------------
+
+# TTS 后端："minimax" 或 "cartesia"。
+tts_backend = "minimax"
+
+# ── Cartesia ──
+cartesia_api_key = ""
+tts_voice_id = ""
+tts_sample_rate = 24000
+
+# ── MiniMax ──
+minimax_api_key = ""
+minimax_model = "speech-2.8-turbo"
+minimax_sample_rate = 32000
+# 语速倍率。>1 加快，<1 减慢。
+minimax_tts_speed = 1.05
+# 播放前预缓冲的音频秒数。越大越流畅但延迟越高。
+minimax_tts_buffer_seconds = 0.3
+
+# ---------------------------------------------------------------------------
+# STT — 语音转文字
+# ---------------------------------------------------------------------------
+
+# 流式 ASR 模型的存放目录。
+stt_model_dir = "models/stt"
+# 用于精炼 STT 原始识别结果的小模型。
+stt_refine_model = "qwen2.5:1.5b"
+# 为 true 时，TTS 播放期间暂停麦克风输入，防止回声。
+stt_pause_during_tts = true
+
+# ---------------------------------------------------------------------------
+# 记忆后端
+# ---------------------------------------------------------------------------
+
+# 后端类型："none"（禁用）、"mem0"（本地向量库）或 "kokoromemo"（外部服务）。
+memory_backend = "mem0"
+
+# KokoroMemo 外部记忆服务地址和仓库路径。
+kokoromo_url = "http://127.0.0.1:14514"
+kokoromo_dir = "D:/program/kokoromemo"
+
+# ---------------------------------------------------------------------------
+# 立绘覆盖层
+# ---------------------------------------------------------------------------
+
+# 透明立绘窗口的 HTTP 地址和端口。
+portrait_overlay_host = "127.0.0.1"
+portrait_overlay_port = 17352
+# 立绘决策循环间隔（秒）。0 表示使用后端默认值（约 2 秒）。
+portrait_decision_interval = 0.0
+# 对话结束后多少秒无语音，立绘自动恢复为平静表情。
+portrait_decay_seconds = 60.0
+# 为 true 时，立绘上叠加显示调度器的冲动值调试信息。
+portrait_debug_overlay = true
+# 为 true 时，鼠标点击穿透立绘窗口。
+portrait_click_through = false
+
+# ---------------------------------------------------------------------------
+# 视觉 / 屏幕识别
+# ---------------------------------------------------------------------------
+
+# 视觉后端："dashscope"（云端）或 "ollama"（本地）。
+vision_backend = "dashscope"
+vision_model = "qwen-vl-plus"
+# DashScope API 密钥。也可以通过环境变量 DASHSCOPE_API_KEY 设置。
+# 留空时从 config.json 读取。
+vision_api_key = ""
+
+# ---------------------------------------------------------------------------
+# 主动语音调度器
+# ---------------------------------------------------------------------------
+
+# 调度器通过冲动值累积机制让角色在空闲时主动说话——基于用户沉默、
+# 最近对话、记忆或屏幕内容触发。详细设计见 alice.md。
+
+[proactive]
+# 所有主动行为的总开关。
+enabled = true
+# 调度器 tick 间隔（秒）。越小响应越快，但 API 调用越多。
+tick_seconds = 3.0
+# 所有冲动值累积速率的全局倍率。1.0 = 正常，4.0 = 频率翻倍。
+drive_rate = 4.0
+# 多样性窗口（秒）。在此时间内不会重复触发同一类行为。
+diversity_window_seconds = 60.0
+# 备选行为挑选概率。当最高冲动值的行为被多样性过滤后，有该概率选第二高的行为。
+secondary_pick_chance = 0.2
+
+[proactive.idle]
+# 该行为的总开关。
+enabled = false
+# IDLE 冲动值的每秒增长量。
+rate = 0.08
+# 触发该行为所需的最小冲动值。
+active_threshold = 60.0
+# 行为触发后的冷却时间（秒）。
+cooldown_seconds = 30.0
+# 因 TTS/STT 繁忙而被延期后扣除的冲动值。
+defer_penalty = 20.0
+# 该行为能承受的最大干扰值。
+max_disturbance = 35.0
+# 权重倍率。
+weight = 1.0
+# 用户连续空闲多少秒后开始给予 IDLE 额外增速。
+user_idle_bonus_after_seconds = 120.0
+
+[proactive.recent]
+# 该行为的总开关。
+enabled = true
+# RECENT 冲动值的每秒衰减速度。
+decay_rate = 2.0
+# 对话结束后多少秒 RECENT 冲动值才开始衰减。
+decay_delay_seconds = 30.0
+# 触发该行为所需的最小冲动值。
+active_threshold = 70.0
+# 行为触发后的冷却时间（秒）。
+cooldown_seconds = 30.0
+# 因 TTS/STT 繁忙而被延期后扣除的冲动值。
+defer_penalty = 20.0
+# 该行为能承受的最大干扰值。
+max_disturbance = 45.0
+# 权重倍率。
+weight = 1.0
+# 对话结束后多少秒内给予 IDLE 额外增速（与 RECENT 联动）。
+bonus_window_seconds = 120.0
+
+[proactive.mem]
+# 该行为的总开关。
+enabled = true
+# MEM 冲动值（由记忆事件触发）的每秒增长量。
+rate = 0.06
+# 触发该行为所需的最小冲动值。
+active_threshold = 70.0
+# 行为触发后的冷却时间（秒）。
+cooldown_seconds = 30.0
+# 因 TTS/STT 繁忙而被延期后扣除的冲动值。
+defer_penalty = 20.0
+# 该行为能承受的最大干扰值。
+max_disturbance = 25.0
+# 权重倍率。
+weight = 1.0
+
+[proactive.screen]
+# 该行为的总开关。
+enabled = true
+# SCREEN 冲动值的每秒衰减速度。
+decay_rate = 5.0
+# 触发该行为所需的最小冲动值。
+active_threshold = 70.0
+# 行为触发后的冷却时间（秒）。
+cooldown_seconds = 30.0
+# 因 TTS/STT 繁忙而被延期后扣除的冲动值。
+defer_penalty = 20.0
+# 该行为能承受的最大干扰值。
+max_disturbance = 50.0
+# 权重倍率。
+weight = 1.0
+# 对话结束后扣除的 SCREEN 冲动值，避免正常对话和主动屏幕评论同时触发。
+post_conversation_decay = 30.0
+
+# ---------------------------------------------------------------------------
+# 屏幕监控 — 周期性截图 + 视觉分析
+# ---------------------------------------------------------------------------
+
+[screen_watch]
+# 是否开启周期性屏幕截图分析。
+enabled = true
+# 截图/分析周期（秒）。
+watch_interval = 45.0
+# 内容兴趣度最低分数（0-100），达到此值才触发 SCREEN 冲动值增加。
+interest_threshold = 70.0
+# 单次视觉分析的最大超时（秒）。
+vision_timeout = 45
+# 是否开启周期性记忆事件轮询（日期纪念日、定期查询等）。
+memory_events_enabled = true
+# 记忆事件轮询间隔（秒）。
+memory_check_interval = 300.0
+# 同一记忆事件的冷却时间（秒）。
+memory_cooldown_seconds = 21600.0  # 6 小时
+# 日期匹配的记忆事件的基础分值。
+memory_date_score = 50.0
+# 定期记忆查询返回结果时的基础分值。
+memory_lookup_score = 70.0
+# 用于定期记忆查询的 LLM 提示语。
+memory_lookup_query = "recent important user preferences, plans, dates, anniversaries, goals"
+
+# 预约日期记忆事件示例（可按需添加更多）：
+# [[proactive.memory_date_events]]
+# date = "05-04"
+# label = "Alice project anniversary"
+# note = "Mention it only if the user seems idle and the mood is relaxed."
+
+# ---------------------------------------------------------------------------
+# mem0 — 内部记忆服务配置
+# ---------------------------------------------------------------------------
+
+[mem0.llm]
+# mem0 用于记忆提取和摘要的 LLM。
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5:1.5b"
+
+[mem0.embedder]
+# 向量搜索用的嵌入模型。fastembed 完全本地运行，无需 Ollama 端点。
+provider = "fastembed"
+model = "BAAI/bge-small-zh-v1.5"
+embedding_dims = 512
+
+[mem0.lifecycle]
+# 重要度模式："auto" 让 LLM 判断每次对话是否值得存入记忆。
+importance_mode = "auto"
+# 记忆召回的最小相似度阈值（0-1）。
+search_threshold = 0.3
+# 每次召回返回的最大记忆条数。
+search_top_k = 8

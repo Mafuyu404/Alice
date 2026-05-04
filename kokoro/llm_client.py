@@ -1,0 +1,69 @@
+"""Shared OpenAI-compatible LLM client helpers."""
+
+from __future__ import annotations
+
+import json
+from typing import Iterable
+
+import requests
+
+from kokoro import config as cfg
+
+
+def api_headers(model: str) -> dict[str, str]:
+    if cfg.is_deepseek_model(model):
+        key = cfg.deepseek_api_key()
+        if key:
+            return {"Authorization": f"Bearer {key}"}
+    return {}
+
+
+def api_base_for(model: str) -> str:
+    if cfg.is_deepseek_model(model):
+        return cfg.deepseek_url() + "/v1"
+    return cfg.api_base()
+
+
+def upstream_url_for(model: str, prefer_kokoromemo: bool = False) -> str:
+    if cfg.is_deepseek_model(model):
+        return cfg.deepseek_url()
+    if prefer_kokoromemo and cfg.kokoromo_url():
+        return cfg.kokoromo_url()
+    return cfg.llm_url()
+
+
+def build_payload(model: str, messages: list[dict], stream: bool = True) -> dict:
+    payload = {"model": model, "messages": messages, "stream": stream}
+    if cfg.is_deepseek_model(model):
+        payload["thinking"] = {"type": "disabled"}
+    return payload
+
+
+def parse_sse_delta(line: str) -> str:
+    if not line or line == "data: [DONE]" or line.startswith(":"):
+        return ""
+    if not line.startswith("data: "):
+        return ""
+    try:
+        chunk = json.loads(line[6:])
+        return chunk["choices"][0].get("delta", {}).get("content", "")
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        return ""
+
+
+def stream_chat(messages: list[dict], model: str, timeout: int = 120) -> Iterable[str]:
+    resp = requests.post(
+        f"{api_base_for(model)}/chat/completions",
+        json=build_payload(model, messages, stream=True),
+        headers=api_headers(model),
+        stream=True,
+        timeout=timeout,
+    )
+    if not resp.ok:
+        raise RuntimeError(f"API error {resp.status_code}: {resp.text[:200]}")
+
+    resp.encoding = "utf-8"
+    for line in resp.iter_lines(decode_unicode=True):
+        content = parse_sse_delta(line)
+        if content:
+            yield content
