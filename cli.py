@@ -342,6 +342,7 @@ def main() -> None:
             if result.score >= screen_interest_threshold:
                 context = result.content or result.reason
                 scheduler.add_screen_interest(result.score, context)
+                session.add_screen_context(context)
                 print(f"\n  [screen] interest={result.score:.1f} {context}")
 
     screen_thread = threading.Thread(target=screen_watch_worker, daemon=True)

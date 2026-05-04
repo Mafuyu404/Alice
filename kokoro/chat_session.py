@@ -16,6 +16,8 @@ class ChatSession:
     memory_backend: object
     max_history: int = 20
     history: list[dict] = field(default_factory=list)
+    screen_contexts: list[str] = field(default_factory=list)
+    max_screen_contexts: int = 3
 
     @property
     def character_name(self) -> str:
@@ -25,8 +27,18 @@ class ChatSession:
     def system_prompt(self) -> str:
         return character.build_system_prompt(self.character_data)
 
-    def build_messages(self, user_text: str) -> list[dict]:
+    def add_screen_context(self, content: str) -> None:
+        self.screen_contexts.append(content)
+        if len(self.screen_contexts) > self.max_screen_contexts:
+            self.screen_contexts = self.screen_contexts[-self.max_screen_contexts:]
+
+    def build_messages(self, user_text: str, include_screen: bool = True) -> list[dict]:
         messages = [{"role": "system", "content": self.system_prompt}]
+        if include_screen and self.screen_contexts:
+            screen_text = "以下是你最近通过屏幕识别观察到的用户活动（按时间顺序从早到晚）：\n"
+            for i, ctx in enumerate(self.screen_contexts, 1):
+                screen_text += f"{i}. {ctx}\n"
+            messages.append({"role": "system", "content": screen_text})
         memory_ctx = self.memory_backend.get_context(user_text, user_id=self.character_id)
         if memory_ctx:
             messages.append({"role": "system", "content": memory_ctx})
