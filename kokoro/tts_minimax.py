@@ -187,13 +187,17 @@ class StreamingTTS:
         self._buf: list[str] = []
         self._is_playing = False
         self._should_stop = False
+        self._active_fetches = 0
+        self._state_lock = threading.Lock()
+        self._fetch_lock = threading.Lock()
         self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._play_thread: threading.Thread | None = None
         self._stream: sd.OutputStream | None = None
 
     @property
     def is_playing(self) -> bool:
-        return self._is_playing
+        with self._state_lock:
+            return self._is_playing or self._active_fetches > 0 or not self._audio_queue.empty()
 
     def prepare(self) -> None:
         """Ensure the output stream and playback thread are running."""
@@ -213,6 +217,8 @@ class StreamingTTS:
         text = "".join(self._buf)
         self._buf = []
         if text:
+            with self._state_lock:
+                self._active_fetches += 1
             threading.Thread(target=self._fetch_worker, args=(text,), daemon=True).start()
 
     def flush(self) -> None:
@@ -231,14 +237,17 @@ class StreamingTTS:
 
     def _fetch_worker(self, text: str) -> None:
         try:
-            for audio, _ in text_to_speech_stream(text, self._voice_id, self._speed):
-                if self._should_stop:
-                    break
-                self._audio_queue.put(audio)
+            with self._fetch_lock:
+                for audio, _ in text_to_speech_stream(text, self._voice_id, self._speed):
+                    if self._should_stop:
+                        break
+                    self._audio_queue.put(audio)
         except Exception as exc:
             logger.warning("TTS fetch failed: %s", exc)
         finally:
-            self._audio_queue.put(None)  # signal end of this fetch
+            self._audio_queue.put(None)  # signal end of this utterance fetch
+            with self._state_lock:
+                self._active_fetches = max(0, self._active_fetches - 1)
 
     def _play_worker(self) -> None:
         stream = self._stream
@@ -254,12 +263,18 @@ class StreamingTTS:
                     if prebuf:
                         for chunk in prebuf:
                             stream.write(chunk)
-                    break
+                        prebuf = []
+                    started = False
+                    prebuf_samples = 0
+                    with self._state_lock:
+                        self._is_playing = False
+                    continue
                 if not started:
                     prebuf.append(audio)
                     prebuf_samples += len(audio)
                     if prebuf_samples >= self._buffer_samples:
-                        self._is_playing = True
+                        with self._state_lock:
+                            self._is_playing = True
                         started = True
                         for chunk in prebuf:
                             stream.write(chunk)
@@ -267,7 +282,8 @@ class StreamingTTS:
                     continue
                 stream.write(audio)
         finally:
-            self._is_playing = False
+            with self._state_lock:
+                self._is_playing = False
 
 
 def streaming_init(voice: str = None) -> None:

@@ -127,11 +127,14 @@ class StreamingTTS:
         self._pending_buf: list[str] = []
         self._play_lock = threading.Lock()
         self._is_playing = False
+        self._pending_plays = 0
+        self._state_lock = threading.Lock()
         self._should_stop = False
 
     @property
     def is_playing(self) -> bool:
-        return self._is_playing
+        with self._state_lock:
+            return self._is_playing or self._pending_plays > 0
 
     def prepare(self) -> None:
         return
@@ -144,6 +147,8 @@ class StreamingTTS:
             return
         text = "".join(self._pending_buf)
         self._pending_buf = []
+        with self._state_lock:
+            self._pending_plays += 1
         threading.Thread(target=self._play_text, args=(text,), daemon=True).start()
 
     def flush(self) -> None:
@@ -153,15 +158,18 @@ class StreamingTTS:
         self._should_stop = True
 
     def _play_text(self, text: str) -> None:
-        if self._should_stop:
-            return
-        self._is_playing = True
         try:
+            if self._should_stop:
+                return
             with self._play_lock:
+                with self._state_lock:
+                    self._is_playing = True
                 chunks = [audio for audio, _ in text_to_speech_stream(text, self._voice_id, 1.0)]
                 _play_audio_chunks(chunks)
         finally:
-            self._is_playing = False
+            with self._state_lock:
+                self._is_playing = False
+                self._pending_plays = max(0, self._pending_plays - 1)
 
 
 def streaming_init(voice: str = None) -> None:

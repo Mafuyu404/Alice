@@ -27,6 +27,7 @@ from kokoro import proactive
 from kokoro import screen_interest
 from kokoro import stt as stt_mod
 from kokoro import tts as tts_mod
+from kokoro import user_commands
 
 
 CONFIG = cfg.load()
@@ -135,13 +136,81 @@ def main() -> None:
     screen_vision_timeout = max(5, int(screen_cfg.get("vision_timeout", 45)))
     memory_detector = memory_events.from_config(CONFIG, memory_backend, session.character_id)
     chat_lock = threading.Lock()
+    screen_watch_state_lock = threading.Lock()
+    screen_watch_seq = 0
+    active_screen_watch_id = 0
+    canceled_screen_watch_ids: set[int] = set()
+
+    def begin_screen_watch() -> int:
+        nonlocal screen_watch_seq, active_screen_watch_id
+        with screen_watch_state_lock:
+            screen_watch_seq += 1
+            active_screen_watch_id = screen_watch_seq
+            return active_screen_watch_id
+
+    def cancel_active_screen_watch() -> bool:
+        with screen_watch_state_lock:
+            if active_screen_watch_id:
+                canceled_screen_watch_ids.add(active_screen_watch_id)
+                return True
+            return False
+
+    def consume_screen_watch_canceled(watch_id: int) -> bool:
+        with screen_watch_state_lock:
+            if watch_id in canceled_screen_watch_ids:
+                canceled_screen_watch_ids.remove(watch_id)
+                return True
+            return False
+
+    def finish_screen_watch(watch_id: int) -> None:
+        nonlocal active_screen_watch_id
+        with screen_watch_state_lock:
+            if active_screen_watch_id == watch_id:
+                active_screen_watch_id = 0
 
     def on_refined(text: str) -> None:
         scheduler.record_user_activity()
         scheduler.reset_all()
         display_user(text)
         with chat_lock:
-            messages = session.build_messages(text)
+            command_context = ""
+            command = user_commands.detect(text)
+            if command:
+                if cancel_active_screen_watch():
+                    scheduler.desires[proactive.Behavior.SCREEN] = 0.0
+                    scheduler.screen_context = ""
+                    print("\n  [screen] active watch canceled by command")
+                try:
+                    waiting_reply = user_commands.build_waiting_reply(
+                        text,
+                        session.history,
+                        llm_url=refine_url,
+                        llm_model=refine_model,
+                        api_key=refine_key,
+                    )
+                except Exception:
+                    waiting_reply = "好，我看一下。"
+
+                print(f"\n{session.character_name}: {waiting_reply}")
+                if tts_engine:
+                    tts_engine.push(waiting_reply)
+                    tts_engine.end_sentence()
+                    while tts_engine.is_playing:
+                        time.sleep(0.1)
+
+                result = user_commands.execute(command, timeout=screen_vision_timeout)
+                command_context = result.context
+                if result.ok and result.screen_context:
+                    scheduler.desires[proactive.Behavior.SCREEN] = 0.0
+                    scheduler.screen_context = ""
+                    session.add_screen_context(result.screen_context)
+                    print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context}")
+                elif result.user_visible_note:
+                    label = "private" if result.private else "error"
+                    print(f"\n  [screen] command {label}: {result.user_visible_note}")
+                    command_context = result.context or result.user_visible_note
+
+            messages = session.build_messages(text, extra_context=command_context)
 
             try:
                 reply = chat_stream(messages, session.character_name, model, tts_engine)
@@ -330,10 +399,18 @@ def main() -> None:
                 continue
             if tts_engine and tts_engine.is_playing:
                 continue
+            watch_id = begin_screen_watch()
             try:
                 result = screen_interest.analyze(timeout=screen_vision_timeout)
             except Exception as exc:
-                print(f"\n[screen watch error] {type(exc).__name__}: {exc}")
+                if not consume_screen_watch_canceled(watch_id):
+                    print(f"\n[screen watch error] {type(exc).__name__}: {exc}")
+                finish_screen_watch(watch_id)
+                continue
+            finally:
+                finish_screen_watch(watch_id)
+
+            if consume_screen_watch_canceled(watch_id):
                 continue
 
             if result.private:

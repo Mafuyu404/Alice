@@ -17,6 +17,8 @@ from kokoro import prompts
 from kokoro import vision
 
 
+logger = logging.getLogger(__name__)
+
 PRIVACY_PATTERNS = (
     "password",
     "passwd",
@@ -122,22 +124,6 @@ def _parse_content(text: str) -> ScreenInterest:
 
 
 def _extract_json(text: str) -> dict | None:
-    stripped = text.strip()
-    candidates = [stripped]
-    match = re.search(r"\{.*\}", stripped, re.DOTALL)
-    if match:
-        candidates.append(match.group(0))
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
-
-
-def _extract_json(text: str) -> dict | None:
     """Try multiple strategies to extract a JSON dict from the model response."""
     stripped = text.strip()
 
@@ -179,7 +165,7 @@ def _extract_json(text: str) -> dict | None:
                         except json.JSONDecodeError:
                             pass
 
-    logger.warning("_extract_json: no valid JSON found in model response (len=%d)", len(stripped))
+    logger.debug("_extract_json: no valid JSON found in model response (len=%d)", len(stripped))
     return None
 
 
