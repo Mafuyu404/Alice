@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from kokoro import character
+from kokoro import prompts
 
 
 @dataclass
@@ -42,7 +43,7 @@ class ChatSession:
         if extra_context:
             messages.append({"role": "system", "content": extra_context})
         if include_screen and self.screen_contexts:
-            screen_text = "以下是你最近通过屏幕识别观察到的用户活动（按时间顺序从早到晚）：\n"
+            screen_text = prompts.get("chat_session.screen_context_prefix", "")
             for i, ctx in enumerate(self.screen_contexts, 1):
                 screen_text += f"{i}. {ctx}\n"
             messages.append({"role": "system", "content": screen_text})

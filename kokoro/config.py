@@ -124,7 +124,7 @@ def stt_pause_during_tts() -> bool:
 
 
 def stt_refine_stable_seconds() -> float:
-    return float(get("stt_refine_stable_seconds", 0.45))
+    return float(get("stt_refine_stable_seconds", 1.5))
 
 
 def stt_pool_tick_seconds() -> float:

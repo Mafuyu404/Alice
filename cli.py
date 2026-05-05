@@ -345,6 +345,9 @@ def main() -> None:
                             sys.stdout.write(f"\r\033[K  [STT] {text}")
                             sys.stdout.flush()
                             last_partial = text
+                    if recognizer.is_endpoint(stt_stream):
+                        recognizer.reset(stt_stream)
+                        last_partial = ""
         except Exception as exc:
             print(f"\n[STT error] {exc}")
             traceback.print_exc()

@@ -146,7 +146,12 @@ def build_waiting_reply(
     timeout: int = 20,
 ) -> str:
     recent_text = _format_recent(recent_messages)
-    character_text = character_prompt.strip() or (f"你是 {character_name}。" if character_name else "无")
+    if character_prompt.strip():
+        character_text = character_prompt.strip()
+    elif character_name:
+        character_text = prompts.format_prompt("user_commands.character_fallback", character_name=character_name)
+    else:
+        character_text = prompts.get("user_commands.no_context_placeholder", "")
     messages = [
         {
             "role": "system",
@@ -156,7 +161,7 @@ def build_waiting_reply(
             "role": "user",
             "content": prompts.format_prompt(
                 "user_commands.waiting_user",
-                character_name=character_name or "未知",
+                character_name=character_name or prompts.get("user_commands.unknown_name", ""),
                 character_text=character_text,
                 recent_text=recent_text,
                 user_text=user_text,
