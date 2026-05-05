@@ -40,7 +40,7 @@ def build_system_prompt(char: dict[str, str]) -> str:
     name = char.get("name", "助手")
     background = char.get("background", "")
     relationship = char.get("relationship", "")
-    return prompts.format_prompt(
+    base_prompt = prompts.format_prompt(
         "character_system.template",
         name=name,
         description=char.get("description", ""),
@@ -51,6 +51,8 @@ def build_system_prompt(char: dict[str, str]) -> str:
         relationship_block=f"\n【关系】{relationship}" if relationship else "",
         example_dialogue=char.get("example_dialogue", ""),
     )
+    calibration = prompts.get("character_system.expression_calibration", "")
+    return f"{base_prompt}\n\n{calibration}" if calibration else base_prompt
 
 
 def get_display(char: dict[str, str]) -> str:

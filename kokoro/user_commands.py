@@ -9,6 +9,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Iterable
 
+from kokoro import prompts
 from kokoro import screen_interest
 from kokoro import vision
 
@@ -40,7 +41,9 @@ SCREEN_COMMAND_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"(?:帮我|你|麻烦你|可以|能不能|能|给我|替我|请你)?.{0,8}(?:看|看看|瞅|瞧|读|识别|分析|检查|观察|扫|扫一下|看一眼|瞄一眼).{0,18}(?:屏幕|荧幕|画面|桌面|当前窗口|前台窗口|窗口|页面|网页|界面|这里|这儿|这个|这个页面|这个界面|这张图|当前画面|现在画面)",
+        r"(?:看|看看|瞅|瞧|读|识别|分析|检查|观察).{0,12}(?:我|我的|咱|咱的).{0,6}(?:屏幕|荧幕|画面|桌面|窗口|页面|界面)",
         r"(?:屏幕|荧幕|画面|桌面|当前窗口|前台窗口|窗口|页面|网页|界面|这里|这儿|这个|当前画面|现在画面).{0,18}(?:有什么|是什么|写了什么|显示什么|显示了什么|在干嘛|哪里不对|怎么回事|帮我看看|帮我分析|你看得见|你能看)",
+        r"(?:屏幕|荧幕|画面|桌面|窗口|页面|界面).{0,30}(?:技能|招式|用什么|怎么打|下一步|怎么办|怎么回|怎么回复)",
         r"(?:look|read|scan|inspect|check|analy[sz]e|describe).{0,20}(?:screen|desktop|window|page|browser|this|here)",
         r"(?:what'?s|what is).{0,16}(?:on|in).{0,8}(?:my )?(?:screen|desktop|window|page)",
     )
@@ -89,26 +92,26 @@ def execute(command: UserCommand, *, timeout: int = 45) -> CommandResult:
             return CommandResult(
                 command.type,
                 False,
-                context=(
-                    "用户刚才要求你查看屏幕，但当前前台窗口疑似包含隐私内容，"
-                    "系统已跳过屏幕识别。请简短说明无法查看隐私内容。"
-                ),
+                context=prompts.get("user_commands.privacy_context", ""),
                 private=True,
-                user_visible_note="当前窗口可能包含隐私内容，我先不看。",
+                user_visible_note=prompts.get("user_commands.privacy_note", ""),
             )
 
-        content = vision.detect_desktop(prompt=_screen_inspect_prompt(command.raw_text), timeout=timeout).strip()
+        content = vision.detect_desktop(
+            prompt=_screen_inspect_prompt(command.raw_text),
+            timeout=timeout,
+        ).strip()
     except Exception as exc:
         logger.exception("screen command failed")
         return CommandResult(
             command.type,
             False,
             error=f"{type(exc).__name__}: {exc}",
-            user_visible_note="我刚才没能成功读取屏幕。",
+            user_visible_note=prompts.get("user_commands.screen_error_note", ""),
         )
 
     if not content:
-        content = "屏幕识别没有返回可用内容。"
+        content = prompts.get("user_commands.empty_screen_content", "")
 
     return CommandResult(
         command.type,
@@ -120,25 +123,14 @@ def execute(command: UserCommand, *, timeout: int = 45) -> CommandResult:
 
 
 def _screen_inspect_prompt(user_text: str) -> str:
-    return (
-        "用户主动要求你查看当前屏幕，因此这次任务不是判断是否有趣，也不需要返回 JSON。\n"
-        "请用自然中文详细描述当前完整桌面截图和前台窗口内容，重点服务用户刚才的请求。\n"
-        f"用户原话：{user_text}\n\n"
-        "要求：\n"
-        "- 不要输出 JSON、Markdown 代码块或评分。\n"
-        "- 优先读取前台窗口里的标题、正文、按钮、错误信息、输入框、列表项和状态提示。\n"
-        "- 如果用户像是在问页面哪里不对、下一步怎么做、按钮在哪里，请描述足够信息，方便后续对话模型判断。\n"
-        "- 如果看不清某些文字，请明确说看不清，不要编造。\n"
-    )
+    return prompts.format_prompt("user_commands.screen_inspect_prompt", user_text=user_text)
 
 
 def format_context(user_text: str, screen_content: str) -> str:
-    return (
-        "用户刚才明确要求你查看屏幕。以下是本次屏幕识别结果：\n"
-        f"{screen_content}\n\n"
-        f"用户原话：{user_text}\n"
-        "请结合用户原话和屏幕内容继续对话。不要只复述屏幕内容；"
-        "如果用户是在询问页面、错误、按钮、状态或下一步操作，请直接给出判断和建议。"
+    return prompts.format_prompt(
+        "user_commands.screen_result_context",
+        user_text=user_text,
+        screen_content=screen_content,
     )
 
 
@@ -148,23 +140,27 @@ def build_waiting_reply(
     *,
     llm_url: str,
     llm_model: str,
+    character_name: str = "",
+    character_prompt: str = "",
     api_key: str | None = None,
     timeout: int = 20,
 ) -> str:
     recent_text = _format_recent(recent_messages)
+    character_text = character_prompt.strip() or (f"你是 {character_name}。" if character_name else "无")
     messages = [
         {
             "role": "system",
-            "content": (
-                "你正在扮演用户的桌面伙伴。用户刚刚发出了需要你查看屏幕的指令，"
-                "但屏幕识别还需要等待。请只回复一句自然的等待式回应，表示你马上查看。"
-                "要结合最近上下文和用户语气，中文为主，不要解释系统机制，不要提到模型，"
-                "不要假装已经看到了屏幕内容。长度控制在 6-18 个汉字。"
-            ),
+            "content": prompts.get("user_commands.waiting_system", ""),
         },
         {
             "role": "user",
-            "content": f"最近上下文：\n{recent_text}\n\n用户刚才说：{user_text}\n\n等待式回应：",
+            "content": prompts.format_prompt(
+                "user_commands.waiting_user",
+                character_name=character_name or "未知",
+                character_text=character_text,
+                recent_text=recent_text,
+                user_text=user_text,
+            ),
         },
     ]
     reply = _call_refine_style_llm(
@@ -174,7 +170,7 @@ def build_waiting_reply(
         api_key=api_key,
         timeout=timeout,
     )
-    return _clean_waiting_reply(reply) or "好，我看一下。"
+    return _clean_waiting_reply(reply) or prompts.get("user_commands.waiting_fallback", "")
 
 
 def _call_refine_style_llm(

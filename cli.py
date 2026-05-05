@@ -176,6 +176,7 @@ def main() -> None:
             command_context = ""
             command = user_commands.detect(text)
             if command:
+                print(f"\n  [command] {command.type} confidence={command.confidence:.2f}")
                 if cancel_active_screen_watch():
                     scheduler.desires[proactive.Behavior.SCREEN] = 0.0
                     scheduler.screen_context = ""
@@ -186,6 +187,8 @@ def main() -> None:
                         session.history,
                         llm_url=refine_url,
                         llm_model=refine_model,
+                        character_name=session.character_name,
+                        character_prompt=session.system_prompt,
                         api_key=refine_key,
                     )
                 except Exception:
@@ -204,7 +207,7 @@ def main() -> None:
                     scheduler.desires[proactive.Behavior.SCREEN] = 0.0
                     scheduler.screen_context = ""
                     session.add_screen_context(result.screen_context)
-                    print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context}")
+                    print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context.split(chr(10))[0]}")
                 elif result.user_visible_note:
                     label = "private" if result.private else "error"
                     print(f"\n  [screen] command {label}: {result.user_visible_note}")
@@ -420,7 +423,7 @@ def main() -> None:
                 context = result.content or result.reason
                 scheduler.add_screen_interest(result.score, context)
                 session.add_screen_context(context)
-                print(f"\n  [screen] interest={result.score:.1f} {context}")
+                print(f"\n  [screen] interest={result.score:.1f} {context.split(chr(10))[0]}")
 
     screen_thread = threading.Thread(target=screen_watch_worker, daemon=True)
     screen_thread.start()
