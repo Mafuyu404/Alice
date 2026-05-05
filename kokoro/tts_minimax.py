@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import queue
+import re
 import threading
 import time
 from typing import Generator, Optional, Tuple
@@ -172,12 +173,14 @@ def stop_playback() -> None:
     pass
 
 
-class StreamingTTS:
-    """Streaming TTS that plays audio chunks as they arrive from the API.
+_SENTENCE_END = re.compile(r"[。！？!?；;]")
 
-    push() buffers text incrementally. end_sentence() sends the accumulated
-    text to MiniMax and each audio chunk is written to the sound device
-    immediately rather than collecting all chunks before playing.
+class StreamingTTS:
+    """Streaming TTS with persistent WebSocket and automatic reconnect.
+
+    push() accumulates text. When a sentence-ending punctuation is detected,
+    the complete sentence is sent via task_continue.  If the WebSocket drops,
+    the sentence stays in the buffer and the receiver reconnects transparently.
     """
 
     def __init__(self, voice: str = None):
@@ -187,21 +190,27 @@ class StreamingTTS:
         self._buf: list[str] = []
         self._is_playing = False
         self._should_stop = False
-        self._active_fetches = 0
         self._state_lock = threading.Lock()
-        self._fetch_lock = threading.Lock()
         self._first_audio_logged = False
         self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._play_thread: threading.Thread | None = None
         self._stream: sd.OutputStream | None = None
+        self._ws: object = None
+        self._ws_started = threading.Event()
+        self._ws_recv_thread: threading.Thread | None = None
+        self._pending_count = 0
+        self._pending_lock = threading.Lock()
+        self._all_done = threading.Event()
+        self._all_done.set()
+        self._session_done = False
 
     @property
     def is_playing(self) -> bool:
         with self._state_lock:
-            return self._is_playing or self._active_fetches > 0 or not self._audio_queue.empty()
+            return self._is_playing or not self._audio_queue.empty()
 
     def prepare(self) -> None:
-        """Ensure the output stream and playback thread are running."""
+        """Start audio output and the WS receiver thread (manages its own connection)."""
         if self._stream is None:
             self._stream = sd.OutputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=2048,
@@ -211,23 +220,89 @@ class StreamingTTS:
             self._play_thread = threading.Thread(target=self._play_worker, daemon=True)
             self._play_thread.start()
 
+        self._all_done.set()
+        self._session_done = False
+        with self._pending_lock:
+            self._pending_count = 0
+        self._ws_recv_thread = threading.Thread(target=self._ws_recv_worker, daemon=True)
+        self._ws_recv_thread.start()
+        if not self._ws_started.wait(timeout=10):
+            raise RuntimeError("MiniMax TTS task_started timeout")
+
+    def _try_send(self, text: str) -> bool:
+        """Send a sentence. Returns False if WS is down (caller should retry)."""
+        if not self._ws_started.is_set() or not self._ws:
+            return False
+        try:
+            with self._pending_lock:
+                self._pending_count += 1
+                self._all_done.clear()
+            self._ws.send(json.dumps(_task_continue(text)))
+            return True
+        except Exception as exc:
+            logger.warning("TTS send failed: %s", exc)
+            with self._pending_lock:
+                self._pending_count = max(0, self._pending_count - 1)
+                if self._pending_count == 0:
+                    self._all_done.set()
+            self._ws_started.clear()
+            return False
+
     def push(self, text: str) -> None:
+        """Accumulate text; send complete sentences when WS is available."""
         self._buf.append(text)
+        while True:
+            combined = "".join(self._buf)
+            match = _SENTENCE_END.search(combined)
+            if not match:
+                break
+            idx = match.end()
+            sentence = combined[:idx]
+            stripped = sentence.strip()
+            if stripped and self._try_send(stripped):
+                rest = combined[idx:]
+                self._buf = [rest] if rest else []
+            else:
+                break  # WS down, retry on next push() or end_sentence()
 
     def end_sentence(self) -> None:
-        text = "".join(self._buf)
-        self._buf = []
-        if text:
-            with self._state_lock:
-                self._active_fetches += 1
-            threading.Thread(target=self._fetch_worker, args=(text,), daemon=True).start()
+        """Flush remaining text, then finish the session."""
+        # Keep trying to send remaining text until WS is available and it goes through
+        deadline = time.perf_counter() + 30
+        while True:
+            remaining = "".join(self._buf).strip()
+            if not remaining:
+                break
+            if self._try_send(remaining):
+                self._buf = []
+                break
+            if time.perf_counter() > deadline or self._should_stop:
+                self._buf = []
+                break
+            time.sleep(0.1)
+
+        # Wait for all pending sentences to finish
+        self._all_done.wait(timeout=30)
+        self._session_done = True
+        if self._ws and self._ws_started.is_set():
+            try:
+                self._ws.send(json.dumps({"event": "task_finish"}))
+            except Exception:
+                pass
 
     def flush(self) -> None:
         self.end_sentence()
 
     def close(self) -> None:
         self._should_stop = True
-        self._audio_queue.put(None)  # unblock play worker
+        self._session_done = True
+        self._audio_queue.put(None)
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
         if self._stream is not None:
             try:
                 self._stream.stop()
@@ -236,23 +311,76 @@ class StreamingTTS:
                 pass
             self._stream = None
 
-    def _fetch_worker(self, text: str) -> None:
-        t0 = time.perf_counter()
-        try:
-            with self._fetch_lock:
-                for audio, _ in text_to_speech_stream(text, self._voice_id, self._speed):
-                    if self._should_stop:
-                        break
-                    if not self._first_audio_logged:
-                        self._first_audio_logged = True
-                        print(f"\n  [latency] tts_first_audio {time.perf_counter() - t0:.2f}s")
-                    self._audio_queue.put(audio)
-        except Exception as exc:
-            logger.warning("TTS fetch failed: %s", exc)
-        finally:
-            self._audio_queue.put(None)  # signal end of this utterance fetch
-            with self._state_lock:
-                self._active_fetches = max(0, self._active_fetches - 1)
+    def _ws_recv_worker(self) -> None:
+        """Receiver loop. Reconnects automatically on unexpected drops."""
+        import websockets.sync.client as ws_sync
+        from websockets.exceptions import ConnectionClosed
+
+        while not self._should_stop:
+            self._ws_started.clear()
+            try:
+                self._ws = ws_sync.connect(WS_URL, additional_headers=_ws_headers())
+                self._ws.send(json.dumps(_task_start(self._voice_id, self._speed)))
+            except Exception:
+                if self._should_stop:
+                    return
+                time.sleep(0.5)
+                continue
+
+            t0 = time.perf_counter()
+            try:
+                while not self._should_stop:
+                    try:
+                        msg = self._ws.recv(timeout=1)
+                    except TimeoutError:
+                        if self._session_done:
+                            return
+                        continue
+                    except ConnectionClosed:
+                        break  # Will reconnect below
+
+                    if isinstance(msg, bytes):
+                        continue
+                    data = json.loads(msg)
+                    event = data.get("event", "")
+
+                    if event == "task_started":
+                        self._ws_started.set()
+                    elif event == "task_continued":
+                        if not self._first_audio_logged:
+                            self._first_audio_logged = True
+                            print(f"\n  [latency] tts_first_audio {time.perf_counter() - t0:.2f}s")
+                        audio = _decode_audio_chunk(data.get("data", {}))
+                        if audio is not None and len(audio) > 0:
+                            self._audio_queue.put(audio)
+                        if data.get("is_final") or data.get("data", {}).get("is_final"):
+                            with self._pending_lock:
+                                self._pending_count = max(0, self._pending_count - 1)
+                                if self._pending_count == 0:
+                                    self._all_done.set()
+                    elif event in ("task_finished", "task_failed"):
+                        self._audio_queue.put(None)
+                        self._ws_started.clear()
+                        return
+            except Exception:
+                pass
+            finally:
+                self._ws_started.clear()
+                # Reset pending on unexpected disconnect — lost sentence audio
+                # will be compensated by re-sending from buffer on the new connection.
+                with self._pending_lock:
+                    self._pending_count = 0
+                    self._all_done.set()
+                if self._ws:
+                    try:
+                        self._ws.close()
+                    except Exception:
+                        pass
+                    self._ws = None
+
+            if self._should_stop or self._session_done:
+                return
+            time.sleep(0.2)
 
     def _play_worker(self) -> None:
         stream = self._stream
@@ -263,7 +391,14 @@ class StreamingTTS:
             prebuf_samples = 0
             started = False
             while not self._should_stop:
-                audio = self._audio_queue.get()
+                try:
+                    audio = self._audio_queue.get(timeout=0.15)
+                except queue.Empty:
+                    if started:
+                        with self._state_lock:
+                            self._is_playing = False
+                    continue
+
                 if audio is None:
                     if prebuf:
                         for chunk in prebuf:
@@ -285,6 +420,8 @@ class StreamingTTS:
                             stream.write(chunk)
                         prebuf = []
                     continue
+                with self._state_lock:
+                    self._is_playing = True
                 stream.write(audio)
         finally:
             with self._state_lock:

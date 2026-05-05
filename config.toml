@@ -83,7 +83,7 @@ minimax_tts_speed = 1.05
 # 类型: float
 # 值越大播放越流畅（减少卡顿），但首音延迟越高。
 # 敏感场景（需要快速响应）设 0.05 ~ 0.15，流畅优先设 0.3 ~ 0.5。
-minimax_tts_buffer_seconds = 0.15
+minimax_tts_buffer_seconds = 0.5
 # LLM 流式输出累积多少字符后强制刷新 TTS 缓冲区。
 # 类型: int
 # 较小值让 TTS 更快开始说话（但可能断句不自然），较大值等待更完整句子。
