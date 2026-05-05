@@ -9,23 +9,24 @@
 ```
 screen_watch 线程 (每 watch_interval 秒)
     │
-    ├─ 1. 截图 (PIL.ImageGrab)
-    ├─ 2. 枚举前台窗口 (win32gui)
+    ├─ 1. vision.get_foreground_app() — 获取前台窗口信息
+    ├─ 2. vision.screenshot_to_base64() — 全屏截图转 base64
     │
     └─ → screen_interest.analyze()
             │
-            ├─ 隐私过滤 (PRIVACY_PATTERNS)
-            │   private=True → 跳过
+            ├─ foreground_is_private(foreground) — 隐私过滤
+            │   private=True → 返回 ScreenInterest(private=True)
             │
-            ├─ vision.analyze_image()
-            │   (截图 + content_analysis 提示词 → 视觉 API)
+            ├─ _content_prompt(foreground) — 构建分析提示词
+            │   (含前台窗口标题 + 进程名)
             │
-            └─ 解析 JSON 返回 ScreenInterest
+            ├─ vision.analyze_image() — 调用视觉 API
+            │
+            └─ _parse_content() — 解析 JSON 响应
                     │
                     ├─ score: 0-100 兴趣度
-                    ├─ content: 对前台窗口的详尽描述（含所有可见文本、UI 布局、
-                    │            视觉元素、颜色风格、用户操作状态等）
-                    ├─ reason: 有趣的理由
+                    ├─ content: 对前台窗口的详尽描述（截断至 600 字符）
+                    ├─ reason: 有趣的理由（截断至 200 字符）
                     └─ private: 是否隐私内容
                             │
                 score ≥ interest_threshold 且非 private
@@ -41,25 +42,26 @@ screen_watch 线程 (每 watch_interval 秒)
 @dataclass(frozen=True)
 class ScreenInterest:
     score: float      # 0-100 兴趣度
-    content: str      # 详细描述（含文本、布局、UI 状态等）
+    content: str      # 详细描述
     reason: str       # 认为有趣的理由
     private: bool     # 是否隐私内容
 ```
 
 ## 隐私过滤
 
-`PRIVACY_PATTERNS` 列表匹配窗口标题关键词，匹配时标记 `private=True`：
+`foreground_is_private(foreground)` 检查前台窗口的标题、进程名、窗口类名是否匹配隐私关键词：
 
-- 密码/登录/支付/银行页面
-- 私人聊天/会议软件（Zoom、Teams 等）
-- 浏览器隐身模式
-- 验证码/2FA 页面
+```
+password, passwd, login, sign in, signin, bank, payment, checkout, wallet,
+authenticator, 2fa, private browsing, incognito, 隐私, 密码, 登录, 登陆,
+支付, 付款, 银行, 验证码, 会议, meeting, zoom, teams, tencentmeeting
+```
 
-`foreground_is_private(foreground)` 函数返回窗口标题是否匹配隐私模式。
+匹配时返回 `ScreenInterest(private=True)`，CLI 端设置 `quiet_until` 推迟下次检查。
 
 ## 内容分析提示词
 
-`_content_prompt()` 使用 `prompts.json` 中的 `screen_interest.content_analysis` 模板，要求视觉 API 输出包含以下维度的 JSON：
+`_content_prompt()` 使用 `prompts.json` 中的 `screen_interest.content_analysis` 模板，注入前台窗口标题和进程名作为 `{fg_info}`。要求视觉 API 输出包含以下维度的 JSON：
 
 - 窗口标题、界面布局（区域划分）
 - 所有可见文本（按钮、标签、对话框、列表项、数值、状态信息）
@@ -70,28 +72,49 @@ class ScreenInterest:
 - 动画或动态效果
 - 窗口外桌面区域
 
+## JSON 解析
+
+`_extract_json()` 使用三重策略提取视觉模型返回的 JSON：
+
+1. Markdown code block 提取（```` ```json ... ``` ````）
+2. 最外层平衡大括号匹配
+3. 清理尾逗号后重试
+
+解析失败时返回原始文本（score=0）。
+
 ## 视觉后端
 
 由 `kokoro/vision.py` 实现，支持两种后端：
 
-- **DashScope**（云端）：阿里云视觉模型 `qwen-vl-plus` / `qwen-vl-max`，需要 API Key，识别能力强
-- **Ollama**（本地）：Ollama 多模态模型 `llava` 等，免费但识别能力有限
+- **DashScope**（云端）：阿里云视觉模型 `qwen-vl-plus` / `qwen-vl-max`，需要 API Key
+- **Ollama**（本地）：Ollama 多模态模型 `qwen2.5vl:3b` 等，免费但识别能力有限
+
+详见 [vision.md](#)（`kokoro/vision.py` 还提供 `get_running_apps()`、`get_foreground_app()`、`detect_desktop()` 等窗口枚举和综合桌面分析功能）。
+
+## CLI 主循环集成
+
+`cli.py` 中 `screen_watch_worker` 线程的工作流程：
+
+1. 等待 `screen_watch_interval` 秒
+2. 检查聊天锁/TTS 播放状态（忙时跳过）
+3. 调用 `begin_screen_watch()` 获取唯一 ID（支持取消）
+4. 调用 `screen_interest.analyze()`
+5. 检查是否被用户命令取消（`consume_screen_watch_canceled()`）
+6. 结果处理：
+   - `private=True` → 设置 `quiet_until` 推迟下次检查
+   - `score >= interest_threshold` → 注入 scheduler + session
 
 ## 配置
 
 ```toml
 [screen_watch]
 enabled = true
-watch_interval = 45.0          # 截图周期（秒）
+watch_interval = 45.0          # 截图周期（秒），最小 10
 interest_threshold = 70.0      # 兴趣度阈值（0-100）
-vision_timeout = 45            # 视觉 API 超时（秒）
-memory_events_enabled = true   # 记忆事件轮询开关
-memory_check_interval = 300.0  # 记忆事件轮询间隔
-memory_cooldown_seconds = 21600.0  # 记忆事件冷却（6 小时）
-memory_date_score = 50.0       # 日期匹配基准分
-memory_lookup_score = 70.0     # 记忆查询基准分
-memory_lookup_query = "recent important user preferences, plans, dates, anniversaries, goals"
+vision_timeout = 45            # 视觉 API 超时（秒），最小 5
 ```
+
+记忆事件配置已移至 `[proactive]` 节下，详见 [memory.md](memory.md)。
 
 ## 禁用
 

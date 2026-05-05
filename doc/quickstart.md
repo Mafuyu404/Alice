@@ -3,7 +3,7 @@
 ## 环境要求
 
 - Python 3.10+
-- Windows（立绘叠加层依赖 Win32 API，屏幕识别需要）
+- Windows（立绘叠加层依赖 Win32 API；屏幕识别需要 `pywin32` + `pillow`）
 - 麦克风（语音模式需要）
 
 ## 安装依赖
@@ -23,6 +23,15 @@ pip install sherpa-onnx sounddevice numpy
 
 # 立绘窗口（可选）
 pip install PySide6
+
+# MiniMax TTS WebSocket（可选，使用 minimax 后端时需要）
+pip install websockets
+
+# Cartesia TTS（可选，使用 cartesia 后端时需要）
+pip install cartesia
+
+# 屏幕截图与窗口枚举（可选，屏幕监控需要）
+pip install pillow pywin32
 ```
 
 ## 配置
@@ -36,8 +45,11 @@ pip install PySide6
 llm_url = "http://127.0.0.1:11434"
 llm_model = "deepseek-v4-flash"
 
-# 记忆后端："mem0" 或 "none"
+# 记忆后端："mem0"、"kokoromemo" 或 "none"
 memory_backend = "mem0"
+
+# TTS 后端："minimax" 或 "cartesia"
+tts_backend = "minimax"
 ```
 
 ### 2. API 密钥（可选）
@@ -58,7 +70,7 @@ memory_backend = "mem0"
 
 ### 3. 角色配置
 
-`characters.json` 中预制了 `alice` 角色。可通过 Web UI 或直接编辑该文件来添加/修改角色。详见 [character.md](character.md)。
+`characters.json` 中预制了 `alice` 和 `yuki` 两个角色。可通过 Web UI 或直接编辑该文件来添加/修改角色。详见 [character.md](character.md)。
 
 ## 启动
 
@@ -73,12 +85,29 @@ python cli.py
 | 参数 | 作用 |
 |------|------|
 | `--character alice` | 指定角色 ID（默认 alice） |
-| `--model qwen2.5:7b` | 指定对话模型 |
+| `--model qwen2.5:7b` | 指定对话模型（覆盖 config.toml） |
+| `--device 0` | 指定麦克风设备 ID |
 | `--list-devices` | 列出可用麦克风设备 |
 | `--no-tts` | 禁用语音输出 |
 | `--no-portrait` | 禁用立绘叠加层 |
 | `--no-proactive` | 禁用主动搭话 |
 | `--no-screen-watch` | 禁用屏幕识别 |
+
+启动后会显示各模块状态：
+```
+==================================================
+  Alice CLI
+  Character: 爱丽丝·玛格特罗伊德
+  Model: deepseek-v4-flash
+  Microphone: [1]
+  TTS: True
+  Portrait: True
+  Proactive: True
+  Screen watch: True
+  Memory events: True
+  Ctrl+C to stop
+==================================================
+```
 
 ### 文字模式
 
@@ -86,7 +115,9 @@ python cli.py
 python webui.py
 ```
 
-打开 http://localhost:8080 即可在浏览器中对话。可通过 `--port` 和 `--host` 参数自定义地址。
+打开 http://localhost:8080 即可在浏览器中对话。可通过 `--port`、`--host`、`--model`、`--character` 参数自定义。
+
+WebUI 启动时会自动尝试连接 LLM 后端，如果 `LLM_BACKEND_CMD` 环境变量已设置且 LLM 不可用，则自动启动后端进程。当 `memory_backend = "kokoromemo"` 时，也会自动启动 `kokoromemo-server.exe`。
 
 ## 快速测试
 
@@ -96,8 +127,8 @@ python webui.py
 # Ollama
 curl http://localhost:11434/api/tags
 
-# 测试聊天
-python webui.py --model qwen2.5:7b
+# 测试聊天（文字模式）
+python webui.py
 ```
 
 ## 目录结构
@@ -109,13 +140,13 @@ python webui.py --model qwen2.5:7b
 ├── config.json                     # 本地密钥（已 gitignore）
 ├── characters.json                 # 角色定义
 ├── prompts.json                    # 所有提示词集中管理
-├── portrait_notes.json             # 立绘注释（用于 AI 选图）
+├── portrait_notes.json             # 立绘注释（供 LLM 选图用）
+├── portrait_map.json               # 立绘素材映射（供 overlay 轮播用）
 ├── overlay_slideshow.py            # 立绘窗口（PySide6）
-├── local_llm.py                    # 本地模型后备
 ├── img/                            # 立绘素材
 ├── doc/                            # 文档
-│   ├── quickstart.md               # 本文件
 │   ├── overview.md                 # 框架概述
+│   ├── quickstart.md               # 本文件
 │   ├── config.md                   # 配置系统
 │   ├── character.md                # 角色系统
 │   ├── chat_session.md             # 对话会话与 LLM 客户端
@@ -126,7 +157,11 @@ python webui.py --model qwen2.5:7b
 │   ├── proactive.md                # 主动搭话调度器
 │   ├── screen_interest.md          # 屏幕兴趣检测
 │   ├── portrait.md                 # 立绘系统
-│   └── webui.md                    # Web UI
+│   ├── webui.md                    # Web UI
+│   └── user_commands.md            # 用户命令
+├── models/
+│   └── stt/                        # sherpa-onnx 模型（自动下载）
+├── mem0_data/                      # mem0 本地向量库数据
 └── kokoro/
     ├── __init__.py                 # 模块入口
     ├── config.py                   # 配置加载
@@ -136,14 +171,14 @@ python webui.py --model qwen2.5:7b
     ├── llm_client.py               # LLM 客户端
     ├── pool.py                     # STT 精炼池
     ├── stt.py                      # 语音识别
-    ├── tts.py                      # TTS 调度
+    ├── tts.py                      # TTS 调度（动态加载）
     ├── tts_minimax.py              # MiniMax TTS
     ├── tts_cartesia.py             # Cartesia TTS
     ├── memory.py                   # 记忆后端
     ├── memory_events.py            # 记忆事件检测
     ├── proactive.py                # 主动搭话调度器
     ├── screen_interest.py          # 屏幕兴趣检测
-    ├── vision.py                   # 视觉识别
+    ├── vision.py                   # 视觉识别 + 截图 + 窗口枚举
     ├── portrait_controller.py      # 立绘控制器
-    └── user_commands.py            # 用户命令检测
+    └── user_commands.py            # 用户命令检测与执行
 ```

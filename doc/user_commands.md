@@ -8,28 +8,48 @@
 
 ### 支持的命令类型
 
-| 类型 | 触发短语示例 |
-|------|-------------|
-| `screen.inspect` | "帮我看看屏幕"、"你看得见我在干嘛吗"、"分析一下这个页面"、"read this screen" 等 |
+| 类型 | 常量 | 描述 |
+|------|------|------|
+| `screen.inspect` | `TYPE_SCREEN_INSPECT` | 用户要求查看/分析屏幕内容 |
 
 ### 检测机制
 
-1. 从用户语音文本中匹配多组正则模式（`SCREEN_COMMAND_PATTERNS`）
-2. 结合动作词（看/瞅/扫/look/scan）和对象词（屏幕/窗口/page/screen）综合判断
-3. 排除负向表达（"不用看""别看"）和自我描述（"我自己看了半天"）
+`detect(text)` 函数使用多层策略：
+
+1. **预处理**：`_normalize(text)` 去除所有空白字符
+2. **排除检查**：
+   - `NEGATIVE_RE` — 排除负向表达（"不用看""别看""don't look"）
+   - `NON_COMMAND_RE` — 排除自我描述（"我看了半天屏幕眼睛累了"）
+3. **精准匹配**：6 组 `SCREEN_COMMAND_PATTERNS` 正则模式，覆盖中英文自然表达
+4. **通用匹配**：`SCREEN_ACTION_RE`（看/瞅/look/scan 等） + `SCREEN_OBJECT_RE`（屏幕/窗口/page 等）
 
 ### 置信度
 
 - 精准匹配预定义模式 → `confidence = 0.95`
-- 通用动作+对象匹配 → `confidence = 0.75`
+- 通用动作 + 对象匹配 → `confidence = 0.75`
+
+### 正则模式覆盖
+
+6 组模式覆盖以下表达类型：
+1. 中文请求式：帮我看看屏幕 / 你能看一下这个页面吗
+2. 中文对象式：看看我的屏幕 / 分析一下我的桌面
+3. 中文疑问式：屏幕上有什么 / 这个界面显示什么
+4. 中文上下文式：下一步怎么办 / 用什么技能
+5. 英文指令式：look at my screen / read this page
+6. 英文疑问式：what's on my screen / what is on this page
 
 ## 命令执行
 
-`execute(command)` 接收检测到的命令并执行：
+`execute(command, timeout=45)` 接收检测到的命令并执行：
 
-1. **前置检查**：检测前台窗口是否涉及隐私（密码、支付、会议等），是则返回 privacy 结果
-2. **视觉分析**：使用专门的 `user_commands.screen_inspect_prompt` 提示词调用视觉 API，重点读取前台窗口的文字内容（标题、正文、按钮、错误信息、输入框、列表项、状态提示）
-3. **结果组装**：返回 `CommandResult`，包含原始屏幕描述和格式化上下文
+1. **前置检查**：调用 `vision.get_foreground_app()` 获取前台窗口 → `screen_interest.foreground_is_private()` 检查隐私。涉及隐私则返回 `privacy_context` + `privacy_note`
+2. **视觉分析**：调用 `vision.detect_desktop()` — 全屏截图 + 枚举所有运行窗口 + 调用视觉 API，使用 `user_commands.screen_inspect_prompt` 作为分析提示（注入 `{user_text}`）
+3. **结果组装**：返回 `CommandResult`，通过 `format_context()` 使用 `user_commands.screen_result_context` 模板格式化（注入 `{screen_content}` `{user_text}`）
+
+`detect_desktop()` 与普通屏幕监控 `analyze()` 的区别：
+- 使用全屏截图 + 窗口枚举组合，信息更全面
+- 注入 `vision.analyze_suffix`（含运行窗口列表）
+- 使用独立的命令专用提示词
 
 ## CommandResult
 
@@ -38,11 +58,11 @@
 class CommandResult:
     type: str                # 命令类型
     ok: bool                 # 是否成功
-    context: str             # 格式化后的对话上下文（含用户原话）
-    screen_context: str      # 原始屏幕描述
+    context: str             # 格式化后的对话上下文（注入 LLM 消息中）
+    screen_context: str      # 原始屏幕描述（存入 session.screen_contexts）
     score: float             # 兴趣度（指令触发固定 100.0）
     private: bool            # 是否隐私内容
-    user_visible_note: str   # 给用户的反馈文本
+    user_visible_note: str   # 给用户的反馈文本（打印到终端）
     error: str               # 错误信息
 ```
 
@@ -50,18 +70,31 @@ class CommandResult:
 
 `build_waiting_reply()` 在视觉分析完成前生成一句自然的等待回应（如"好，我看一下"），避免用户感觉冷场：
 
-- 调用小模型（复用 STT 精炼的 LLM）生成等待式回应
-- 参考角色设定和最近上下文，保持语气一致
-- 6-18 个汉字，简洁自然
+- 调用小模型（复用 STT 精炼 LLM 的地址和模型）生成等待式回应
+- 参考角色系统提示词和最近 6 条对话历史，保持语气一致
+- 使用 `user_commands.waiting_system` + `user_commands.waiting_user` 提示词模板
+- 回应经 `_clean_waiting_reply()` 清洗（去引号、去前缀、去空白、截断至 40 字符）
+- 失败时降级到 `user_commands.waiting_fallback`
+- 等待回应通过 TTS 播放同时视觉分析在后台进行（并行优化）
 
 ## CLI 集成
 
-`cli.py` 中，用户文本先经过 `user_commands.detect()`：
+`cli.py` 的 `on_refined()` 回调中，用户文本先经过 `user_commands.detect()`：
 
 ```
-用户输入 → detect() 检测到命令 → 等待回应 → 视觉分析 → 注入结果上下文
-    ↓                                      ↓
-  未检测到命令                           指令成功/失败
-    ↓                                      ↓
-  正常对话流程                         插入 system 消息继续对话
+用户输入 → detect() 检测到命令 → 取消活跃的 screen_watch
+    │                                    ↓
+    ├─ 未检测到命令                   _run_vision() 后台线程
+    │                                    ↓
+    └─→ 正常对话流程              build_waiting_reply() + TTS 播放
+                                       ↓
+                                  vision_ready.wait()
+                                       ↓
+                                  result.context 注入对话
+                                       ↓
+                                  build_messages(extra_context=result.context)
+                                       ↓
+                                  chat_stream() → 正常回复
 ```
+
+命令执行期间会取消当前活跃的 screen_watch 任务，并清零 SCREEN 冲动值，避免命令分析与周期性屏幕监控冲突。

@@ -220,6 +220,21 @@ def main() -> None:
                     scheduler.desires[proactive.Behavior.SCREEN] = 0.0
                     scheduler.screen_context = ""
                     print("\n  [screen] active watch canceled by command")
+
+                # Start vision immediately, parallel with waiting-reply LLM + TTS
+                vision_result: list[user_commands.CommandResult | Exception | None] = [None]
+                vision_ready = threading.Event()
+
+                def _run_vision() -> None:
+                    try:
+                        vision_result[0] = user_commands.execute(command, timeout=screen_vision_timeout)
+                    except Exception as exc:
+                        vision_result[0] = exc
+                    finally:
+                        vision_ready.set()
+
+                threading.Thread(target=_run_vision, daemon=True).start()
+
                 try:
                     waiting_reply = user_commands.build_waiting_reply(
                         text,
@@ -239,17 +254,22 @@ def main() -> None:
                     while tts_engine.is_playing:
                         time.sleep(0.1)
 
-                result = user_commands.execute(command, timeout=screen_vision_timeout)
-                command_context = result.context
-                if result.ok and result.screen_context:
-                    scheduler.desires[proactive.Behavior.SCREEN] = 0.0
-                    scheduler.screen_context = ""
-                    session.add_screen_context(result.screen_context)
-                    print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context.split(chr(10))[0]}")
-                elif result.user_visible_note:
-                    label = "private" if result.private else "error"
-                    print(f"\n  [screen] command {label}: {result.user_visible_note}")
-                    command_context = result.context or result.user_visible_note
+                vision_ready.wait()
+                result = vision_result[0]
+                if isinstance(result, Exception):
+                    command_context = ""
+                    print(f"\n  [screen] command error: {result}")
+                else:
+                    command_context = result.context
+                    if result.ok and result.screen_context:
+                        scheduler.desires[proactive.Behavior.SCREEN] = 0.0
+                        scheduler.screen_context = ""
+                        session.add_screen_context(result.screen_context)
+                        print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context.split(chr(10))[0]}")
+                    elif result.user_visible_note:
+                        label = "private" if result.private else "error"
+                        print(f"\n  [screen] command {label}: {result.user_visible_note}")
+                        command_context = result.context or result.user_visible_note
 
             messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline)
 
