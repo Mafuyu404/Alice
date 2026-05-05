@@ -8,6 +8,7 @@ helpers live in kokoro package modules so webui.py can share the same core.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 import traceback
@@ -28,6 +29,31 @@ from kokoro import screen_interest
 from kokoro import stt as stt_mod
 from kokoro import tts as tts_mod
 from kokoro import user_commands
+
+
+_PAREN_STRIP_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*")
+
+def _strip_parens(text: str) -> str:
+    return _PAREN_STRIP_RE.sub("", text).strip()
+
+
+class _ParenFilter:
+    """Stateful filter to remove parenthetical content during streaming."""
+
+    def __init__(self):
+        self._depth = 0
+
+    def filter(self, text: str) -> str:
+        result: list[str] = []
+        for ch in text:
+            if ch in "（(":
+                self._depth += 1
+            elif ch in "）)":
+                if self._depth > 0:
+                    self._depth -= 1
+            elif self._depth == 0:
+                result.append(ch)
+        return "".join(result)
 
 
 CONFIG = cfg.load()
@@ -61,8 +87,12 @@ def chat_stream(
     reply = ""
     t0 = time.perf_counter()
     first_token_at = 0.0
+    paren_filter = _ParenFilter()
 
     for content in llm_client.stream_chat(messages, model):
+        content = paren_filter.filter(content)
+        if not content:
+            continue
         if not first_token_at:
             first_token_at = time.perf_counter()
             print(f"\n  [latency] llm_first_token {first_token_at - t0:.2f}s")
@@ -73,6 +103,7 @@ def chat_stream(
             tts_engine.push(content)
 
     print()
+    reply = _strip_parens(reply)
     if reply and tts_engine:
         tts_engine.end_sentence()
     print(f"  [latency] llm_done {time.perf_counter() - t0:.2f}s")
@@ -220,7 +251,7 @@ def main() -> None:
                     print(f"\n  [screen] command {label}: {result.user_visible_note}")
                     command_context = result.context or result.user_visible_note
 
-            messages = session.build_messages(text, extra_context=command_context)
+            messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline)
 
             try:
                 reply = chat_stream(messages, session.character_name, model, tts_engine)
@@ -243,11 +274,14 @@ def main() -> None:
                 tts_engine.prepare()
 
     refine_url, refine_model, refine_key = refine_endpoint()
+    stt_refine_mode = cfg.stt_refine_mode()
+    stt_refine_inline = stt_refine_mode == "inline"
     pool = pool_mod.ConversationPool(
         llm_url=refine_url,
         llm_model=refine_model,
         on_refined=on_refined,
         api_key=refine_key,
+        mode=stt_refine_mode,
     )
 
     device = args.device if args.device is not None else stt_mod.find_input_device()

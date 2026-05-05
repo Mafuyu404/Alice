@@ -16,6 +16,36 @@ from kokoro import prompts
 logger = logging.getLogger(__name__)
 
 
+def local_clean_stt(text: str) -> str:
+    """Basic regex-based STT cleaning — zero latency, no LLM.
+
+    Handles the most common ASR artifacts:
+      - Character-level stutter: "我我我想" → "我想"
+      - Word/phrase-level stutter: "那个那个那个" → "那个"
+      - Excessive punctuation: "！！！" → "！"
+      - Whitespace normalization
+    """
+    if not text or not text.strip():
+        return text
+
+    # Merge multiple spaces/newlines
+    text = re.sub(r"\s+", "", text)
+
+    # Word-level stutter (2-4 char phrases repeated 3+ times)
+    text = re.sub(r"(.{2,4}?)\1{2,}", r"\1", text)
+
+    # Character-level stutter (same char 3+ times)
+    text = re.sub(r"(.)\1{2,}", r"\1", text)
+
+    # Collapse excessive punctuation to single
+    text = re.sub(r"([。！？!?，,、….])\1+", r"\1", text)
+
+    return text.strip()
+
+
+_STUTTER_RE = re.compile(r"(.)\1{2,}|[?？]{2,}|[。！？!?，,、]{2,}")
+
+
 class ConversationPool:
     """Accumulates STT output and refines stable text in a single worker."""
 
@@ -29,6 +59,7 @@ class ConversationPool:
         tick_seconds: float | None = None,
         max_tokens: int | None = None,
         skip_short_refine: bool | None = None,
+        mode: str | None = None,
     ):
         self.llm_url = llm_url.rstrip("/")
         self.llm_model = llm_model
@@ -40,6 +71,7 @@ class ConversationPool:
         self.skip_short_refine = bool(
             skip_short_refine if skip_short_refine is not None else cfg.stt_skip_short_refine()
         )
+        self.mode = mode if mode is not None else cfg.stt_refine_mode()
 
         self._raw = ""
         self._last_refined_text = ""
@@ -83,7 +115,7 @@ class ConversationPool:
         if len(stripped) > cfg.stt_skip_short_refine_max_chars():
             return False
         # Refine short text only when it contains obvious ASR artifacts.
-        return not re.search(r"(.)\1{2,}|[?？]{2,}|[。！？!?，,、]{2,}", stripped)
+        return not _STUTTER_RE.search(stripped)
 
     def _refine(self, text: str) -> Optional[str]:
         user_prompt = prompts.format_prompt("stt_refine.user_template", text=text)
@@ -142,12 +174,23 @@ class ConversationPool:
                 continue
 
             t0 = time.perf_counter()
-            result = text_to_refine.strip() if self._should_skip_refine(text_to_refine) else self._refine(text_to_refine)
+
+            if self.mode == "separate":
+                # Current behavior: LLM refine (skip for short/clean text)
+                result = text_to_refine.strip() if self._should_skip_refine(text_to_refine) else self._refine(text_to_refine)
+                skip = result == text_to_refine.strip()
+            else:
+                # inline / none: local regex cleaning only, no LLM refine call
+                result = local_clean_stt(text_to_refine)
+                skip = True
+
             elapsed = time.perf_counter() - t0
-            print(f"\n  [latency] stt_refine {elapsed:.2f}s skip={result == text_to_refine.strip()}")
+            label = "local" if skip else self.mode
             if result is None:
+                print(f"\n  [latency] stt_refine {elapsed:.2f}s mode={label} FAILED")
                 time.sleep(1.0)
                 continue
+            print(f"\n  [latency] stt_refine {elapsed:.2f}s mode={label}")
             if result and result != self._last_output:
                 self._last_output = result
                 self._advance_processed()

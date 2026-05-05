@@ -119,6 +119,10 @@ def stt_refine_model() -> str:
     return get("stt_refine_model", "qwen2.5:1.5b")
 
 
+def stt_refine_mode() -> str:
+    return get("stt_refine_mode", "separate")
+
+
 def stt_pause_during_tts() -> bool:
     return bool(get("stt_pause_during_tts", False))
 

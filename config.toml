@@ -83,7 +83,7 @@ minimax_tts_speed = 1.05
 # 类型: float
 # 值越大播放越流畅（减少卡顿），但首音延迟越高。
 # 敏感场景（需要快速响应）设 0.05 ~ 0.15，流畅优先设 0.3 ~ 0.5。
-minimax_tts_buffer_seconds = 0.5
+minimax_tts_buffer_seconds = 0.3
 # LLM 流式输出累积多少字符后强制刷新 TTS 缓冲区。
 # 类型: int
 # 较小值让 TTS 更快开始说话（但可能断句不自然），较大值等待更完整句子。
@@ -110,6 +110,17 @@ stt_model_dir = "models/stt"
 # 模型越强精炼效果越好，但延迟也越高。建议 1.5b ~ 7b。
 # 设为 "" 可跳过精炼（直接使用原始 STT 结果）。
 stt_refine_model = "qwen2.5:1.5b"
+
+# STT 精炼模式。
+# 类型: string
+# 可选值:
+#   "separate" - 独立精炼 LLM 调用（默认，当前行为），精炼完再聊天
+#   "inline"   - 本地正则预清洗 + 聊天 LLM 隐式纠错，一次调用完成
+#   "none"     - 仅本地正则预清洗，不调用任何 LLM 精炼
+# separate 质量最高但延迟最大（精炼 LLM 串行阻塞）。
+# inline 延迟最低，聊天 LLM 在回复时自然纠正少量同音错字。
+# none 零 LLM 开销，适合 STT 准确率已经很高的场景。
+stt_refine_mode = "inline"
 
 # STT 文本稳定判定间隔（秒）。
 # 类型: float

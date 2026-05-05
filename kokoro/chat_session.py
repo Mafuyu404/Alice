@@ -38,6 +38,7 @@ class ChatSession:
         user_text: str,
         include_screen: bool = True,
         extra_context: str | None = None,
+        stt_refine_inline: bool = False,
     ) -> list[dict]:
         messages = [{"role": "system", "content": self.system_prompt}]
         if extra_context:
@@ -51,6 +52,10 @@ class ChatSession:
         if memory_ctx:
             messages.append({"role": "system", "content": memory_ctx})
         messages.extend(self.history)
+        if stt_refine_inline:
+            inline_prompt = prompts.get("stt_refine_inline.system", "")
+            if inline_prompt:
+                messages.append({"role": "system", "content": inline_prompt})
         messages.append({"role": "user", "content": user_text})
         return messages
 
