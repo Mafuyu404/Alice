@@ -46,7 +46,9 @@ minimax_sample_rate = 32000
 # 语速倍率。>1 加快，<1 减慢。
 minimax_tts_speed = 1.05
 # 播放前预缓冲的音频秒数。越大越流畅但延迟越高。
-minimax_tts_buffer_seconds = 0.3
+minimax_tts_buffer_seconds = 0.15
+tts_stream_chunk_chars = 28
+tts_stream_sentence_min_chars = 8
 
 # ---------------------------------------------------------------------------
 # STT — 语音转文字
@@ -56,6 +58,11 @@ minimax_tts_buffer_seconds = 0.3
 stt_model_dir = "models/stt"
 # 用于精炼 STT 原始识别结果的小模型。
 stt_refine_model = "qwen2.5:1.5b"
+stt_refine_stable_seconds = 0.45
+stt_pool_tick_seconds = 0.05
+stt_refine_max_tokens = 128
+stt_skip_short_refine = true
+stt_skip_short_refine_max_chars = 18
 # 为 true 时，TTS 播放期间暂停麦克风输入，防止回声。
 stt_pause_during_tts = true
 

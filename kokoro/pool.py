@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 import urllib.request
 from typing import Callable, Optional
 
+from kokoro import config as cfg
 from kokoro import prompts
 
 logger = logging.getLogger(__name__)
@@ -23,11 +25,21 @@ class ConversationPool:
         llm_model: str = "qwen2.5:0.5b",
         on_refined: Optional[Callable[[str], None]] = None,
         api_key: Optional[str] = None,
+        stable_seconds: float | None = None,
+        tick_seconds: float | None = None,
+        max_tokens: int | None = None,
+        skip_short_refine: bool | None = None,
     ):
         self.llm_url = llm_url.rstrip("/")
         self.llm_model = llm_model
         self.on_refined = on_refined
         self.api_key = api_key
+        self.stable_seconds = float(stable_seconds if stable_seconds is not None else cfg.stt_refine_stable_seconds())
+        self.tick_seconds = float(tick_seconds if tick_seconds is not None else cfg.stt_pool_tick_seconds())
+        self.max_tokens = int(max_tokens if max_tokens is not None else cfg.stt_refine_max_tokens())
+        self.skip_short_refine = bool(
+            skip_short_refine if skip_short_refine is not None else cfg.stt_skip_short_refine()
+        )
 
         self._raw = ""
         self._last_refined_text = ""
@@ -60,9 +72,18 @@ class ConversationPool:
             last_sent = self._last_refined_text
             since = time.time() - self._last_chunk_time
 
-        if not raw or raw == last_sent or since < 0.8:
+        if not raw or raw == last_sent or since < self.stable_seconds:
             return None
         return raw
+
+    def _should_skip_refine(self, text: str) -> bool:
+        if not self.skip_short_refine:
+            return False
+        stripped = text.strip()
+        if len(stripped) > cfg.stt_skip_short_refine_max_chars():
+            return False
+        # Refine short text only when it contains obvious ASR artifacts.
+        return not re.search(r"(.)\1{2,}|[?？]{2,}|[。！？!?，,、]{2,}", stripped)
 
     def _refine(self, text: str) -> Optional[str]:
         user_prompt = prompts.format_prompt("stt_refine.user_template", text=text)
@@ -79,7 +100,7 @@ class ConversationPool:
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.1,
-                "max_tokens": 512,
+                "max_tokens": self.max_tokens,
                 "thinking": {"type": "disabled"},
             }
         else:
@@ -91,7 +112,7 @@ class ConversationPool:
                     {"role": "user", "content": user_prompt},
                 ],
                 "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 512},
+                "options": {"temperature": 0.1, "num_predict": self.max_tokens},
             }
 
         try:
@@ -117,10 +138,13 @@ class ConversationPool:
         while self._running:
             text_to_refine = self._get_text_to_refine()
             if text_to_refine is None:
-                time.sleep(0.2)
+                time.sleep(self.tick_seconds)
                 continue
 
-            result = self._refine(text_to_refine)
+            t0 = time.perf_counter()
+            result = text_to_refine.strip() if self._should_skip_refine(text_to_refine) else self._refine(text_to_refine)
+            elapsed = time.perf_counter() - t0
+            print(f"\n  [latency] stt_refine {elapsed:.2f}s skip={result == text_to_refine.strip()}")
             if result is None:
                 time.sleep(1.0)
                 continue

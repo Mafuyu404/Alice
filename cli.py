@@ -8,6 +8,7 @@ helpers live in kokoro package modules so webui.py can share the same core.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 import traceback
@@ -59,17 +60,40 @@ def chat_stream(
 ) -> str:
     print(f"\n{char_name}: ", end="", flush=True)
     reply = ""
+    t0 = time.perf_counter()
+    first_token_at = 0.0
+    tts_buf = ""
 
     for content in llm_client.stream_chat(messages, model):
+        if not first_token_at:
+            first_token_at = time.perf_counter()
+            print(f"\n  [latency] llm_first_token {first_token_at - t0:.2f}s")
+            print(f"{char_name}: ", end="", flush=True)
         print(content, end="", flush=True)
         reply += content
         if tts_engine:
             tts_engine.push(content)
+            tts_buf += content
+            if should_flush_tts(tts_buf):
+                tts_engine.end_sentence()
+                tts_buf = ""
 
     print()
     if reply and tts_engine:
-        tts_engine.end_sentence()
+        if tts_buf:
+            tts_engine.end_sentence()
+    print(f"  [latency] llm_done {time.perf_counter() - t0:.2f}s")
     return reply
+
+
+def should_flush_tts(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) >= int(CONFIG.get("tts_stream_chunk_chars", 28)):
+        return True
+    min_chars = int(CONFIG.get("tts_stream_sentence_min_chars", 8))
+    return len(stripped) >= min_chars and re.search(r"[。！？!?；;，,、]\s*$", stripped) is not None
 
 
 def create_tts_engine(enabled: bool):

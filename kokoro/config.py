@@ -123,6 +123,26 @@ def stt_pause_during_tts() -> bool:
     return bool(get("stt_pause_during_tts", False))
 
 
+def stt_refine_stable_seconds() -> float:
+    return float(get("stt_refine_stable_seconds", 0.45))
+
+
+def stt_pool_tick_seconds() -> float:
+    return float(get("stt_pool_tick_seconds", 0.05))
+
+
+def stt_refine_max_tokens() -> int:
+    return int(get("stt_refine_max_tokens", 128))
+
+
+def stt_skip_short_refine() -> bool:
+    return bool(get("stt_skip_short_refine", True))
+
+
+def stt_skip_short_refine_max_chars() -> int:
+    return int(get("stt_skip_short_refine_max_chars", 18))
+
+
 def api_base() -> str:
     kb = kokoromo_url()
     mb = memory_backend()

@@ -6,6 +6,7 @@ import io
 import logging
 import queue
 import threading
+import time
 from typing import Generator, Optional, Tuple
 
 import numpy as np
@@ -158,13 +159,20 @@ class StreamingTTS:
         self._should_stop = True
 
     def _play_text(self, text: str) -> None:
+        t0 = time.perf_counter()
         try:
             if self._should_stop:
                 return
             with self._play_lock:
                 with self._state_lock:
                     self._is_playing = True
-                chunks = [audio for audio, _ in text_to_speech_stream(text, self._voice_id, 1.0)]
+                chunks = []
+                first_audio_logged = False
+                for audio, _ in text_to_speech_stream(text, self._voice_id, 1.0):
+                    if not first_audio_logged:
+                        first_audio_logged = True
+                        print(f"\n  [latency] tts_first_audio {time.perf_counter() - t0:.2f}s")
+                    chunks.append(audio)
                 _play_audio_chunks(chunks)
         finally:
             with self._state_lock:

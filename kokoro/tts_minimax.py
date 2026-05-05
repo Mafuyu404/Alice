@@ -190,6 +190,7 @@ class StreamingTTS:
         self._active_fetches = 0
         self._state_lock = threading.Lock()
         self._fetch_lock = threading.Lock()
+        self._first_audio_logged = False
         self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._play_thread: threading.Thread | None = None
         self._stream: sd.OutputStream | None = None
@@ -236,11 +237,15 @@ class StreamingTTS:
             self._stream = None
 
     def _fetch_worker(self, text: str) -> None:
+        t0 = time.perf_counter()
         try:
             with self._fetch_lock:
                 for audio, _ in text_to_speech_stream(text, self._voice_id, self._speed):
                     if self._should_stop:
                         break
+                    if not self._first_audio_logged:
+                        self._first_audio_logged = True
+                        print(f"\n  [latency] tts_first_audio {time.perf_counter() - t0:.2f}s")
                     self._audio_queue.put(audio)
         except Exception as exc:
             logger.warning("TTS fetch failed: %s", exc)
