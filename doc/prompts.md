@@ -2,58 +2,116 @@
 
 ## 概述
 
-所有 LLM 提示词集中在 `prompts.json` 中，由 `kokoro/prompts.py` 加载和格式化。集中管理便于修改和维护。
+所有 LLM 提示词集中在 `prompts.json` 中，由 `kokoro/prompts.py` 加载和格式化。集中管理便于统一修改和维护。`prompts.py` 内含一套内置默认值，`prompts.json` 中的值会递归覆盖默认值。
 
 ## 加载方式
 
 ```python
 from kokoro import prompts
+
+# 获取纯文本
 content = prompts.get("section.key")
+
+# 格式化（Python str.format）
 content = prompts.format_prompt("section.key", var1=value1, var2=value2)
 ```
 
 ## 提示词结构
 
+### 角色系统
+
 | 键 | 用途 |
 |------|------|
-| `character_system.template` | 角色设定模板，被 build_system_prompt() 使用 |
-| `stt_refine.system` | STT 精炼系统提示词 |
-| `stt_refine.user_template` | STT 精炼用户提示模板（参数：`{text}`） |
+| `character_system.template` | 角色设定模板（含对话守则 + 格式要求），被 `build_system_prompt()` 使用。参数：`{name}` `{description}` `{personality}` `{background_block}` `{relationship_block}` |
+| `character_system.expression_calibration` | 表达校准规则。拼接在 template 之后，约束语音对话的写实性、回答风格 |
+
+### STT 精炼
+
+| 键 | 用途 |
+|------|------|
+| `stt_refine.system` | 精炼系统提示词 |
+| `stt_refine.user_template` | 精炼用户提示模板。参数：`{text}` |
+
+### 记忆
+
+| 键 | 用途 |
+|------|------|
 | `memory_importance.system` | 判断对话是否值得记忆 |
-| `memory_importance.user` | 记忆重要度判断用户提示词 |
+| `memory_importance.user_template` | 记忆重要度判断。参数：`{user_msg}` `{assistant_msg}` |
+
+### 立绘选择
+
+| 键 | 用途 |
+|------|------|
 | `portrait_selection.system` | 立绘选择系统提示词 |
-| `portrait_selection.time_info_idle` | 空闲时的时间信息 |
-| `portrait_selection.time_info_recent` | 对话刚结束时的沉浸式时间信息 |
-| `proactive.idle` | IDLE 主动搭话提示词 |
-| `proactive.recent` | RECENT 主动搭话提示词 |
-| `proactive.mem` | MEM 主动搭话提示词 |
-| `proactive.screen` | SCREEN 主动搭话提示词 |
+| `portrait_selection.user_template` | 选择请求模板。参数：`{current_id}` `{user_text}` `{assistant_text}` `{time_info}` `{catalog}` |
+| `portrait_selection.time_info_idle` | 空闲时间信息。参数：`{seconds}` |
+| `portrait_selection.time_info_recent` | 对话刚结束的时间信息 |
+
+### 主动搭话
+
+| 键 | 用途 |
+|------|------|
+| `proactive.idle` | IDLE 主动搭话的角色提示 |
+| `proactive.recent` | RECENT 主动搭话的角色提示 |
+| `proactive.mem` | MEM 主动搭话的角色提示 |
+| `proactive.screen` | SCREEN 主动搭话的角色提示 |
+| `proactive.screen_context_label` | SCREEN 上下文标签。参数：`{context}` |
+| `proactive.mem_context_label` | MEM 上下文标签。参数：`{context}` |
 | `proactive.trigger_system` | 主动搭话触发时的 system 提示词后缀 |
-| `screen_interest.content_analysis` | 屏幕兴趣分析（参数：`{fg_info}`） |
-| `memory_events.memory_lookup` | 记忆事件上下文提示词（参数：`{context}`） |
-| `vision.analyze_suffix` | 视觉分析后缀 |
+| `proactive.trigger_guidance_label` | 角色特定指导标签。参数：`{guidance}` |
 
-## 提示词注入机制
+### 屏幕兴趣
 
-### 主动搭话的提示词注入
+| 键 | 用途 |
+|------|------|
+| `screen_interest.content_analysis` | 屏幕截图分析提示词。参数：`{fg_info}` 要求输出详尽 JSON |
 
-`prompts.json` 中的 `proactive.*` 提示词包含 `{name}` 和 `{relationship}` 占位符（角色名和称呼），`prompts.format_prompt()` 填充后注入为 system 提示词。
+### 记忆事件
 
-`proactive.trigger_system` 在每个主动搭话轮次作为 system 提示词后缀注入，提醒 AI 这是主动行为。
+| 键 | 用途 |
+|------|------|
+| `memory_events.memory_lookup` | 记忆事件上下文提示。参数：`{context}` |
 
-### 角色特定指导
+### 用户命令
 
-`characters.json` 中的 `proactive_guidance` 字段在 `cli.py` 中以运行时追加的方式注入到主动搭话的 system 提示词中：
+| 键 | 用途 |
+|------|------|
+| `user_commands.screen_inspect_prompt` | 用户主动要求看屏幕时的分析提示。参数：`{user_text}` |
+| `user_commands.screen_result_context` | 屏幕指令执行后的上下文注入模板。参数：`{screen_content}` `{user_text}` |
+| `user_commands.waiting_system` | 等待屏幕识别时的等待回应系统提示 |
+| `user_commands.waiting_user` | 等待回应用户模板。参数：`{character_name}` `{character_text}` `{recent_text}` `{user_text}` |
+| `user_commands.waiting_fallback` | 等待回应的保底回复 |
+| `user_commands.privacy_context` / `privacy_note` | 隐私内容时的上下文和提示 |
+| `user_commands.screen_error_note` | 屏幕识别失败的提示 |
+| `user_commands.empty_screen_content` | 屏幕识别结果为空时的内容 |
 
-```python
-trigger_prompt = prompts.get("proactive.trigger_system")
-if char_data.get("proactive_guidance"):
-    trigger_prompt += "\n\n" + char_data["proactive_guidance"]
+### 视觉
+
+| 键 | 用途 |
+|------|------|
+| `vision.analyze_suffix` | 视觉分析后缀。参数：`{app_text}` |
+
+## 提示词注入流程
+
+### 正常对话
+```
+system: character_system.template + expression_calibration
+system: (extra_context — 指令结果等)
+system: 最近屏幕观察记录（自动从 screen_contexts 拼接）
+system: 记忆上下文（从 memory_backend.get_context 获取）
+history...
+user: 当前输入
 ```
 
-### 模板格式
-
-使用 Python `str.format()` 语法，支持命名占位符：
+### 主动搭话
 ```
-"请分析以下屏幕内容的基础信息，不要过度解读：\n{fg_info}"
+system: character_system.template + expression_calibration
+system: proactive.trigger_system + proactive.trigger_guidance_label
+system: proactive.{behavior}
+system: proactive.screen/mem_context_label （含 context）
+system: 最近屏幕观察记录
+system: 记忆上下文
+history...
+user: 内部触发指令
 ```

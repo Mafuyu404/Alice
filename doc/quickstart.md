@@ -3,7 +3,7 @@
 ## 环境要求
 
 - Python 3.10+
-- Windows（立绘叠加层依赖 Win32 API）
+- Windows（立绘叠加层依赖 Win32 API，屏幕识别需要）
 - 麦克风（语音模式需要）
 
 ## 安装依赖
@@ -20,13 +20,16 @@ pip install mem0ai
 
 # STT 语音识别（语音模式需要）
 pip install sherpa-onnx sounddevice numpy
+
+# 立绘窗口（可选）
+pip install PySide6
 ```
 
 ## 配置
 
 ### 1. 基本配置
 
-复制 `config.toml` 并根据需要修改：
+`config.toml` 是主配置文件，已包含所有可配置项及详细注释。核心配置：
 
 ```toml
 # LLM 地址（兼容 OpenAI 格式）
@@ -51,11 +54,11 @@ memory_backend = "mem0"
 }
 ```
 
-密钥也可通过环境变量设置：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`。
+部分密钥也可通过环境变量设置：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`。
 
 ### 3. 角色配置
 
-`characters.json` 中预制了 `alice` 角色。可通过 Web UI 或直接编辑该文件来添加/修改角色。
+`characters.json` 中预制了 `alice` 角色。可通过 Web UI 或直接编辑该文件来添加/修改角色。详见 [character.md](character.md)。
 
 ## 启动
 
@@ -83,7 +86,7 @@ python cli.py
 python webui.py
 ```
 
-打开 http://localhost:8080 即可在浏览器中对话。
+打开 http://localhost:8080 即可在浏览器中对话。可通过 `--port` 和 `--host` 参数自定义地址。
 
 ## 快速测试
 
@@ -102,30 +105,45 @@ python webui.py --model qwen2.5:7b
 ```
 ├── cli.py                          # 语音 CLI 入口
 ├── webui.py                        # Web UI 入口
-├── config.toml                     # 主配置文件
+├── config.toml                     # 主配置文件（所有可配置项 + 注释）
 ├── config.json                     # 本地密钥（已 gitignore）
 ├── characters.json                 # 角色定义
-├── prompts.json                    # 所有提示词
+├── prompts.json                    # 所有提示词集中管理
 ├── portrait_notes.json             # 立绘注释（用于 AI 选图）
-├── kokoro/
-│   ├── __init__.py                 # 模块入口
-│   ├── config.py                   # 配置加载
-│   ├── character.py                # 角色管理
-│   ├── prompts.py                  # 提示词加载
-│   ├── chat_session.py             # 对话会话
-│   ├── llm_client.py               # LLM 客户端
-│   ├── pool.py                     # STT 提炼池
-│   ├── stt.py                      # 语音识别
-│   ├── tts.py                      # TTS 调度
-│   ├── tts_minimax.py              # MiniMax TTS
-│   ├── tts_cartesia.py             # Cartesia TTS
-│   ├── memory.py                   # 记忆后端
-│   ├── memory_events.py            # 记忆事件检测
-│   ├── proactive.py                # 主动搭话调度器
-│   ├── screen_interest.py          # 屏幕兴趣检测
-│   ├── portrait_controller.py      # 立绘控制器
-│   └── vision.py                   # 视觉识别
-├── overlay_slideshow.py            # 立绘窗口（Qt）
+├── overlay_slideshow.py            # 立绘窗口（PySide6）
 ├── local_llm.py                    # 本地模型后备
-└── img/                            # 立绘素材
+├── img/                            # 立绘素材
+├── doc/                            # 文档
+│   ├── quickstart.md               # 本文件
+│   ├── overview.md                 # 框架概述
+│   ├── config.md                   # 配置系统
+│   ├── character.md                # 角色系统
+│   ├── chat_session.md             # 对话会话与 LLM 客户端
+│   ├── prompts.md                  # 提示词管理
+│   ├── stt.md                      # 语音识别
+│   ├── tts.md                      # 语音合成
+│   ├── memory.md                   # 记忆系统
+│   ├── proactive.md                # 主动搭话调度器
+│   ├── screen_interest.md          # 屏幕兴趣检测
+│   ├── portrait.md                 # 立绘系统
+│   └── webui.md                    # Web UI
+└── kokoro/
+    ├── __init__.py                 # 模块入口
+    ├── config.py                   # 配置加载
+    ├── character.py                # 角色管理
+    ├── prompts.py                  # 提示词加载
+    ├── chat_session.py             # 对话会话
+    ├── llm_client.py               # LLM 客户端
+    ├── pool.py                     # STT 精炼池
+    ├── stt.py                      # 语音识别
+    ├── tts.py                      # TTS 调度
+    ├── tts_minimax.py              # MiniMax TTS
+    ├── tts_cartesia.py             # Cartesia TTS
+    ├── memory.py                   # 记忆后端
+    ├── memory_events.py            # 记忆事件检测
+    ├── proactive.py                # 主动搭话调度器
+    ├── screen_interest.py          # 屏幕兴趣检测
+    ├── vision.py                   # 视觉识别
+    ├── portrait_controller.py      # 立绘控制器
+    └── user_commands.py            # 用户命令检测
 ```

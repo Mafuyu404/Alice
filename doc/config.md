@@ -6,11 +6,7 @@
 
 ### 合并规则
 
-`kokoro/config.py` 中的 `_merge_fallback()` 函数实现合并：
-
-```python
-_CONFIG = _merge_fallback(primary=toml_config, fallback=json_config)
-```
+`kokoro/config.py` 中的 `_merge_fallback(primary=toml, fallback=json)`：
 
 - TOML 中已存在的非空值优先
 - JSON 填充 TOML 中缺失或为空的值
@@ -35,113 +31,63 @@ _CONFIG = _merge_fallback(primary=toml_config, fallback=json_config)
 }
 ```
 
-部分密钥也可通过环境变量设置（`config.py` 会优先读取环境变量）：
+部分密钥也可通过环境变量设置（`config.py` 优先读取环境变量）：
 - `DEEPSEEK_API_KEY`
 - `DASHSCOPE_API_KEY`
 
-## 配置项参考
+## 配置加载流程
+
+1. `kokoro/config.py.load()` 首次调用时加载，后续返回缓存
+2. 清理所有 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，设置 `NO_PROXY=*`
+3. 读取 `config.toml`（使用 `tomllib`，Python 3.11+ 内置）
+4. 读取 `config.json`（密钥覆盖）
+5. 合并两层配置，全局缓存
+6. 各辅助函数（`llm_url()`、`tts_backend()` 等）内部调用 `get()` → `load()`
+
+## 配置项总览
+
+所有配置项及详细注释直接写在 `config.toml` 中。以下是各模块包含的主要配置组：
 
 ### LLM
 
-```toml
-# LLM 地址（兼容 OpenAI 格式）
-llm_url = "http://127.0.0.1:11434"
-# 默认对话模型
-llm_model = "deepseek-v4-flash"
-# 可用模型列表（供启动时选择或回退）
-available_models = ["qwen2.5:0.5b", "qwen2.5:1.5b", "qwen2.5:7b", "deepseek-v4-flash", "deepseek-v4-pro"]
-# DeepSeek API 密钥（环境变量 DEEPSEEK_API_KEY 优先）
-deepseek_api_key = ""
-# 本地 transformers 后备模型
-local_model = "Qwen/Qwen2.5-1.5B-Instruct"
-```
+`llm_url` `llm_model` `available_models` `deepseek_api_key` `local_model`
+
+LLM 地址兼容 OpenAI/Ollama 格式。模型名以 `deepseek` 开头时自动路由到 DeepSeek 云端 API。
 
 ### TTS
 
-```toml
-tts_backend = "minimax"        # "minimax" 或 "cartesia"
+`tts_backend` — `"minimax"` 或 `"cartesia"`，切换后自动加载对应后端模块。
 
-# Cartesia
-cartesia_api_key = ""
-tts_voice_id = ""
-tts_sample_rate = 24000
+MiniMax 特有：`minimax_model` `minimax_tts_speed` `minimax_tts_buffer_seconds`
 
-# MiniMax
-minimax_api_key = ""
-minimax_model = "speech-2.8-turbo"
-minimax_sample_rate = 32000
-minimax_tts_speed = 1.05       # 语速倍率
-minimax_tts_buffer_seconds = 0.3  # 预缓冲秒数
-```
+流式 TTS：`tts_stream_chunk_chars`（累积多少字符强制刷新缓冲区） `tts_stream_sentence_min_chars`（触发刷新的最小字符数，需配合句末标点）
 
 ### STT
 
-```toml
-stt_model_dir = "models/stt"          # ASR 模型目录
-stt_refine_model = "qwen2.5:1.5b"     # 精炼用模型
-stt_pause_during_tts = true           # TTS 时暂停麦克风
-```
+`stt_model_dir` `stt_refine_model` `stt_refine_stable_seconds`（静默判定时间，默认 0.6） `stt_pool_tick_seconds` `stt_refine_max_tokens` `stt_skip_short_refine` `stt_skip_short_refine_max_chars` `stt_pause_during_tts`
 
 ### 记忆
 
-```toml
-memory_backend = "mem0"               # "none" | "mem0" | "kokoromemo"
-kokoromo_url = "http://127.0.0.1:14514"
-kokoromo_dir = "D:/program/kokoromemo"
-```
+`memory_backend` — `"none"`（禁用）`"mem0"`（本地向量库）`"kokoromemo"`（外部服务）
+
+mem0 子配置：`[mem0.llm]` `[mem0.embedder]` `[mem0.lifecycle]`
 
 ### 立绘
 
-```toml
-portrait_overlay_host = "127.0.0.1"
-portrait_overlay_port = 17352
-portrait_decision_interval = 0.0      # 决策间隔（秒），0=默认
-portrait_decay_seconds = 60.0         # 无语音后恢复平静表情的秒数
-portrait_debug_overlay = true         # 显示调试信息
-portrait_click_through = false        # 鼠标点击穿透
-```
+`portrait_overlay_host/port` `portrait_decision_interval` `portrait_decay_seconds` `portrait_debug_overlay` `portrait_click_through`
 
 ### 视觉 / 屏幕识别
 
-```toml
-vision_backend = "dashscope"          # "dashscope" 或 "ollama"
-vision_model = "qwen-vl-plus"
-vision_api_key = ""
-```
+`vision_backend` `vision_model` `vision_api_key`
 
 ### 主动搭话调度器
+
+全局 `[proactive]` + 四类行为子配置：`[proactive.idle]` `[proactive.recent]` `[proactive.mem]` `[proactive.screen]`
 
 详见 [proactive.md](proactive.md)。
 
 ### 屏幕监控
 
+`[screen_watch]`：`watch_interval` `interest_threshold` `vision_timeout` 以及记忆事件子配置。
+
 详见 [screen_interest.md](screen_interest.md)。
-
-### Mem0 配置
-
-```toml
-[mem0.llm]
-provider = "ollama"
-base_url = "http://127.0.0.1:11434"
-model = "qwen2.5:1.5b"
-
-[mem0.embedder]
-provider = "fastembed"
-model = "BAAI/bge-small-zh-v1.5"
-embedding_dims = 512
-
-[mem0.lifecycle]
-importance_mode = "auto"
-search_threshold = 0.3
-search_top_k = 8
-```
-
-## 配置加载流程
-
-1. `kokoro/config.py` 的 `load()` 函数在首次调用时加载
-2. 清理所有 HTTP_PROXY 环境变量
-3. 读取 `config.toml` 和 `config.json`
-4. 合并两层配置
-5. 全局缓存 `_CONFIG` 变量，后续调用直接返回
-
-各个配置读取函数（`llm_url()`、`tts_backend()` 等）内部调用 `get()` → `load()`。
