@@ -209,9 +209,10 @@ class ConversationPool:
             print(f"\n  [latency] stt_refine {elapsed:.2f}s mode={label}")
             if result and result != self._last_output:
                 self._last_output = result
-                self._advance_processed()
                 if self.on_refined:
                     self.on_refined(result)
+                # 回调后才标记已处理——防止回调被拒时文本丢失
+                self._advance_processed()
             else:
                 self._advance_processed()
 

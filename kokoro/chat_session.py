@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import threading
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from kokoro import character
 from kokoro import prompts
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,6 +25,13 @@ class ChatSession:
     history: list[dict] = field(default_factory=list)
     screen_contexts: list[str] = field(default_factory=list)
     max_screen_contexts: int = 3
+    # Conversation summarization — compresses old history into a running summary
+    max_window: int = 40        # max messages before triggering summarization
+    compress_batch: int = 10    # oldest N messages to compress each time
+    summary: str = ""
+    summary_file: str = ""
+    _summarize_in_progress: bool = False
+    _summarize_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
     def character_name(self) -> str:
@@ -32,6 +45,27 @@ class ChatSession:
         self.screen_contexts.append(content)
         if len(self.screen_contexts) > self.max_screen_contexts:
             self.screen_contexts = self.screen_contexts[-self.max_screen_contexts:]
+
+    def load_summary(self) -> None:
+        if not self.summary_file:
+            return
+        try:
+            if os.path.exists(self.summary_file):
+                with open(self.summary_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.summary = data.get("summary", "")
+        except Exception as exc:
+            logger.warning("failed to load summary: %s", exc)
+
+    def save_summary(self) -> None:
+        if not self.summary_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.summary_file), exist_ok=True)
+            with open(self.summary_file, "w", encoding="utf-8") as f:
+                json.dump({"summary": self.summary}, f, ensure_ascii=False)
+        except Exception as exc:
+            logger.warning("failed to save summary: %s", exc)
 
     def build_messages(
         self,
@@ -51,6 +85,10 @@ class ChatSession:
         memory_ctx = self.memory_backend.get_context(user_text, user_id=self.character_id)
         if memory_ctx:
             messages.append({"role": "system", "content": memory_ctx})
+        # Inject conversation summary before recent history
+        with self._summarize_lock:
+            if self.summary:
+                messages.append({"role": "system", "content": f"【对话摘要】\n{self.summary}"})
         messages.extend(self.history)
         if stt_refine_inline:
             inline_prompt = prompts.get("stt_refine_inline.system", "")
@@ -63,11 +101,29 @@ class ChatSession:
         if not assistant_text:
             return
 
-        self.history.append({"role": "user", "content": user_text})
-        self.history.append({"role": "assistant", "content": assistant_text})
-        limit = self.max_history * 2
-        if len(self.history) > limit:
-            self.history[:] = self.history[-limit:]
+        need_summary = False
+        with self._summarize_lock:
+            self.history.append({"role": "user", "content": user_text})
+            self.history.append({"role": "assistant", "content": assistant_text})
+
+            # Trigger summarization when history exceeds max_window
+            if (
+                not self._summarize_in_progress
+                and len(self.history) > self.max_window
+            ):
+                batch = self.history[:self.compress_batch]
+                self.history = self.history[self.compress_batch:]
+                self._summarize_in_progress = True
+                need_summary = True
+            else:
+                batch = None
+
+        if need_summary and batch:
+            threading.Thread(
+                target=self._summarize_async,
+                args=(batch,),
+                daemon=True,
+            ).start()
 
         if async_store:
             threading.Thread(
@@ -77,6 +133,86 @@ class ChatSession:
             ).start()
         else:
             self.memory_backend.store(user_text, assistant_text, user_id=self.character_id)
+
+    def _summarize_async(self, batch: list[dict]) -> None:
+        try:
+            conv_lines = []
+            for msg in batch:
+                role = "User" if msg["role"] == "user" else self.character_name
+                conv_lines.append(f"{role}: {msg['content']}")
+            conv_text = "\n".join(conv_lines)
+
+            with self._summarize_lock:
+                existing = self.summary
+
+            new_summary = self._call_summary_llm(existing, conv_text)
+            if new_summary:
+                with self._summarize_lock:
+                    self.summary = new_summary
+                self.save_summary()
+        except Exception as exc:
+            logger.warning("conversation summarization failed: %s", exc)
+        finally:
+            self._summarize_in_progress = False
+
+    def _call_summary_llm(self, existing_summary: str, conversation: str) -> str | None:
+        prompt = prompts.format_prompt(
+            "conversation_summary.user_template",
+            existing_summary=existing_summary or "无",
+            conversation=conversation,
+        )
+        system = prompts.get("conversation_summary.system", "")
+
+        from kokoro import config as cfg
+
+        model = cfg.stt_refine_model()
+        url = cfg.llm_url()
+        api_key = ""
+        if cfg.is_deepseek_model(model):
+            api_key = cfg.deepseek_api_key()
+            url = cfg.deepseek_url()
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            api_url = f"{url}/v1/chat/completions"
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 512,
+            }
+        else:
+            api_url = f"{url}/api/chat"
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": False,
+                "options": {"temperature": 0.1, "num_predict": 512},
+            }
+
+        try:
+            req = urllib.request.Request(
+                api_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                result = json.loads(resp.read())
+            if api_key:
+                text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            else:
+                text = result.get("message", {}).get("content", "").strip()
+            return text if text else None
+        except Exception as exc:
+            logger.warning("summary LLM call failed: %s", exc)
+            return None
 
 
 def load_session(

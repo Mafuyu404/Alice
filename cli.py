@@ -11,6 +11,7 @@ what the system is doing. All workers consult it instead of ad-hoc flags.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 import time
@@ -169,6 +170,11 @@ def main() -> None:
         print(f"Available characters: {', '.join(character.load().keys())}")
         return
 
+    # Conversation summary persistence
+    summary_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+    session.summary_file = os.path.join(summary_dir, f"summary_{args.character}.json")
+    session.load_summary()
+
     model = args.model or cfg.llm_model()
     tts_engine = create_tts_engine(not args.no_tts)
     portrait_client = None
@@ -213,8 +219,23 @@ def main() -> None:
 
         # Emit state transition: LISTENING → THINKING
         if not machine.emit(sm.SystemEvent.STT_REFINED):
-            # State machine rejected — system is busy or shutting down
+            # 状态机拒绝 — 系统正忙(THINKING/SPEAKING)，barge-in 让路
+            if machine.is_busy:
+                cancel = _current_cancel[0]
+                if cancel:
+                    cancel.set()
+                if tts_engine:
+                    tts_engine.interrupt()
+                machine.emit(sm.SystemEvent.USER_SPEECH_START)
+                machine.set_stt_state(sm.STTState.LISTENING)
             return
+
+        # 恢复 TTS 连接（中断后 WS 已死，prepare 内会自动重建）
+        if tts_engine:
+            try:
+                tts_engine.prepare()
+            except Exception as exc:
+                print(f"\n  [tts] prepare failed: {exc}")
 
         cancel_event = threading.Event()
         _current_cancel[0] = cancel_event
@@ -428,23 +449,18 @@ def main() -> None:
                                 machine.emit(sm.SystemEvent.USER_SPEECH_START)
                                 machine.set_stt_state(sm.STTState.LISTENING)
                             elif machine.is_thinking or machine.is_speaking:
-                                # Barge-in: cancel LLM, stop TTS, return text to pool
-                                cancel = _current_cancel[0]
-                                if cancel:
-                                    cancel.set()
-                                if tts_engine:
-                                    try:
-                                        tts_engine.interrupt()
-                                    except Exception:
-                                        pass
-                                pool.interrupt()
-                                print("\n  [interrupt] user barge-in, returning to listening")
-                                machine.emit(sm.SystemEvent.USER_SPEECH_START)
-                                machine.set_stt_state(sm.STTState.LISTENING)
+                                # 不立即 barge-in — 等 endpoint 拿到完整文本后再处理
+                                # 避免"爱"这种不完整片段提前取消 LLM
+                                pass
                     if recognizer.is_endpoint(stt_stream):
-                        recognizer.reset(stt_stream)
-                        last_partial = ""
-                        machine.emit(sm.SystemEvent.USER_SPEECH_END)
+                        if machine.is_busy:
+                            # 系统忙时不 reset 识别器 — 用户可能继续说
+                            # 不清空流，让新文本"爱丽丝"自然延续"晚上好"成为"晚上好爱丽丝"
+                            pass
+                        else:
+                            recognizer.reset(stt_stream)
+                            last_partial = ""
+                            machine.emit(sm.SystemEvent.USER_SPEECH_END)
         except Exception as exc:
             print(f"\n[STT error] {exc}")
             traceback.print_exc()

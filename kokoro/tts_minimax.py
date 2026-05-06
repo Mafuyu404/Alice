@@ -209,8 +209,9 @@ class StreamingTTS:
         with self._state_lock:
             return self._is_playing or not self._audio_queue.empty()
 
-    def prepare(self) -> None:
-        """Start audio output and the WS receiver thread (manages its own connection)."""
+    def prepare(self) -> bool:
+        """Ensure TTS is ready for a new session. Returns True if WS is ready."""
+        # 音频流 / 播放线程：只重建一次
         if self._stream is None:
             self._stream = sd.OutputStream(
                 samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=2048,
@@ -220,6 +221,20 @@ class StreamingTTS:
             self._play_thread = threading.Thread(target=self._play_worker, daemon=True)
             self._play_thread.start()
 
+        # WS 还活着 → 无需重建
+        if self._ws_started.is_set() and self._ws is not None:
+            return True
+
+        # WS 已死（中断后）→ 清理旧 recv 线程，重新建连
+        self._session_done = True
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._ws_started.clear()
+
         self._all_done.set()
         self._session_done = False
         with self._pending_lock:
@@ -227,7 +242,9 @@ class StreamingTTS:
         self._ws_recv_thread = threading.Thread(target=self._ws_recv_worker, daemon=True)
         self._ws_recv_thread.start()
         if not self._ws_started.wait(timeout=10):
-            raise RuntimeError("MiniMax TTS task_started timeout")
+            logger.warning("MiniMax TTS task_started timeout — TTS will be silent this turn")
+            return False
+        return True
 
     def _try_send(self, text: str) -> bool:
         """Send a sentence. Returns False if WS is down (caller should retry)."""
@@ -333,17 +350,11 @@ class StreamingTTS:
             except Exception:
                 pass
             self._ws = None
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        # 不销毁 _stream — 播放线程和音频输出保持存活，避免 is_playing 永久卡死
         with self._state_lock:
             self._is_playing = False
         self._should_stop = False
-        self._session_done = False
+        self._session_done = False  # recv 线程自动重连 WS，供下一轮 TTS 使用
         self._first_audio_logged = False
 
     def _ws_recv_worker(self) -> None:
@@ -354,7 +365,7 @@ class StreamingTTS:
         while not self._should_stop:
             self._ws_started.clear()
             try:
-                self._ws = ws_sync.connect(WS_URL, additional_headers=_ws_headers())
+                self._ws = ws_sync.connect(WS_URL, additional_headers=_ws_headers(), open_timeout=10)
                 self._ws.send(json.dumps(_task_start(self._voice_id, self._speed)))
             except Exception:
                 if self._should_stop:

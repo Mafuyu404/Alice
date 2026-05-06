@@ -427,6 +427,7 @@ class SystemStateMachine:
         # IDLE transitions
         self._transitions[SystemState.IDLE] = {
             SystemEvent.USER_SPEECH_START: (SystemState.LISTENING, None),
+            SystemEvent.STT_REFINED: (SystemState.THINKING, None),
             SystemEvent.PROACTIVE_TRIGGERED: (SystemState.THINKING, None),
             SystemEvent.SCREEN_INTEREST: (SystemState.SCREEN_WATCHING, None),
             SystemEvent.SHUTDOWN: (SystemState.SHUTTING_DOWN, None),
