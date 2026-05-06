@@ -123,12 +123,12 @@ def chat_stream(
     return reply, cancelled
 
 
-def create_tts_engine(enabled: bool):
+def create_tts_engine(enabled: bool, voice_id: str | None = None):
     if not enabled:
         return None
     try:
         tts_mod.warmup()
-        engine = tts_mod.StreamingTTS()
+        engine = tts_mod.StreamingTTS(voice=voice_id)
         engine.prepare()
         return engine
     except Exception as exc:
@@ -176,7 +176,7 @@ def main() -> None:
     session.load_summary()
 
     model = args.model or cfg.llm_model()
-    tts_engine = create_tts_engine(not args.no_tts)
+    tts_engine = create_tts_engine(not args.no_tts, session.character_data.get("tts_voice_id"))
     portrait_client = None
     portrait_worker = None
     if not args.no_portrait:

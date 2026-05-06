@@ -206,7 +206,7 @@ portrait_decay_seconds = 60.0
 # 立绘窗口上叠加显示调度器的冲动值调试信息。
 # 类型: bool (true/false)
 # 调试用。如果不需要看到驱动值数字可关闭。
-portrait_debug_overlay = true
+portrait_debug_overlay = false
 
 # 鼠标点击穿透立绘窗口。
 # 类型: bool (true/false)
