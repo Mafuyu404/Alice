@@ -311,6 +311,41 @@ class StreamingTTS:
                 pass
             self._stream = None
 
+    def interrupt(self) -> None:
+        """Stop playback immediately and reset state for a new session."""
+        self._should_stop = True
+        self._session_done = True
+        self._buf = []
+        with self._pending_lock:
+            self._pending_count = 0
+            self._all_done.set()
+        # Drain audio queue
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._audio_queue.put(None)
+        self._ws_started.clear()
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        with self._state_lock:
+            self._is_playing = False
+        self._should_stop = False
+        self._session_done = False
+        self._first_audio_logged = False
+
     def _ws_recv_worker(self) -> None:
         """Receiver loop. Reconnects automatically on unexpected drops."""
         import websockets.sync.client as ws_sync

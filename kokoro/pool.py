@@ -99,6 +99,12 @@ class ConversationPool:
             self._raw = stripped
             self._last_chunk_time = time.time()
 
+    def interrupt(self) -> None:
+        """Reset processed state so pending text can be re-extracted on next silence."""
+        with self._lock:
+            self._last_refined_text = ""
+            self._last_output = ""
+
     def stop(self) -> None:
         self._running = False
 

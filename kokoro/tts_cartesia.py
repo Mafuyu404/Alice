@@ -158,6 +158,15 @@ class StreamingTTS:
     def close(self) -> None:
         self._should_stop = True
 
+    def interrupt(self) -> None:
+        """Stop playback and reset state for a new session."""
+        self._should_stop = True
+        self._pending_buf = []
+        with self._state_lock:
+            self._is_playing = False
+            self._pending_plays = 0
+        self._should_stop = False
+
     def _play_text(self, text: str) -> None:
         t0 = time.perf_counter()
         try:

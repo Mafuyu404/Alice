@@ -83,6 +83,7 @@ class SystemEvent(StrEnum):
     # STT → Pool pipeline
     USER_SPEECH_START = "user_speech_start"
     USER_SPEECH_END = "user_speech_end"
+    USER_INTERRUPT = "user_interrupt"
     STT_REFINED = "stt_refined"
 
     # Command detection
@@ -446,6 +447,8 @@ class SystemStateMachine:
         # THINKING transitions
         self._transitions[SystemState.THINKING] = {
             SystemEvent.LLM_DONE: (SystemState.SPEAKING, None),
+            SystemEvent.USER_SPEECH_START: (SystemState.LISTENING, None),
+            SystemEvent.USER_INTERRUPT: (SystemState.LISTENING, None),
             SystemEvent.SHUTDOWN: (SystemState.SHUTTING_DOWN, None),
             SystemEvent.ERROR: (SystemState.ERROR, None),
             SystemEvent.FATAL: (SystemState.SHUTTING_DOWN, None),

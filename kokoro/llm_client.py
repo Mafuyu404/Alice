@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable
+import threading
+from typing import Iterable, Optional
 
 import requests
 
@@ -51,7 +52,17 @@ def parse_sse_delta(line: str) -> str:
         return ""
 
 
-def stream_chat(messages: list[dict], model: str, timeout: int = 120) -> Iterable[str]:
+class _StreamCancelled(Exception):
+    """Raised internally when a streaming request is cancelled."""
+    pass
+
+
+def stream_chat(
+    messages: list[dict],
+    model: str,
+    timeout: int = 120,
+    cancel_event: Optional[threading.Event] = None,
+) -> Iterable[str]:
     resp = requests.post(
         f"{api_base_for(model)}/chat/completions",
         json=build_payload(model, messages, stream=True),
@@ -63,7 +74,14 @@ def stream_chat(messages: list[dict], model: str, timeout: int = 120) -> Iterabl
         raise RuntimeError(f"API error {resp.status_code}: {resp.text[:200]}")
 
     resp.encoding = "utf-8"
-    for line in resp.iter_lines(decode_unicode=True):
-        content = parse_sse_delta(line)
-        if content:
-            yield content
+    try:
+        for line in resp.iter_lines(decode_unicode=True):
+            if cancel_event and cancel_event.is_set():
+                resp.close()
+                return
+            content = parse_sse_delta(line)
+            if content:
+                yield content
+    finally:
+        if cancel_event and cancel_event.is_set():
+            resp.close()

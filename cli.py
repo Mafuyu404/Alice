@@ -86,14 +86,17 @@ def chat_stream(
     char_name: str,
     model: str,
     tts_engine: object | None,
-) -> str:
+    cancel_event: threading.Event | None = None,
+) -> tuple[str, bool]:
+    """Stream LLM response. Returns (reply_text, was_cancelled)."""
     print(f"\n{char_name}: ", end="", flush=True)
     reply = ""
     t0 = time.perf_counter()
     first_token_at = 0.0
     paren_filter = _ParenFilter()
+    cancelled = False
 
-    for content in llm_client.stream_chat(messages, model):
+    for content in llm_client.stream_chat(messages, model, cancel_event=cancel_event):
         content = paren_filter.filter(content)
         if not content:
             continue
@@ -106,12 +109,17 @@ def chat_stream(
         if tts_engine:
             tts_engine.push(content)
 
-    print()
+    if cancel_event and cancel_event.is_set():
+        cancelled = True
+        print(f"\n  [interrupt] barge-in, cancelled after {time.perf_counter() - t0:.1f}s")
+    else:
+        print()
     reply = _strip_parens(reply)
-    if reply and tts_engine:
+    if reply and tts_engine and not cancelled:
         tts_engine.end_sentence()
-    print(f"  [latency] llm_done {time.perf_counter() - t0:.2f}s")
-    return reply
+    if not cancelled:
+        print(f"  [latency] llm_done {time.perf_counter() - t0:.2f}s")
+    return reply, cancelled
 
 
 def create_tts_engine(enabled: bool):
@@ -194,6 +202,9 @@ def main() -> None:
     screen_vision_timeout = max(5, int(screen_cfg.get("vision_timeout", 45)))
     memory_detector = memory_events.from_config(CONFIG, memory_backend, session.character_id)
 
+    # ── shared cancel token for barge-in ──────────────────────────────────────
+    _current_cancel: list[threading.Event | None] = [None]
+
     # ── conversation handler (called by pool when STT text is ready) ───────
     def on_refined(text: str) -> None:
         scheduler.record_user_activity()
@@ -204,6 +215,9 @@ def main() -> None:
         if not machine.emit(sm.SystemEvent.STT_REFINED):
             # State machine rejected — system is busy or shutting down
             return
+
+        cancel_event = threading.Event()
+        _current_cancel[0] = cancel_event
 
         try:
             command_context = ""
@@ -241,8 +255,12 @@ def main() -> None:
                 print(f"\n{session.character_name}: {waiting_reply}")
                 if tts_engine:
                     tts_engine.push(waiting_reply)
-                    while tts_engine.is_playing:
+                    while tts_engine.is_playing and not cancel_event.is_set():
                         time.sleep(0.1)
+
+                if cancel_event.is_set():
+                    _current_cancel[0] = None
+                    return
 
                 vision_ready.wait()
                 result = vision_result[0]
@@ -264,14 +282,21 @@ def main() -> None:
             messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline)
 
             try:
-                reply = chat_stream(messages, session.character_name, model, tts_engine)
+                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                 machine.emit_error("llm_connection")
+                _current_cancel[0] = None
                 return
             except Exception as exc:
                 print(f"\n[error] {type(exc).__name__}: {exc}")
                 machine.emit_error("llm_stream")
+                _current_cancel[0] = None
+                return
+
+            if cancelled:
+                # User interrupted — STT worker already transitioned to LISTENING
+                _current_cancel[0] = None
                 return
 
             # LLM done → transition to SPEAKING
@@ -285,8 +310,11 @@ def main() -> None:
                 portrait_worker.submit(text, reply)
 
             if tts_engine:
-                while tts_engine.is_playing:
+                while tts_engine.is_playing and not cancel_event.is_set():
                     time.sleep(0.1)
+                if cancel_event.is_set():
+                    _current_cancel[0] = None
+                    return
                 scheduler.record_tts_end()
                 tts_engine.prepare()
 
@@ -299,6 +327,8 @@ def main() -> None:
             print(f"\n[error] on_refined: {type(exc).__name__}: {exc}")
             traceback.print_exc()
             machine.emit_error("on_refined")
+        finally:
+            _current_cancel[0] = None
 
     # ── STT pool ───────────────────────────────────────────────────────────
     refine_url, refine_model, refine_key = refine_endpoint()
@@ -397,6 +427,20 @@ def main() -> None:
                             if machine.is_idle or machine.state == sm.SystemState.SCREEN_WATCHING:
                                 machine.emit(sm.SystemEvent.USER_SPEECH_START)
                                 machine.set_stt_state(sm.STTState.LISTENING)
+                            elif machine.is_thinking or machine.is_speaking:
+                                # Barge-in: cancel LLM, stop TTS, return text to pool
+                                cancel = _current_cancel[0]
+                                if cancel:
+                                    cancel.set()
+                                if tts_engine:
+                                    try:
+                                        tts_engine.interrupt()
+                                    except Exception:
+                                        pass
+                                pool.interrupt()
+                                print("\n  [interrupt] user barge-in, returning to listening")
+                                machine.emit(sm.SystemEvent.USER_SPEECH_START)
+                                machine.set_stt_state(sm.STTState.LISTENING)
                     if recognizer.is_endpoint(stt_stream):
                         recognizer.reset(stt_stream)
                         last_partial = ""
@@ -439,6 +483,8 @@ def main() -> None:
                 continue
 
             machine.set_proactive_state(sm.ProactiveState.EXECUTING)
+            proactive_cancel = threading.Event()
+            _current_cancel[0] = proactive_cancel
             try:
                 messages = session.build_messages(decision.prompt)
                 guidance = session.character_data.get("proactive_guidance", "")
@@ -457,7 +503,7 @@ def main() -> None:
                     f"desire={decision.desire:.1f} disturb={decision.disturbance:.1f}"
                 )
                 try:
-                    reply = chat_stream(messages, session.character_name, model, tts_engine)
+                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel)
                 except requests.exceptions.ConnectionError:
                     print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                     machine.emit_error("proactive_llm")
@@ -466,6 +512,11 @@ def main() -> None:
                 except Exception as exc:
                     print(f"\n[proactive error] {type(exc).__name__}: {exc}")
                     machine.emit_error("proactive_stream")
+                    machine.set_proactive_state(sm.ProactiveState.ACCRUING)
+                    continue
+
+                if cancelled:
+                    _current_cancel[0] = None
                     machine.set_proactive_state(sm.ProactiveState.ACCRUING)
                     continue
 
@@ -482,8 +533,12 @@ def main() -> None:
                     machine.set_tts_state(sm.TTSState.STREAMING)
 
                 if tts_engine:
-                    while tts_engine.is_playing and not machine.is_shutting_down:
+                    while tts_engine.is_playing and not proactive_cancel.is_set():
                         time.sleep(0.1)
+                    if proactive_cancel.is_set():
+                        _current_cancel[0] = None
+                        machine.set_proactive_state(sm.ProactiveState.ACCRUING)
+                        continue
                     scheduler.record_tts_end()
                     tts_engine.prepare()
 
@@ -497,6 +552,8 @@ def main() -> None:
                 traceback.print_exc()
                 machine.emit_error("proactive")
                 machine.set_proactive_state(sm.ProactiveState.ACCRUING)
+            finally:
+                _current_cancel[0] = None
 
     proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
     proactive_thread.start()
