@@ -1,49 +1,57 @@
 # 快速开始
 
+本文给出从安装到启动的最短路径。更完整的模块说明见同目录其他文档。
+
 ## 环境要求
 
+- Windows
 - Python 3.11+
-- Windows（立绘叠加层依赖 Win32 API；屏幕识别需要 `pywin32` + `pillow`）
-- 麦克风（语音模式需要）
+- 可用的 LLM 后端，例如 Ollama、DeepSeek，或任意 OpenAI 兼容 `/v1/chat/completions` 服务
+- 麦克风，仅语音模式需要
 
 ## 安装依赖
 
+按实际功能安装即可。
+
 ```bash
-# 核心依赖
-pip install requests numpy sounddevice sherpa-onnx pillow pywin32
+# 基础
+pip install requests numpy
 
-# TTS（可选）
-pip install websockets    # MiniMax TTS
-pip install cartesia      # Cartesia TTS
+# 语音识别
+pip install sounddevice sherpa-onnx
 
-# 长期记忆（可选）
+# 立绘和屏幕感知
+pip install PySide6 pillow pywin32
+
+# TTS 后端，按需安装
+pip install websockets
+pip install cartesia
+
+# 长期记忆，按需安装
 pip install mem0ai fastembed
-
-# 立绘窗口（可选）
-pip install PySide6
 ```
 
 ## 配置
 
-### 1. 基本配置
+`config.toml` 是主配置文件，适合提交。`config.json` 用来放本地密钥，已被 `.gitignore` 忽略。
 
-`config.toml` 是主配置文件，已包含所有可配置项及详细注释。核心配置：
+常用配置：
 
 ```toml
-# LLM 地址（兼容 OpenAI 格式）
 llm_url = "http://127.0.0.1:11434"
 llm_model = "deepseek-v4-flash"
+available_models = ["qwen2.5:7b", "deepseek-v4-flash"]
 
-# 记忆后端："mem0"、"kokoromemo" 或 "none"
-memory_backend = "mem0"
+memory_backend = "mem0"      # mem0 / kokoromemo / none
+tts_backend = "minimax"      # minimax / cartesia
 
-# TTS 后端："minimax" 或 "cartesia"
-tts_backend = "minimax"
+portrait_overlay_host = "127.0.0.1"
+portrait_overlay_port = 17352
+portrait_decay_seconds = 60.0
+portrait_click_through = false
 ```
 
-### 2. API 密钥（可选）
-
-创建 `config.json`（已加入 `.gitignore`，不会被提交）：
+`config.json` 示例：
 
 ```json
 {
@@ -55,121 +63,95 @@ tts_backend = "minimax"
 }
 ```
 
-部分密钥也可通过环境变量设置：`DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`。
+部分密钥也可使用环境变量，例如 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`。
 
-### 3. 角色配置
+## 角色
 
-`characters.json` 中预制了 `alice` 和 `yuki` 两个角色。可通过 Web UI 或直接编辑该文件来添加/修改角色。详见 [character.md](character.md)。
+角色来自 `characters/` 目录：
 
-## 启动
+```text
+characters/{id}/{id}.json
+characters/{id}/portrait/portrait.json
+characters/{id}/portrait/*.png
+```
 
-### 语音模式（完整体验）
+当前仓库中已有：
+
+- `alice`：有角色设定和 96 张立绘
+- `penglai`：有角色设定和 7 张立绘
+- `yuki`：有角色设定，暂无 PNG 立绘
+
+根目录的 `characters.json` 是旧版聚合文件，当前主流程不再以它作为角色来源。
+
+## 启动 CLI
+
+完整语音模式：
 
 ```bash
 python cli.py
 ```
 
-可用参数：
+常用参数：
 
 | 参数 | 作用 |
-|------|------|
-| `--character alice` | 指定角色 ID（默认 alice） |
-| `--model qwen2.5:7b` | 指定对话模型（覆盖 config.toml） |
+| --- | --- |
+| `--character alice` | 指定角色 ID，默认 `alice` |
+| `-c penglai` | `--character` 的短写 |
+| `--model qwen2.5:7b` | 临时指定对话模型 |
 | `--device 0` | 指定麦克风设备 ID |
 | `--list-devices` | 列出可用麦克风设备 |
 | `--no-tts` | 禁用语音输出 |
-| `--no-portrait` | 禁用立绘叠加层 |
+| `--no-portrait` | 禁用立绘覆盖层 |
 | `--no-proactive` | 禁用主动搭话 |
-| `--no-screen-watch` | 禁用屏幕识别 |
+| `--no-screen-watch` | 禁用屏幕感知 |
 
-启动后会显示各模块状态：
-```
-==================================================
-  Alice CLI
-  Character: 爱丽丝·玛格特罗伊德
-  Model: deepseek-v4-flash
-  Microphone: [1]
-  TTS: True
-  Portrait: True
-  Proactive: True
-  Screen watch: True
-  Memory events: True
-  Ctrl+C to stop
-==================================================
+示例：
+
+```bash
+python cli.py --character penglai --no-screen-watch
+python cli.py --character alice --model deepseek-v4-flash
 ```
 
-### 文字模式
+## 启动 WebUI
 
 ```bash
 python webui.py
 ```
 
-打开 http://localhost:8080 即可在浏览器中对话。可通过 `--port`、`--host`、`--model`、`--character` 参数自定义。
+然后打开：
 
-WebUI 启动时会自动尝试连接 LLM 后端，如果 `LLM_BACKEND_CMD` 环境变量已设置且 LLM 不可用，则自动启动后端进程。当 `memory_backend = "kokoromemo"` 时，也会自动启动 `kokoromemo-server.exe`。
+```text
+http://127.0.0.1:8080
+```
 
-## 快速测试
+WebUI 是文字模式，不启动 STT、TTS、立绘覆盖层、主动搭话和屏幕感知。
 
-确认 LLM 服务可用：
+## 快速检查
+
+确认 LLM 后端可用：
 
 ```bash
-# Ollama
-curl http://localhost:11434/api/tags
-
-# 测试聊天（文字模式）
-python webui.py
+curl http://127.0.0.1:11434/api/tags
 ```
 
-## 目录结构
+确认角色能被加载：
 
+```bash
+python -c "from kokoro import character; print(character.load().keys())"
 ```
-├── cli.py                          # 语音 CLI 入口
-├── webui.py                        # Web UI 入口
-├── config.toml                     # 主配置文件（所有可配置项 + 注释）
-├── config.json                     # 本地密钥（已 gitignore）
-├── characters.json                 # 角色定义
-├── prompts.json                    # 所有提示词集中管理
-├── portrait_notes.json             # 立绘注释（供 LLM 选图用）
-├── overlay_slideshow.py            # 立绘窗口（PySide6）
-├── img/                            # 立绘素材
-│   └── portrait_map.json           # 立绘素材映射
-├── doc/                            # 文档
-│   ├── overview.md                 # 框架概述
-│   ├── quickstart.md               # 本文件
-│   ├── config.md                   # 配置系统
-│   ├── character.md                # 角色系统
-│   ├── chat_session.md             # 对话会话与 LLM 客户端
-│   ├── prompts.md                  # 提示词管理
-│   ├── state_machine.md            # 状态机
-│   ├── stt.md                      # 语音识别
-│   ├── tts.md                      # 语音合成
-│   ├── memory.md                   # 记忆系统
-│   ├── proactive.md                # 主动搭话调度器
-│   ├── screen_interest.md          # 屏幕兴趣检测
-│   ├── portrait.md                 # 立绘系统
-│   ├── webui.md                    # Web UI
-│   └── user_commands.md            # 用户命令
-├── models/
-│   └── stt/                        # sherpa-onnx 模型（自动下载）
-├── mem0_data/                      # mem0 本地向量库数据
-└── kokoro/
-    ├── __init__.py                 # 模块入口
-    ├── config.py                   # 配置加载
-    ├── state_machine.py            # 两级层次状态机
-    ├── character.py                # 角色管理
-    ├── prompts.py                  # 提示词加载
-    ├── chat_session.py             # 对话会话
-    ├── llm_client.py               # LLM 客户端
-    ├── pool.py                     # STT 精炼池
-    ├── stt.py                      # 语音识别
-    ├── tts.py                      # TTS 调度（动态加载）
-    ├── tts_minimax.py              # MiniMax TTS
-    ├── tts_cartesia.py             # Cartesia TTS
-    ├── memory.py                   # 记忆后端
-    ├── memory_events.py            # 记忆事件检测
-    ├── proactive.py                # 主动搭话调度器
-    ├── screen_interest.py          # 屏幕兴趣检测
-    ├── vision.py                   # 视觉识别 + 截图 + 窗口枚举
-    ├── portrait_controller.py      # 立绘控制器
-    └── user_commands.py            # 用户命令检测与执行
+
+确认立绘说明能对应到文件：
+
+```bash
+python -c "import json,pathlib; r=pathlib.Path('characters/penglai/portrait'); d=json.loads((r/'portrait.json').read_text(encoding='utf-8')); print(len(d), [x['id'] for x in d if not (r/x['id']).exists()])"
 ```
+
+输出中的缺失列表应为空。
+
+## 常见问题
+
+- PowerShell 直接 `Get-Content` 中文文档出现乱码：通常是控制台代码页显示问题，文件本身仍是 UTF-8。
+- `Character 'xxx' not found`：检查是否存在 `characters/xxx/xxx.json`。
+- 立绘窗口没有出现：确认安装了 `PySide6`，并检查 `characters/{id}/portrait/portrait.json` 中的 `id` 是否对应 PNG。
+- 端口 17352 被占用：修改 `portrait_overlay_port`，或关闭已有立绘窗口。
+- WebUI 显示 LLM 不可用：确认 `llm_url` 指向的服务已启动，或设置 `LLM_BACKEND_CMD` 让 WebUI 自动拉起后端。

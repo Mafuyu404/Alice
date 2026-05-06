@@ -1,123 +1,136 @@
 # 立绘系统
 
-## 概述
+立绘系统由两部分组成：
 
-立绘系统包含两个独立组件和两个配置文件：
+- `overlay_slideshow.py`：PySide6 透明窗口，显示 PNG 立绘，并提供本地 HTTP 控制接口。
+- `kokoro/portrait_controller.py`：CLI 中的控制器，启动立绘窗口，并让 LLM 根据对话选择合适差分。
 
-1. **立绘窗口** (`overlay_slideshow.py`) — PySide6 透明窗口，显示立绘图片，内置 HTTP 控制服务
-2. **立绘控制** (`kokoro/portrait_controller.py`) — LLM 驱动的表情选择 + 子进程管理
-3. **`portrait_notes.json`** — 立绘注释（供 LLM 选图用）
-4. **`portrait_map.json`** — 立绘素材映射（供 overlay 轮播用，位于 `img/` 目录）
+## 文件布局
 
-## 立绘窗口
+每个角色有自己的立绘目录：
 
-`PortraitOverlay` 类创建一个无边框、透明背景的置顶窗口。
+```text
+characters/{character_id}/portrait/
+├── portrait.json
+└── *.png
+```
 
-### 特性
+当前主流程不再使用根目录 `img/` 作为角色立绘目录。`overlay_slideshow.py --image-dir img` 仍可用于手动测试旧目录，但 CLI 会传入 `characters/{character_id}/portrait`。
 
-- 窗口置顶，不干扰其他操作
-- 支持透明 PNG 图片叠加
-- 鼠标点击穿透模式（`portrait_click_through = true`，适合游戏等场景）
-- 拖拽移动位置（点击穿透关闭时）
-- 鼠标滚轮缩放（0.2x ~ 4.0x，步进 0.1x）
-- 图片轮播（暂停/播放控制，默认 2 秒间隔）
-- 系统托盘图标（右键菜单：切换穿透、播放/暂停、退出）
-- HTTP 控制服务器（端口默认 17352），用于接收切换指令
-- 调试叠加层（显示冲动值状态）
-- DWM 原生窗口修复（禁用圆角、强制 popup 样式）
+## portrait.json
 
-### 键盘快捷键
+`portrait.json` 是立绘候选表。当前推荐格式是数组，每项只保留 `id` 和 `notes`：
 
-| 快捷键 | 功能 |
-|--------|------|
-| `F8` | 切换鼠标点击穿透 |
-| `Space` | 播放/暂停轮播 |
-| `→` | 下一张立绘（手动暂停） |
-| `←` | 上一张立绘（手动暂停） |
-| `Esc` | 退出立绘窗口 |
+```json
+[
+  {
+    "id": "penglai_seated_hands_lap_quiet_neutral_p01.png",
+    "notes": "正坐合手放在膝前，直视前方，眼神空灵，嘴角轻收。"
+  }
+]
+```
 
-### HTTP 控制 API
+规则：
 
-| 端点 | 方法 | 功能 |
-|------|------|------|
-| `/health` | GET | 健康检查，返回 `{"ok": true}` |
-| `/status` | GET | 返回当前立绘状态（含当前 asset、所有 series、素材总数） |
-| `/portraits` | GET | 列出立绘。支持查询参数过滤：`?series=&emotion=&pose=&eyes=&mouth=` |
-| `/control` | POST | 控制指令。body: `{"action": "show"|"pause"|"play"|"click_through"|"shutdown", ...}` |
-| `/debug` | POST | 发送调试信息叠加显示。body: `{"data": {...}}` |
+- `id` 必须是同目录下真实存在的 PNG 文件名。
+- `notes` 是给立绘选择 LLM 看的中文描述，应描述眼神、嘴型、表情强度和手势姿态。
+- 文件名建议包含角色、姿态、表情和原始序号，例如 `penglai_seated_hands_lap_tiny_surprise_p06.png`。
+- 保留 `pXX` 有助于追溯原始差分顺序。
 
-#### /control 的 action 参数
+`overlay_slideshow.py` 兼容旧格式：如果条目里有 `new_name`，会优先使用 `new_name`；否则使用 `id`。旧版 `series`、`emotion`、`pose`、`eyes`、`mouth` 字段仍可被 HTTP 过滤接口读取，但不是必需字段。
 
-| action | 额外参数 | 功能 |
-|--------|---------|------|
-| `show` | `name` 或 `random` + 过滤字段 | 切换到指定立绘或随机选择 |
-| `pause` | — | 暂停轮播 |
-| `play` | — | 恢复轮播 |
-| `click_through` | `enabled` (bool) | 设置鼠标穿透 |
-| `shutdown` | — | 关闭立绘窗口 |
+## 立绘选择
 
-### 状态持久化
+CLI 启动立绘时：
 
-窗口位置（x, y）、缩放比例（scale_factor）保存在 `portrait_overlay_state.json`（已 gitignore），重启后自动恢复。
+1. `kokoro.portrait_controller.create_controller(character_id, model)` 创建客户端和后台选择线程。
+2. 客户端启动 `overlay_slideshow.py --image-dir characters/{character_id}/portrait`。
+3. 选择线程读取 `characters/{character_id}/portrait/portrait.json`。
+4. 每轮助手回复结束后，线程把用户输入、助手回复、当前立绘和候选表交给 LLM。
+5. LLM 只需返回候选 `id`，控制器通过 HTTP 切换图片。
+6. 长时间无对话后，控制器会尝试回到文件名包含 `neutral` 的立绘。
 
-### 立绘素材
-
-- 图片存放在 `img/` 目录
-- `portrait_map.json` 定义素材映射（含 series、emotion、pose、eyes、mouth 等标签字段）
-- `portrait_notes.json` 定义供 LLM 选择时参考的注释（id + notes），格式：`{"portraits": [{"id": "happy.png", "notes": "开心微笑"}, ...]}`
-
-## 立绘控制
-
-`kokoro/portrait_controller.py` 管理表情选择和子进程生命周期：
-
-### PortraitOverlayClient
-
-HTTP 客户端，与立绘窗口通信：
-
-| 方法 | 功能 |
-|------|------|
-| `start()` | 启动立绘窗口子进程（`python overlay_slideshow.py`），等待就绪（8s 超时） |
-| `is_running()` | 健康检查（`GET /health`） |
-| `wait_until_ready(timeout=8.0)` | 轮询等待窗口就绪 |
-| `show(name)` | 切换立绘（`POST /control` action=show） |
-| `status()` | 获取当前状态（`GET /status`） |
-| `send_debug(data)` | 发送调试覆盖信息（`POST /debug`） |
-| `pause()` | 暂停轮播 |
-| `shutdown()` | 关闭子进程（`POST /control` action=shutdown），超时则 terminate |
-
-### PortraitDecisionWorker
-
-后台线程，根据对话内容选择表情：
-
-1. `submit(user_text, assistant_text)` 被调用，标记待决策
-2. 检查空闲时间：超过 `portrait_decay_seconds`（默认 60 秒）无对话 → 自动恢复 `neutral` 表情
-3. 在待决策状态下，调用 LLM 分析对话情绪
-4. 从 `portrait_notes.json` 的候选列表中选择最匹配的表情 ID
-5. 调用 `client.show()` 切换立绘
-
-### 提示词
-
-`prompts.json` 中的 `portrait_selection` 部分：
-- `system` — 立绘选择器的系统提示词
-- `user_template` — 包含当前立绘、对话内容、候选列表。参数：`{current_id}` `{user_text}` `{assistant_text}` `{time_info}` `{catalog}`
-- `time_info_idle` — 空闲时间信息。参数：`{seconds}`
-- `time_info_recent` — 对话刚结束的时间信息
-
-### 创建入口
-
-`create_controller(model)` 工厂函数：读取配置中的 host/port，创建 `PortraitOverlayClient` 并启动子进程，然后创建 `PortraitDecisionWorker`。返回 `(client, worker)` 元组。
-
-## 配置
+相关配置：
 
 ```toml
 portrait_overlay_host = "127.0.0.1"
 portrait_overlay_port = 17352
-portrait_decision_interval = 0.0    # 0=使用后端默认（约 2 秒）
-portrait_decay_seconds = 60.0       # 无对话后恢复平静的等待秒数
-portrait_debug_overlay = true       # 显示冲动值调试信息
-portrait_click_through = false      # 鼠标点击穿透
+portrait_decision_interval = 0.0
+portrait_decay_seconds = 60.0
+portrait_debug_overlay = false
+portrait_click_through = false
 ```
 
-## 启动选项
+`portrait_decision_interval = 0.0` 在当前代码中会作为 0 秒间隔传入，实际循环仍有最小等待；想减少立绘选择频率可以设为 `2.0` 或更高。
 
-- `--no-portrait`：禁用立绘叠加层
+## 手动启动
+
+```bash
+python overlay_slideshow.py --image-dir characters/penglai/portrait
+python overlay_slideshow.py --host 127.0.0.1 --port 17352 --image-dir characters/alice/portrait
+```
+
+窗口行为：
+
+- 左键拖动：移动窗口
+- 鼠标滚轮：缩放，范围 0.2x 到 4.0x
+- `F8`：切换鼠标点击穿透
+- `Space`：播放/暂停轮播
+- `Right`：下一张
+- `Left`：上一张
+- `Esc`：退出
+
+窗口位置和缩放保存到根目录 `portrait_overlay_state.json`。
+
+## HTTP API
+
+默认地址：`http://127.0.0.1:17352`
+
+| 接口 | 方法 | 作用 |
+| --- | --- | --- |
+| `/health` | GET | 健康检查 |
+| `/status` | GET | 当前立绘、系列列表和总数 |
+| `/portraits` | GET | 列出立绘，可按 query 过滤 |
+| `/control` | POST | 切换、播放、暂停、点击穿透、退出 |
+| `/debug` | POST | 更新调试覆盖层数据 |
+
+示例：
+
+```bash
+curl http://127.0.0.1:17352/health
+curl http://127.0.0.1:17352/status
+curl http://127.0.0.1:17352/portraits
+curl -X POST http://127.0.0.1:17352/control ^
+  -H "Content-Type: application/json" ^
+  -d "{\"action\":\"show\",\"name\":\"penglai_seated_hands_lap_tiny_surprise_p06.png\"}"
+```
+
+`/control` 支持：
+
+| action | 参数 | 作用 |
+| --- | --- | --- |
+| `show` | `name` | 显示指定文件 |
+| `show` | `random: true` | 从候选中随机显示 |
+| `pause` | 无 | 暂停轮播 |
+| `play` | 无 | 恢复轮播 |
+| `click_through` | `enabled: true/false` | 设置点击穿透 |
+| `shutdown` | 无 | 关闭立绘窗口 |
+
+## 当前素材
+
+| 角色 | 目录 | 数量 | 说明 |
+| --- | --- | --- | --- |
+| `alice` | `characters/alice/portrait` | 96 | 已整理为 `id` / `notes` |
+| `penglai` | `characters/penglai/portrait` | 7 | 已整理为 `id` / `notes` |
+| `yuki` | `characters/yuki/portrait` | 0 | 暂无 PNG |
+
+## 描述建议
+
+`notes` 不宜只写“开心”“生气”这类宽泛词。更好的描述应包含：
+
+- 眼睛：睁大、半垂、闭眼、侧目、直视
+- 嘴型：抿嘴、微张、小圆口、浅笑、露齿笑
+- 姿态：手按胸前、指向、双手交叠、正坐合手
+- 情绪强度：轻微惊讶、克制不满、含蓄高兴、强压火气
+
+保持一句话即可，方便 LLM 快速比较候选。
