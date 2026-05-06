@@ -1,4 +1,8 @@
-"""Character storage and prompt construction."""
+"""Character storage and prompt construction.
+
+Each character lives in characters/{id}/{id}.json.
+Portrait images and metadata live in characters/{id}/portrait/.
+"""
 
 from __future__ import annotations
 
@@ -7,22 +11,33 @@ import os
 
 from kokoro import prompts
 
-_CHARACTERS_PATH = os.path.join(
+_CHARACTERS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
-    "characters.json",
+    "characters",
 )
 
 
 def load() -> dict[str, dict[str, str]]:
-    if os.path.exists(_CHARACTERS_PATH):
-        with open(_CHARACTERS_PATH, "r", encoding="utf-8") as file:
-            return json.load(file)
-    return {}
+    """Scan characters/ directory and load all character definitions."""
+    if not os.path.isdir(_CHARACTERS_DIR):
+        return {}
 
-
-def save(characters: dict) -> None:
-    with open(_CHARACTERS_PATH, "w", encoding="utf-8") as file:
-        json.dump(characters, file, indent=2, ensure_ascii=False)
+    characters: dict[str, dict[str, str]] = {}
+    for entry in sorted(os.listdir(_CHARACTERS_DIR)):
+        char_dir = os.path.join(_CHARACTERS_DIR, entry)
+        if not os.path.isdir(char_dir):
+            continue
+        char_file = os.path.join(char_dir, f"{entry}.json")
+        if not os.path.isfile(char_file):
+            continue
+        try:
+            with open(char_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("name"):
+                characters[entry] = data
+        except Exception:
+            continue
+    return characters
 
 
 def build_system_prompt(char: dict[str, str]) -> str:
@@ -30,8 +45,10 @@ def build_system_prompt(char: dict[str, str]) -> str:
     background = char.get("background", "")
     relationship = char.get("relationship", "")
     example_dialogue = char.get("example_dialogue", "")
-    base_prompt = prompts.format_prompt(
-        "character_system.template",
+    template = char.get("system_prompt_template", "")
+    if not template:
+        template = prompts.get("character_system.template", "")
+    base_prompt = template.format(
         name=name,
         description=char.get("description", ""),
         personality=char.get("personality", ""),
@@ -41,9 +58,19 @@ def build_system_prompt(char: dict[str, str]) -> str:
         relationship_block=f"\n【关系】{relationship}" if relationship else "",
         example_dialogue_block=f"\n【对话示例】\n{example_dialogue}" if example_dialogue else "",
     )
-    calibration = prompts.get("character_system.expression_calibration", "")
+    calibration = char.get("expression_calibration") or prompts.get("character_system.expression_calibration", "")
     return f"{base_prompt}\n\n{calibration}" if calibration else base_prompt
 
 
 def get_display(char: dict[str, str]) -> str:
     return f"{char.get('name', '?')} - {char.get('description', '')[:40]}"
+
+
+def character_dir(character_id: str) -> str:
+    """Return the directory for a given character id."""
+    return os.path.join(_CHARACTERS_DIR, character_id)
+
+
+def portrait_dir(character_id: str) -> str:
+    """Return the portrait directory for a given character id."""
+    return os.path.join(_CHARACTERS_DIR, character_id, "portrait")

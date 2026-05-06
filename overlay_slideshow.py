@@ -21,7 +21,7 @@ from kokoro import config as cfg
 SLIDE_INTERVAL_MS = 2000
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17352
-MAP_FILE = "portrait_map.json"
+MAP_FILE = "portrait.json"
 STATE_FILE = "portrait_overlay_state.json"
 MIN_SCALE = 0.2
 MAX_SCALE = 4.0
@@ -56,9 +56,20 @@ class PortraitCatalog:
 
     def _load_assets(self) -> list[dict]:
         data = json.loads(self.map_path.read_text(encoding="utf-8"))
-        assets = data.get("assets", [])
-        for asset in assets:
-            asset["path"] = str((self.image_dir / asset["new_name"]).resolve())
+        items = data if isinstance(data, list) else data.get("assets", data.get("portraits", []))
+        assets = []
+        for item in items:
+            name = item.get("new_name") or item["id"]
+            assets.append({
+                "new_name": name,
+                "series": item.get("series", ""),
+                "emotion": item.get("emotion", ""),
+                "pose": item.get("pose", ""),
+                "eyes": item.get("eyes", ""),
+                "mouth": item.get("mouth", ""),
+                "notes": item.get("notes", ""),
+                "path": str((self.image_dir / name).resolve()),
+            })
         return assets
 
     def list_series(self) -> list[str]:

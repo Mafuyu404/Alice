@@ -66,7 +66,7 @@ CONFIG = cfg.load()
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="KokoroMemo voice CLI")
-    parser.add_argument("--character", default="alice", help="Character id")
+    parser.add_argument("--character", "-c", default="alice", help="Character id (default: alice)")
     parser.add_argument("--device", type=int, default=None, help="Microphone device id")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices")
     parser.add_argument("--model", default=None, help="Chat model")
@@ -181,7 +181,7 @@ def main() -> None:
     portrait_worker = None
     if not args.no_portrait:
         try:
-            portrait_client, portrait_worker = portrait_controller.create_controller(model)
+            portrait_client, portrait_worker = portrait_controller.create_controller(args.character, model)
             machine.set_portrait_state(sm.PortraitState.SLIDESHOW)
         except Exception as exc:
             print(f"  [cli] Portrait overlay init failed: {exc}")

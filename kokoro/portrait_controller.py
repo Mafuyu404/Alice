@@ -18,23 +18,28 @@ from kokoro import prompts
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
-NOTES_PATH = ROOT / "portrait_notes.json"
 OVERLAY_SCRIPT = ROOT / "overlay_slideshow.py"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17352
 
 
-def load_portrait_notes(path: Path = NOTES_PATH) -> list[dict]:
+def load_portrait_notes(character_id: str) -> list[dict]:
+    path = ROOT / "characters" / character_id / "portrait" / "portrait.json"
     if not path.exists():
         return []
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return data.get("portraits", [])
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else data.get("portraits", [])
+    except Exception as exc:
+        logger.warning("failed to load portrait notes for %s: %s", character_id, exc)
+        return []
 
 
 class PortraitOverlayClient:
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, character_id: str = ""):
         self.host = host
         self.port = port
+        self.character_id = character_id
         self.base_url = f"http://{host}:{port}"
         self.process: Optional[subprocess.Popen] = None
         self.owned_process = False
@@ -47,15 +52,19 @@ class PortraitOverlayClient:
             logger.warning("overlay script not found: %s", OVERLAY_SCRIPT)
             return
         print("  [portrait] Starting overlay...")
+        cmd = [
+            "python",
+            str(OVERLAY_SCRIPT),
+            "--host",
+            self.host,
+            "--port",
+            str(self.port),
+        ]
+        if self.character_id:
+            image_dir = f"characters/{self.character_id}/portrait"
+            cmd.extend(["--image-dir", image_dir])
         self.process = subprocess.Popen(
-            [
-                "python",
-                str(OVERLAY_SCRIPT),
-                "--host",
-                self.host,
-                "--port",
-                str(self.port),
-            ],
+            cmd,
             cwd=str(ROOT),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -143,11 +152,13 @@ class PortraitDecisionWorker:
         self,
         client: PortraitOverlayClient,
         model: str,
+        character_id: str = "",
         notes: Optional[list[dict]] = None,
     ):
         self.client = client
         self.model = model
-        self.notes = notes if notes is not None else load_portrait_notes()
+        self.character_id = character_id
+        self.notes = notes if notes is not None else load_portrait_notes(character_id)
         self.interval = float(cfg.get("portrait_decision_interval", 2.0))
         self._state_lock = threading.Lock()
         self._user_text = ""
@@ -163,9 +174,8 @@ class PortraitDecisionWorker:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
-    @staticmethod
-    def _find_neutral_id() -> str:
-        notes = load_portrait_notes()
+    def _find_neutral_id(self) -> str:
+        notes = load_portrait_notes(self.character_id)
         for item in notes:
             if "neutral" in item["id"]:
                 return item["id"]
@@ -262,10 +272,10 @@ class PortraitDecisionWorker:
         return ""
 
 
-def create_controller(model: str) -> tuple[PortraitOverlayClient, PortraitDecisionWorker]:
+def create_controller(character_id: str, model: str) -> tuple[PortraitOverlayClient, PortraitDecisionWorker]:
     host = cfg.get("portrait_overlay_host", DEFAULT_HOST)
     port = int(cfg.get("portrait_overlay_port", DEFAULT_PORT))
-    client = PortraitOverlayClient(host=host, port=port)
+    client = PortraitOverlayClient(host=host, port=port, character_id=character_id)
     client.start()
-    worker = PortraitDecisionWorker(client=client, model=model)
+    worker = PortraitDecisionWorker(client=client, model=model, character_id=character_id)
     return client, worker
