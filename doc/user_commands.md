@@ -25,8 +25,8 @@
 
 ### 置信度
 
-- 精准匹配预定义模式 → `confidence = 0.95`
-- 通用动作 + 对象匹配 → `confidence = 0.75`
+- 精准匹配预定义模式 — `confidence = 0.95`
+- 通用动作 + 对象匹配 — `confidence = 0.75`
 
 ### 正则模式覆盖
 
@@ -42,7 +42,7 @@
 
 `execute(command, timeout=45)` 接收检测到的命令并执行：
 
-1. **前置检查**：调用 `vision.get_foreground_app()` 获取前台窗口 → `screen_interest.foreground_is_private()` 检查隐私。涉及隐私则返回 `privacy_context` + `privacy_note`
+1. **前置检查**：调用 `vision.get_foreground_app()` 获取前台窗口 — `screen_interest.foreground_is_private()` 检查隐私。涉及隐私则返回 `privacy_context` + `privacy_note`
 2. **视觉分析**：调用 `vision.detect_desktop()` — 全屏截图 + 枚举所有运行窗口 + 调用视觉 API，使用 `user_commands.screen_inspect_prompt` 作为分析提示（注入 `{user_text}`）
 3. **结果组装**：返回 `CommandResult`，通过 `format_context()` 使用 `user_commands.screen_result_context` 模板格式化（注入 `{screen_content}` `{user_text}`）
 
@@ -79,22 +79,25 @@ class CommandResult:
 
 ## CLI 集成
 
-`cli.py` 的 `on_refined()` 回调中，用户文本先经过 `user_commands.detect()`：
+`cli.py` 的 `on_refined()` 回调中，用户文本先经过 `user_commands.detect()`。命令检测到后：
+
+1. 状态机发出 `COMMAND_DETECTED` 事件，系统进入 THINKING 状态
+2. `_run_vision()` 在后台线程中执行屏幕分析
+3. `build_waiting_reply()` 生成等待回应并播放 TTS（与 vision 并行）
+4. `vision_ready.wait()` 等待视觉分析完成
+5. 结果通过 `extra_context` 注入 LLM 对话
 
 ```
-用户输入 → detect() 检测到命令 → 取消活跃的 screen_watch
-    │                                    ↓
-    ├─ 未检测到命令                   _run_vision() 后台线程
-    │                                    ↓
-    └─→ 正常对话流程              build_waiting_reply() + TTS 播放
-                                       ↓
-                                  vision_ready.wait()
-                                       ↓
-                                  result.context 注入对话
-                                       ↓
-                                  build_messages(extra_context=result.context)
-                                       ↓
-                                  chat_stream() → 正常回复
+用户输入 — detect() 检测到命令
+    |
+    ├─ 未检测到命令 — 正常对话流程
+    |
+    └─ 检测到命令
+         |
+         ├─ _run_vision() 后台线程（与等待回应并行）
+         ├─ build_waiting_reply() + TTS 播放
+         ├─ vision_ready.wait()
+         └─ result.context 注入 — build_messages(extra_context=...) — chat_stream()
 ```
 
-命令执行期间会取消当前活跃的 screen_watch 任务，并清零 SCREEN 冲动值，避免命令分析与周期性屏幕监控冲突。
+状态机会在对话期间（THINKING — SPEAKING）自动阻止屏幕监控和主动搭话的并发干扰，不再需要旧版的 `cancel_active_screen_watch()` 手动取消。

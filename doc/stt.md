@@ -91,7 +91,15 @@ STT 子系统由三部分组成：
 
 ### 回调机制
 
-精炼后的完整句子通过构造时传入的 `on_refined(text)` 回调送入 ChatSession。
+`ConversationPool` 支持三个可选回调，供状态机追踪精炼过程：
+
+| 回调 | 触发时机 |
+|------|---------|
+| `on_refine_start()` | 开始精炼（LLM 调用前） |
+| `on_refine_done()` | 精炼完成（LLM 返回后） |
+| `on_refined(text)` | 精炼结果就绪，送入对话流程 |
+
+精炼后的完整句子通过 `on_refined(text)` 回调送入 ChatSession。
 
 ## 依赖
 

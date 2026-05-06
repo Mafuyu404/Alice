@@ -40,7 +40,7 @@
 
 ### 延期机制
 
-当选中行为但 TTS/STT 正忙时（`busy=True`），决策被暂存。下次 tick 不再忙时，以扣除 `defer_penalty` 后的冲动值重新评估，仍达阈值则触发，否则丢弃。
+通过状态机的 `is_busy` 属性（THINKING/SPEAKING 时为 True）传入 `tick(busy=...)`。当选中行为但系统正忙时，决策被暂存（`_deferred`）。下次 tick 不再忙时，以扣除 `defer_penalty` 后的冲动值重新评估，仍达阈值则触发，否则丢弃。状态机的 `emit(PROACTIVE_TRIGGERED)` 提供原子性的"声明对话槽位"操作——如果用户语音先抢占了槽位，主动搭话安全放弃本轮。
 
 ### RECENT 阻止
 
@@ -95,7 +95,7 @@ tick(busy=False) 每次调用:
 | `add_screen_interest(score, context)` | screen_watch 线程 | 注入屏幕兴趣（>50 分才更新） |
 | `add_memory_interest(score, context)` | memory_events 线程 | 注入记忆事件兴趣（累加） |
 | `apply_feedback(behavior, positive)` | 外部反馈 | 调整行为权重 ±5%/±20%，消极反馈设 `quiet_until` 10 分钟 |
-| `tick(busy=False)` | 主循环 | 每次调用执行一次决策周期 |
+| `tick(busy=False)` | proactive_worker | 每次调用执行一次决策周期。`busy` 参数由状态机的 `is_busy` 提供 |
 | `snapshot()` | 调试 | 返回当前冲动值、干扰值、阈值、候选列表 |
 
 ## 配置

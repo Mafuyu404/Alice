@@ -113,9 +113,10 @@ WebSocket 意外断开时：
 
 ## 播放控制
 
-- 各模块（proactive 调度器、STT 暂停逻辑、CLI 主循环）通过 `is_playing` 检查播放状态
-- CLI 主循环在用户消息处理完成后等待 `is_playing` 变为 `False`，然后调用 `scheduler.record_tts_end()` + `prepare()` 重置状态
-- 主动搭话等待 TTS 播放完毕后再调用 `record_tts_end()`
+- 各模块通过 `is_playing` 检查播放状态
+- 状态机在 LLM 完成后发出 `LLM_DONE` 事件，系统进入 SPEAKING 状态，`set_tts_state(STREAMING)` 追踪 TTS 子状态
+- CLI 主循环在用户消息处理完成后等待 TTS 播放完毕，然后发出 `TTS_DONE` 事件回到 IDLE
+- 主动搭话同样遵循 THINKING — SPEAKING — IDLE 的状态转换
 
 ## 配置
 

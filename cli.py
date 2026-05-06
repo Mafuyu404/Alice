@@ -3,6 +3,9 @@
 
 CLI owns microphone/STT orchestration. Chat, memory, model routing, and TTS
 helpers live in kokoro package modules so webui.py can share the same core.
+
+State machine (kokoro/state_machine.py) is the single source of truth for
+what the system is doing. All workers consult it instead of ad-hoc flags.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from kokoro import pool as pool_mod
 from kokoro import prompts
 from kokoro import proactive
 from kokoro import screen_interest
+from kokoro import state_machine as sm
 from kokoro import stt as stt_mod
 from kokoro import tts as tts_mod
 from kokoro import user_commands
@@ -110,7 +114,6 @@ def chat_stream(
     return reply
 
 
-
 def create_tts_engine(enabled: bool):
     if not enabled:
         return None
@@ -138,12 +141,22 @@ def main() -> None:
         stt_mod.list_devices()
         return
 
+    # ── state machine ──────────────────────────────────────────────────────
+    machine = sm.SystemStateMachine()
+
+    # ── observers: state change → side effects ─────────────────────────────
+    def on_state_change(old: sm.SystemState, new: sm.SystemState, event: sm.SystemEvent) -> None:
+        if new == sm.SystemState.ERROR:
+            print(f"\n  [state] ERROR (from {old.value} via {event.value})")
+
+    machine.subscribe(on_state_change)
+
+    # ── memory backend ─────────────────────────────────────────────────────
     memory_backend = mem_mod.create_backend(CONFIG)
     try:
         session = chat_session.load_session(args.character, memory_backend)
     except KeyError:
         from kokoro import character
-
         print(f"[error] Character '{args.character}' not found")
         print(f"Available characters: {', '.join(character.load().keys())}")
         return
@@ -155,12 +168,18 @@ def main() -> None:
     if not args.no_portrait:
         try:
             portrait_client, portrait_worker = portrait_controller.create_controller(model)
+            machine.set_portrait_state(sm.PortraitState.SLIDESHOW)
         except Exception as exc:
             print(f"  [cli] Portrait overlay init failed: {exc}")
 
     scheduler = proactive.from_config(CONFIG)
     if args.no_proactive:
         scheduler.config.enabled = False
+    if scheduler.config.enabled:
+        machine.set_proactive_state(sm.ProactiveState.ACCRUING)
+    else:
+        machine.set_proactive_state(sm.ProactiveState.DISABLED)
+
     proactive_config = CONFIG.get("proactive", {})
     if not isinstance(proactive_config, dict):
         proactive_config = {}
@@ -174,52 +193,23 @@ def main() -> None:
     screen_interest_threshold = max(0.0, float(screen_cfg.get("interest_threshold", 70.0)))
     screen_vision_timeout = max(5, int(screen_cfg.get("vision_timeout", 45)))
     memory_detector = memory_events.from_config(CONFIG, memory_backend, session.character_id)
-    chat_lock = threading.Lock()
-    screen_watch_state_lock = threading.Lock()
-    screen_watch_seq = 0
-    active_screen_watch_id = 0
-    canceled_screen_watch_ids: set[int] = set()
 
-    def begin_screen_watch() -> int:
-        nonlocal screen_watch_seq, active_screen_watch_id
-        with screen_watch_state_lock:
-            screen_watch_seq += 1
-            active_screen_watch_id = screen_watch_seq
-            return active_screen_watch_id
-
-    def cancel_active_screen_watch() -> bool:
-        with screen_watch_state_lock:
-            if active_screen_watch_id:
-                canceled_screen_watch_ids.add(active_screen_watch_id)
-                return True
-            return False
-
-    def consume_screen_watch_canceled(watch_id: int) -> bool:
-        with screen_watch_state_lock:
-            if watch_id in canceled_screen_watch_ids:
-                canceled_screen_watch_ids.remove(watch_id)
-                return True
-            return False
-
-    def finish_screen_watch(watch_id: int) -> None:
-        nonlocal active_screen_watch_id
-        with screen_watch_state_lock:
-            if active_screen_watch_id == watch_id:
-                active_screen_watch_id = 0
-
+    # ── conversation handler (called by pool when STT text is ready) ───────
     def on_refined(text: str) -> None:
         scheduler.record_user_activity()
         scheduler.reset_all()
         display_user(text)
-        with chat_lock:
+
+        # Emit state transition: LISTENING → THINKING
+        if not machine.emit(sm.SystemEvent.STT_REFINED):
+            # State machine rejected — system is busy or shutting down
+            return
+
+        try:
             command_context = ""
             command = user_commands.detect(text)
             if command:
                 print(f"\n  [command] {command.type} confidence={command.confidence:.2f}")
-                if cancel_active_screen_watch():
-                    scheduler.desires[proactive.Behavior.SCREEN] = 0.0
-                    scheduler.screen_context = ""
-                    print("\n  [screen] active watch canceled by command")
 
                 # Start vision immediately, parallel with waiting-reply LLM + TTS
                 vision_result: list[user_commands.CommandResult | Exception | None] = [None]
@@ -277,10 +267,17 @@ def main() -> None:
                 reply = chat_stream(messages, session.character_name, model, tts_engine)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
+                machine.emit_error("llm_connection")
                 return
             except Exception as exc:
                 print(f"\n[error] {type(exc).__name__}: {exc}")
+                machine.emit_error("llm_stream")
                 return
+
+            # LLM done → transition to SPEAKING
+            machine.emit(sm.SystemEvent.LLM_DONE)
+            if tts_engine:
+                machine.set_tts_state(sm.TTSState.STREAMING)
 
             session.remember(text, reply, async_store=True)
             scheduler.record_conversation_end(text, reply)
@@ -293,6 +290,17 @@ def main() -> None:
                 scheduler.record_tts_end()
                 tts_engine.prepare()
 
+            # TTS done → back to IDLE
+            machine.set_tts_state(sm.TTSState.IDLE)
+            machine.emit(sm.SystemEvent.TTS_DONE)
+            machine.reset_error_count()
+
+        except Exception as exc:
+            print(f"\n[error] on_refined: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            machine.emit_error("on_refined")
+
+    # ── STT pool ───────────────────────────────────────────────────────────
     refine_url, refine_model, refine_key = refine_endpoint()
     stt_refine_mode = cfg.stt_refine_mode()
     stt_refine_inline = stt_refine_mode == "inline"
@@ -337,7 +345,10 @@ def main() -> None:
     if greeting:
         print(f"\n{session.character_name}: {greeting}")
 
-    stt_running = True
+    # ── system ready ───────────────────────────────────────────────────────
+    machine.emit(sm.SystemEvent.INIT_DONE)
+
+    # ── STT worker ─────────────────────────────────────────────────────────
     last_partial = ""
     pause_during_tts = cfg.stt_pause_during_tts()
 
@@ -357,7 +368,7 @@ def main() -> None:
             )
             audio_stream.start()
 
-            while stt_running:
+            while not machine.is_shutting_down:
                 chunk, _ = audio_stream.read(1600)
 
                 if pause_during_tts and tts_engine and tts_engine.is_playing:
@@ -382,12 +393,18 @@ def main() -> None:
                             sys.stdout.write(f"\r\033[K  [STT] {text}")
                             sys.stdout.flush()
                             last_partial = text
+                            # Signal that user is speaking
+                            if machine.is_idle or machine.state == sm.SystemState.SCREEN_WATCHING:
+                                machine.emit(sm.SystemEvent.USER_SPEECH_START)
+                                machine.set_stt_state(sm.STTState.LISTENING)
                     if recognizer.is_endpoint(stt_stream):
                         recognizer.reset(stt_stream)
                         last_partial = ""
+                        machine.emit(sm.SystemEvent.USER_SPEECH_END)
         except Exception as exc:
             print(f"\n[STT error] {exc}")
             traceback.print_exc()
+            machine.emit_error("stt")
         finally:
             if audio_stream is not None:
                 try:
@@ -399,23 +416,30 @@ def main() -> None:
     stt_thread = threading.Thread(target=stt_worker, daemon=True)
     stt_thread.start()
 
+    # ── proactive worker ───────────────────────────────────────────────────
     def send_snapshot() -> None:
         if portrait_client:
             portrait_client.send_debug(scheduler.snapshot())
 
     def proactive_worker() -> None:
-        while stt_running:
+        while not machine.is_shutting_down:
             time.sleep(scheduler.config.tick_seconds)
             send_snapshot()
             if not scheduler.config.enabled:
                 continue
 
-            busy = (tts_engine and tts_engine.is_playing) or chat_lock.locked()
+            busy = machine.is_busy
             decision = scheduler.tick(busy=busy)
             if decision is None:
                 continue
 
-            with chat_lock:
+            # Only fire if state machine allows (atomic claim)
+            if not machine.emit(sm.SystemEvent.PROACTIVE_TRIGGERED):
+                # Lost the race — desire already consumed by tick(), will re-accrue
+                continue
+
+            machine.set_proactive_state(sm.ProactiveState.EXECUTING)
+            try:
                 messages = session.build_messages(decision.prompt)
                 guidance = session.character_data.get("proactive_guidance", "")
                 sys_content = prompts.get("proactive.trigger_system", "")
@@ -436,9 +460,13 @@ def main() -> None:
                     reply = chat_stream(messages, session.character_name, model, tts_engine)
                 except requests.exceptions.ConnectionError:
                     print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
+                    machine.emit_error("proactive_llm")
+                    machine.set_proactive_state(sm.ProactiveState.ACCRUING)
                     continue
                 except Exception as exc:
                     print(f"\n[proactive error] {type(exc).__name__}: {exc}")
+                    machine.emit_error("proactive_stream")
+                    machine.set_proactive_state(sm.ProactiveState.ACCRUING)
                     continue
 
                 if reply:
@@ -448,36 +476,48 @@ def main() -> None:
                     if portrait_worker:
                         portrait_worker.submit("", reply)
 
+                # LLM done → SPEAKING
+                machine.emit(sm.SystemEvent.LLM_DONE)
                 if tts_engine:
-                    while tts_engine.is_playing and stt_running:
+                    machine.set_tts_state(sm.TTSState.STREAMING)
+
+                if tts_engine:
+                    while tts_engine.is_playing and not machine.is_shutting_down:
                         time.sleep(0.1)
                     scheduler.record_tts_end()
                     tts_engine.prepare()
 
+                machine.set_tts_state(sm.TTSState.IDLE)
+                machine.emit(sm.SystemEvent.TTS_DONE)
+                machine.reset_error_count()
+                machine.set_proactive_state(sm.ProactiveState.ACCRUING)
+
+            except Exception as exc:
+                print(f"\n[proactive error] {type(exc).__name__}: {exc}")
+                traceback.print_exc()
+                machine.emit_error("proactive")
+                machine.set_proactive_state(sm.ProactiveState.ACCRUING)
+
     proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
     proactive_thread.start()
 
+    # ── screen watch worker ────────────────────────────────────────────────
     def screen_watch_worker() -> None:
-        while stt_running:
+        while not machine.is_shutting_down:
             time.sleep(screen_watch_interval)
             if not screen_watch_enabled:
                 continue
-            if chat_lock.locked():
+            if machine.is_busy:
                 continue
-            if tts_engine and tts_engine.is_playing:
-                continue
-            watch_id = begin_screen_watch()
+
             try:
                 result = screen_interest.analyze(timeout=screen_vision_timeout)
             except Exception as exc:
-                if not consume_screen_watch_canceled(watch_id):
-                    print(f"\n[screen watch error] {type(exc).__name__}: {exc}")
-                finish_screen_watch(watch_id)
+                print(f"\n[screen watch error] {type(exc).__name__}: {exc}")
                 continue
-            finally:
-                finish_screen_watch(watch_id)
 
-            if consume_screen_watch_canceled(watch_id):
+            # Discard result if system state changed during the vision call
+            if machine.is_busy or not machine.can_start_conversation:
                 continue
 
             if result.private:
@@ -492,14 +532,13 @@ def main() -> None:
     screen_thread = threading.Thread(target=screen_watch_worker, daemon=True)
     screen_thread.start()
 
+    # ── memory event worker ────────────────────────────────────────────────
     def memory_event_worker() -> None:
-        while stt_running:
+        while not machine.is_shutting_down:
             time.sleep(memory_detector.config.check_interval)
             if not scheduler.config.enabled or not memory_detector.config.enabled:
                 continue
-            if chat_lock.locked():
-                continue
-            if tts_engine and tts_engine.is_playing:
+            if machine.is_busy:
                 continue
             for event in memory_detector.poll():
                 scheduler.add_memory_interest(event.score, event.context)
@@ -509,13 +548,31 @@ def main() -> None:
     memory_thread = threading.Thread(target=memory_event_worker, daemon=True)
     memory_thread.start()
 
+    # ── error recovery watcher ─────────────────────────────────────────────
+    def error_recovery_worker() -> None:
+        while not machine.is_shutting_down:
+            time.sleep(1.0)
+            if machine.state == sm.SystemState.ERROR:
+                # Perform cleanup
+                if tts_engine:
+                    try:
+                        tts_engine.prepare()
+                    except Exception:
+                        pass
+                machine.recover_from_error()
+                machine.reset_error_count()
+
+    error_thread = threading.Thread(target=error_recovery_worker, daemon=True)
+    error_thread.start()
+
+    # ── main loop ──────────────────────────────────────────────────────────
     try:
-        while stt_running:
+        while not machine.is_shutting_down:
             time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n\n[cli] Stopping...")
     finally:
-        stt_running = False
+        machine.emit(sm.SystemEvent.SHUTDOWN)
         pool.stop()
         if portrait_worker:
             portrait_worker.stop()

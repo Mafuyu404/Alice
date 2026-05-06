@@ -54,6 +54,8 @@ class ConversationPool:
         llm_url: str = "http://127.0.0.1:11434",
         llm_model: str = "qwen2.5:0.5b",
         on_refined: Optional[Callable[[str], None]] = None,
+        on_refine_start: Optional[Callable[[], None]] = None,
+        on_refine_done: Optional[Callable[[], None]] = None,
         api_key: Optional[str] = None,
         stable_seconds: float | None = None,
         tick_seconds: float | None = None,
@@ -64,6 +66,8 @@ class ConversationPool:
         self.llm_url = llm_url.rstrip("/")
         self.llm_model = llm_model
         self.on_refined = on_refined
+        self.on_refine_start = on_refine_start
+        self.on_refine_done = on_refine_done
         self.api_key = api_key
         self.stable_seconds = float(stable_seconds if stable_seconds is not None else cfg.stt_refine_stable_seconds())
         self.tick_seconds = float(tick_seconds if tick_seconds is not None else cfg.stt_pool_tick_seconds())
@@ -175,6 +179,9 @@ class ConversationPool:
 
             t0 = time.perf_counter()
 
+            if self.on_refine_start:
+                self.on_refine_start()
+
             if self.mode == "separate":
                 # Current behavior: LLM refine (skip for short/clean text)
                 result = text_to_refine.strip() if self._should_skip_refine(text_to_refine) else self._refine(text_to_refine)
@@ -183,6 +190,9 @@ class ConversationPool:
                 # inline / none: local regex cleaning only, no LLM refine call
                 result = local_clean_stt(text_to_refine)
                 skip = True
+
+            if self.on_refine_done:
+                self.on_refine_done()
 
             elapsed = time.perf_counter() - t0
             label = "local" if skip else self.mode

@@ -8,32 +8,32 @@
 
 ```
 screen_watch 线程 (每 watch_interval 秒)
-    │
+    |
     ├─ 1. vision.get_foreground_app() — 获取前台窗口信息
     ├─ 2. vision.screenshot_to_base64() — 全屏截图转 base64
-    │
-    └─ → screen_interest.analyze()
-            │
+    |
+    └─ screen_interest.analyze()
+            |
             ├─ foreground_is_private(foreground) — 隐私过滤
-            │   private=True → 返回 ScreenInterest(private=True)
-            │
+            |   private=True — 返回 ScreenInterest(private=True)
+            |
             ├─ _content_prompt(foreground) — 构建分析提示词
-            │   (含前台窗口标题 + 进程名)
-            │
+            |   (含前台窗口标题 + 进程名)
+            |
             ├─ vision.analyze_image() — 调用视觉 API
-            │
+            |
             └─ _parse_content() — 解析 JSON 响应
-                    │
+                    |
                     ├─ score: 0-100 兴趣度
                     ├─ content: 对前台窗口的详尽描述（截断至 600 字符）
                     ├─ reason: 有趣的理由（截断至 200 字符）
                     └─ private: 是否隐私内容
-                            │
-                score ≥ interest_threshold 且非 private
-                            │
-                            ▼
-                    ├─→ scheduler.add_screen_interest(score, context)
-                    └─→ session.add_screen_context(content)
+                            |
+                score >= interest_threshold 且非 private
+                            |
+                            v
+                    ├─ scheduler.add_screen_interest(score, context)
+                    └─ session.add_screen_context(content)
 ```
 
 ## ScreenInterest
@@ -89,20 +89,21 @@ authenticator, 2fa, private browsing, incognito, 隐私, 密码, 登录, 登陆,
 - **DashScope**（云端）：阿里云视觉模型 `qwen-vl-plus` / `qwen-vl-max`，需要 API Key
 - **Ollama**（本地）：Ollama 多模态模型 `qwen2.5vl:3b` 等，免费但识别能力有限
 
-详见 [vision.md](#)（`kokoro/vision.py` 还提供 `get_running_apps()`、`get_foreground_app()`、`detect_desktop()` 等窗口枚举和综合桌面分析功能）。
+`kokoro/vision.py` 还提供 `get_running_apps()`、`get_foreground_app()`、`detect_desktop()` 等窗口枚举和综合桌面分析功能。
 
 ## CLI 主循环集成
 
-`cli.py` 中 `screen_watch_worker` 线程的工作流程：
+`cli.py` 中 `screen_watch_worker` 线程通过状态机控制并发安全：
 
 1. 等待 `screen_watch_interval` 秒
-2. 检查聊天锁/TTS 播放状态（忙时跳过）
-3. 调用 `begin_screen_watch()` 获取唯一 ID（支持取消）
-4. 调用 `screen_interest.analyze()`
-5. 检查是否被用户命令取消（`consume_screen_watch_canceled()`）
-6. 结果处理：
-   - `private=True` → 设置 `quiet_until` 推迟下次检查
-   - `score >= interest_threshold` → 注入 scheduler + session
+2. 检查状态机是否繁忙（`machine.is_busy`，THINKING/SPEAKING 状态时跳过）
+3. 调用 `screen_interest.analyze()`（阻塞，最长 `vision_timeout` 秒）
+4. 视觉 API 返回后再次检查 `machine.can_start_conversation`，系统状态已变化则丢弃结果
+5. 结果处理：
+   - `private=True` — 设置 `quiet_until` 推迟下次检查
+   - `score >= interest_threshold` — 注入 scheduler + session
+
+状态机自动处理并发控制：用户说话或主动搭话触发时，屏幕监控的结果会被自然丢弃。不再需要旧版的 `active_screen_watch_id` + `canceled_screen_watch_ids` 取消机制。
 
 ## 配置
 

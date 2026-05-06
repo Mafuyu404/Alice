@@ -2,36 +2,25 @@
 
 ## 环境要求
 
-- Python 3.10+
+- Python 3.11+
 - Windows（立绘叠加层依赖 Win32 API；屏幕识别需要 `pywin32` + `pillow`）
 - 麦克风（语音模式需要）
 
 ## 安装依赖
 
 ```bash
-pip install -r requirements.txt
-```
+# 核心依赖
+pip install requests numpy sounddevice sherpa-onnx pillow pywin32
 
-需要额外安装的可选依赖：
+# TTS（可选）
+pip install websockets    # MiniMax TTS
+pip install cartesia      # Cartesia TTS
 
-```bash
 # 长期记忆（可选）
-pip install mem0ai
-
-# STT 语音识别（语音模式需要）
-pip install sherpa-onnx sounddevice numpy
+pip install mem0ai fastembed
 
 # 立绘窗口（可选）
 pip install PySide6
-
-# MiniMax TTS WebSocket（可选，使用 minimax 后端时需要）
-pip install websockets
-
-# Cartesia TTS（可选，使用 cartesia 后端时需要）
-pip install cartesia
-
-# 屏幕截图与窗口枚举（可选，屏幕监控需要）
-pip install pillow pywin32
 ```
 
 ## 配置
@@ -141,9 +130,9 @@ python webui.py
 ├── characters.json                 # 角色定义
 ├── prompts.json                    # 所有提示词集中管理
 ├── portrait_notes.json             # 立绘注释（供 LLM 选图用）
-├── portrait_map.json               # 立绘素材映射（供 overlay 轮播用）
 ├── overlay_slideshow.py            # 立绘窗口（PySide6）
 ├── img/                            # 立绘素材
+│   └── portrait_map.json           # 立绘素材映射
 ├── doc/                            # 文档
 │   ├── overview.md                 # 框架概述
 │   ├── quickstart.md               # 本文件
@@ -151,6 +140,7 @@ python webui.py
 │   ├── character.md                # 角色系统
 │   ├── chat_session.md             # 对话会话与 LLM 客户端
 │   ├── prompts.md                  # 提示词管理
+│   ├── state_machine.md            # 状态机
 │   ├── stt.md                      # 语音识别
 │   ├── tts.md                      # 语音合成
 │   ├── memory.md                   # 记忆系统
@@ -165,6 +155,7 @@ python webui.py
 └── kokoro/
     ├── __init__.py                 # 模块入口
     ├── config.py                   # 配置加载
+    ├── state_machine.py            # 两级层次状态机
     ├── character.py                # 角色管理
     ├── prompts.py                  # 提示词加载
     ├── chat_session.py             # 对话会话
