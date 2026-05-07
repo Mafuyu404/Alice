@@ -34,6 +34,8 @@ from kokoro import state_machine as sm
 from kokoro import stt as stt_mod
 from kokoro import tts as tts_mod
 from kokoro import user_commands
+from kokoro import agent_loop
+from kokoro import tool_registry as tool_registry_mod
 
 
 _PAREN_STRIP_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*")
@@ -74,6 +76,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no-portrait", action="store_true", help="Disable portrait overlay")
     parser.add_argument("--no-proactive", action="store_true", help="Disable proactive speech scheduler")
     parser.add_argument("--no-screen-watch", action="store_true", help="Disable proactive screen interest events")
+    parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
     return parser.parse_args()
 
 
@@ -89,18 +92,44 @@ def chat_stream(
     tts_engine: object | None,
     cancel_event: threading.Event | None = None,
     character_config: dict | None = None,
+    agent_config: agent_loop.AgentConfig | None = None,
+    tool_context: dict | None = None,
 ) -> tuple[str, bool]:
     """Stream LLM response. Returns (reply_text, was_cancelled)."""
     print(f"\n{char_name}: ", end="", flush=True)
+    char_cfg = character_config or {}
+    _llm_api_base = char_cfg.get("llm_url") or None
+    _llm_api_key = char_cfg.get("api_key") or None
+
+    if agent_config is not None:
+        # Tool-calling path: agent loop handles streaming + tools
+        t0 = time.perf_counter()
+        result = agent_loop.agent_chat(
+            messages, model,
+            agent_config=agent_config,
+            cancel_event=cancel_event,
+            tts_engine=tts_engine,
+            character_config=character_config,
+            api_base_url=_llm_api_base,
+            api_key=_llm_api_key,
+            **(tool_context or {}),
+        )
+        if not result.cancelled:
+            print()
+            print(f"  [latency] llm_done {time.perf_counter() - t0:.2f}s")
+            if result.tool_calls_made > 0:
+                print(f"  [tool] total tool calls: {result.tool_calls_made}")
+        reply = _strip_parens(result.reply)
+        if reply and tts_engine and not result.cancelled:
+            tts_engine.end_sentence()
+        return reply, result.cancelled
+
+    # Legacy path: plain streaming
     reply = ""
     t0 = time.perf_counter()
     first_token_at = 0.0
     paren_filter = _ParenFilter()
     cancelled = False
-
-    char_cfg = character_config or {}
-    _llm_api_base = char_cfg.get("llm_url") or None
-    _llm_api_key = char_cfg.get("api_key") or None
 
     for content in llm_client.stream_chat(
         messages, model,
@@ -204,6 +233,30 @@ def main() -> None:
     else:
         machine.set_proactive_state(sm.ProactiveState.DISABLED)
 
+    # ── tool calling ──────────────────────────────────────────────────────────
+    _agent_config: agent_loop.AgentConfig | None = None
+    _tool_enabled = cfg.tool_enabled() and not args.no_tools
+    if _tool_enabled:
+        _tool_list = cfg.tool_list()
+        _tool_timeout = cfg.tool_timeout()
+        _max_iter = cfg.tool_max_iterations()
+        _registry = tool_registry_mod.create_registry(
+            tool_list=_tool_list,
+            tool_timeout=_tool_timeout,
+        )
+        _tool_schemas = _registry.enabled_schemas()
+        if _tool_schemas:
+            _agent_config = agent_loop.AgentConfig(
+                tools=_tool_schemas,
+                tool_registry=_registry,
+                max_tool_iterations=_max_iter,
+                tool_timeout=_tool_timeout,
+            )
+            print(f"  [tool] Enabled: {', '.join(s['function']['name'] for s in _tool_schemas)}")
+        else:
+            _tool_enabled = False
+            print("  [tool] No tools enabled (check config or model compatibility)")
+
     proactive_config = CONFIG.get("proactive", {})
     if not isinstance(proactive_config, dict):
         proactive_config = {}
@@ -252,68 +305,69 @@ def main() -> None:
 
         try:
             command_context = ""
-            command = user_commands.detect(text)
-            if command:
-                print(f"\n  [command] {command.type} confidence={command.confidence:.2f}")
+            if not _tool_enabled:
+                command = user_commands.detect(text)
+                if command:
+                    print(f"\n  [command] {command.type} confidence={command.confidence:.2f}")
 
-                # Start vision immediately, parallel with waiting-reply LLM + TTS
-                vision_result: list[user_commands.CommandResult | Exception | None] = [None]
-                vision_ready = threading.Event()
+                    # Start vision immediately, parallel with waiting-reply LLM + TTS
+                    vision_result: list[user_commands.CommandResult | Exception | None] = [None]
+                    vision_ready = threading.Event()
 
-                def _run_vision() -> None:
+                    def _run_vision() -> None:
+                        try:
+                            vision_result[0] = user_commands.execute(command, timeout=screen_vision_timeout)
+                        except Exception as exc:
+                            vision_result[0] = exc
+                        finally:
+                            vision_ready.set()
+
+                    threading.Thread(target=_run_vision, daemon=True).start()
+
                     try:
-                        vision_result[0] = user_commands.execute(command, timeout=screen_vision_timeout)
-                    except Exception as exc:
-                        vision_result[0] = exc
-                    finally:
-                        vision_ready.set()
+                        waiting_reply = user_commands.build_waiting_reply(
+                            text,
+                            session.history,
+                            llm_url=refine_url,
+                            llm_model=refine_model,
+                            character_name=session.character_name,
+                            character_prompt=session.system_prompt,
+                            api_key=refine_key,
+                        )
+                    except Exception:
+                        waiting_reply = "好，我看一下。"
 
-                threading.Thread(target=_run_vision, daemon=True).start()
+                    print(f"\n{session.character_name}: {waiting_reply}")
+                    if tts_engine:
+                        tts_engine.push(waiting_reply)
+                        while tts_engine.is_playing and not cancel_event.is_set():
+                            time.sleep(0.1)
 
-                try:
-                    waiting_reply = user_commands.build_waiting_reply(
-                        text,
-                        session.history,
-                        llm_url=refine_url,
-                        llm_model=refine_model,
-                        character_name=session.character_name,
-                        character_prompt=session.system_prompt,
-                        api_key=refine_key,
-                    )
-                except Exception:
-                    waiting_reply = "好，我看一下。"
+                    if cancel_event.is_set():
+                        _current_cancel[0] = None
+                        return
 
-                print(f"\n{session.character_name}: {waiting_reply}")
-                if tts_engine:
-                    tts_engine.push(waiting_reply)
-                    while tts_engine.is_playing and not cancel_event.is_set():
-                        time.sleep(0.1)
+                    vision_ready.wait()
+                    result = vision_result[0]
+                    if isinstance(result, Exception):
+                        command_context = ""
+                        print(f"\n  [screen] command error: {result}")
+                    else:
+                        command_context = result.context
+                        if result.ok and result.screen_context:
+                            scheduler.desires[proactive.Behavior.SCREEN] = 0.0
+                            scheduler.screen_context = ""
+                            session.add_screen_context(result.screen_context)
+                            print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context.split(chr(10))[0]}")
+                        elif result.user_visible_note:
+                            label = "private" if result.private else "error"
+                            print(f"\n  [screen] command {label}: {result.user_visible_note}")
+                            command_context = result.context or result.user_visible_note
 
-                if cancel_event.is_set():
-                    _current_cancel[0] = None
-                    return
-
-                vision_ready.wait()
-                result = vision_result[0]
-                if isinstance(result, Exception):
-                    command_context = ""
-                    print(f"\n  [screen] command error: {result}")
-                else:
-                    command_context = result.context
-                    if result.ok and result.screen_context:
-                        scheduler.desires[proactive.Behavior.SCREEN] = 0.0
-                        scheduler.screen_context = ""
-                        session.add_screen_context(result.screen_context)
-                        print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context.split(chr(10))[0]}")
-                    elif result.user_visible_note:
-                        label = "private" if result.private else "error"
-                        print(f"\n  [screen] command {label}: {result.user_visible_note}")
-                        command_context = result.context or result.user_visible_note
-
-            messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline)
+            messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline, inject_memory=not _tool_enabled)
 
             try:
-                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config)
+                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                 machine.emit_error("llm_connection")
@@ -397,6 +451,7 @@ def main() -> None:
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
     print(f"  Proactive: {scheduler.config.enabled}")
+    print(f"  Tool calling: {_tool_enabled}")
     print(f"  Screen watch: {screen_watch_enabled}")
     print(f"  Memory events: {memory_detector.config.enabled}")
     print("  Ctrl+C to stop")
@@ -512,7 +567,7 @@ def main() -> None:
             proactive_cancel = threading.Event()
             _current_cancel[0] = proactive_cancel
             try:
-                messages = session.build_messages(decision.prompt)
+                messages = session.build_messages(decision.prompt, inject_memory=not _tool_enabled)
                 guidance = session.character_data.get("proactive_guidance", "")
                 sys_content = prompts.get("proactive.trigger_system", "")
                 if guidance:
@@ -529,7 +584,7 @@ def main() -> None:
                     f"desire={decision.desire:.1f} disturb={decision.disturbance:.1f}"
                 )
                 try:
-                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel, character_config=session.character_config)
+                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel, character_config=session.character_config, agent_config=_agent_config, tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
                 except requests.exceptions.ConnectionError:
                     print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                     machine.emit_error("proactive_llm")

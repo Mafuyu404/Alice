@@ -79,6 +79,7 @@ class ChatSession:
         include_screen: bool = True,
         extra_context: str | None = None,
         stt_refine_inline: bool = False,
+        inject_memory: bool = True,
     ) -> list[dict]:
         messages = [{"role": "system", "content": self.system_prompt}]
         # History first — stable prefix for API prompt caching
@@ -95,9 +96,10 @@ class ChatSession:
             messages.append({"role": "system", "content": screen_text})
         if extra_context:
             messages.append({"role": "system", "content": extra_context})
-        memory_ctx = self.memory_backend.get_context(user_text, user_id=self.character_id)
-        if memory_ctx:
-            messages.append({"role": "system", "content": memory_ctx})
+        if inject_memory:
+            memory_ctx = self.memory_backend.get_context(user_text, user_id=self.character_id)
+            if memory_ctx:
+                messages.append({"role": "system", "content": memory_ctx})
         if stt_refine_inline:
             inline_prompt = prompts.get("stt_refine_inline.system", "")
             if inline_prompt:
@@ -107,6 +109,9 @@ class ChatSession:
 
     def remember(self, user_text: str, assistant_text: str, async_store: bool = True) -> None:
         if not assistant_text:
+            return
+        # Skip tool-role messages — they are ephemeral conversation artifacts
+        if user_text.startswith("[tool:") or assistant_text.startswith("[tool:"):
             return
 
         need_summary = False

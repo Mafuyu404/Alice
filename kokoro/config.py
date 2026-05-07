@@ -153,3 +153,33 @@ def api_base() -> str:
     if mb in ("mem0", "none") or not kb:
         return lu + "/v1"
     return kb + "/v1"
+
+
+# ── tool calling ────────────────────────────────────────────────────────────
+
+def tool_enabled() -> bool:
+    section = get("tool_calling", {})
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
+
+
+def tool_list() -> list[str]:
+    section = get("tool_calling", {})
+    if not isinstance(section, dict):
+        return ["look_at_screen", "search_memory", "get_current_time", "get_current_app"]
+    return section.get("tools", ["look_at_screen", "search_memory", "get_current_time", "get_current_app"])
+
+
+def tool_max_iterations() -> int:
+    section = get("tool_calling", {})
+    if not isinstance(section, dict):
+        return 5
+    return int(section.get("max_iterations", 5))
+
+
+def tool_timeout() -> float:
+    section = get("tool_calling", {})
+    if not isinstance(section, dict):
+        return 45.0
+    return float(section.get("tool_timeout", 45.0))

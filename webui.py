@@ -23,6 +23,8 @@ from kokoro import character
 from kokoro import config as cfg
 from kokoro import llm_client
 from kokoro import memory as mem_mod
+from kokoro import tool_registry as tool_registry_mod
+from kokoro.tool_parser import parse_sse_chunk, ToolCallAccumulator
 
 
 CONFIG = cfg.load()
@@ -253,6 +255,8 @@ async def chat_completions(request: dict):
     stream = request.get("stream", True)
     model = request.get("model", MODEL)
     user_id = char_key or "default"
+    tools = request.get("tools")
+    _tool_enabled = cfg.tool_enabled() and tools
 
     use_mem0 = not USE_KOKOROMO and memory_backend.ready
     last_input = chat_session.last_user_text(messages) if use_mem0 else ""
@@ -260,17 +264,27 @@ async def chat_completions(request: dict):
         ctx = await asyncio_get_context(last_input, user_id)
         messages = chat_session.inject_memory_context(messages, ctx)
 
+    if _tool_enabled and tools:
+        return StreamingResponse(
+            _tool_aware_stream(messages, model, tools, user_id, use_mem0, last_input),
+            media_type="text/event-stream",
+        )
+
     payload = llm_client.build_payload(model, messages, stream=stream)
     headers = llm_client.api_headers(model)
     reply_chunks: list[str] = []
 
-    async def stream_from(url: str):
+    async def stream_from(url: str, _payload=None, _headers=None):
+        if _payload is None:
+            _payload = payload
+        if _headers is None:
+            _headers = headers
         async with httpx.AsyncClient(timeout=120) as client:
             async with client.stream(
                 "POST",
                 f"{url}/v1/chat/completions",
-                json=payload,
-                headers=headers,
+                json=_payload,
+                headers=_headers,
             ) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
@@ -303,6 +317,142 @@ async def chat_completions(request: dict):
             chat_session.store_memory_async(memory_backend, last_input, "".join(reply_chunks), user_id)
 
     return StreamingResponse(proxy_stream(), media_type="text/event-stream")
+
+
+async def _tool_aware_stream(
+    messages: list[dict],
+    model: str,
+    tools: list[dict],
+    user_id: str,
+    use_mem0: bool,
+    last_input: str,
+):
+    """Agent loop for streaming with tool calling, yielding SSE lines."""
+    import asyncio
+    import json as _jsonmod
+    import re as _remod
+
+    tool_names = [t["function"]["name"] for t in tools if "function" in t]
+    registry = tool_registry_mod.create_registry(
+        tool_list=tool_names,
+        tool_timeout=cfg.tool_timeout(),
+    )
+    tool_schemas = registry.enabled_schemas()
+    if not tool_schemas:
+        # Fallback: no tools available
+        payload = llm_client.build_payload(model, messages, stream=True)
+        headers = llm_client.api_headers(model)
+        url = _resolve_upstream_url(model)
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", f"{url}/v1/chat/completions", json=payload, headers=headers) as resp:
+                async for line in resp.aiter_lines():
+                    if line:
+                        yield line + "\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    max_iter = cfg.tool_max_iterations()
+    reply_chunks: list[str] = []
+    working_messages = list(messages)
+
+    for iteration in range(max_iter):
+        accumulator = ToolCallAccumulator()
+        pending_completed = []
+        chunk_data = ""
+
+        payload = llm_client.build_payload(model, working_messages, stream=True, tools=tool_schemas)
+        headers = llm_client.api_headers(model)
+        url = _resolve_upstream_url(model)
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", f"{url}/v1/chat/completions", json=payload, headers=headers) as resp:
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    err = f"[API error {resp.status_code}] {body[:200].decode(errors='replace')}"
+                    yield f"data: {_jsonmod.dumps({'choices': [{'delta': {'content': err}}]})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    parsed = parse_sse_chunk(line)
+
+                    # Stream content to client
+                    if parsed.content:
+                        chunk_data += parsed.content
+                        reply_chunks.append(parsed.content)
+                        sse_line = f"data: {_jsonmod.dumps({'choices': [{'delta': {'content': parsed.content}}]})}\n\n"
+                        yield sse_line
+
+                    # Accumulate tool calls
+                    if parsed.tool_call_deltas:
+                        completed = accumulator.feed(parsed.tool_call_deltas)
+                        pending_completed.extend(completed)
+
+                    if parsed.finish_reason in ("stop", "tool_calls"):
+                        break
+
+        # If no tool calls, we're done
+        if not pending_completed:
+            break
+
+        # Yield a tool call status event
+        for tc in pending_completed:
+            yield f"data: {_jsonmod.dumps({'type': 'tool_call', 'name': tc.name, 'status': 'running'})}\n\n"
+
+        # Build assistant message with tool_calls
+        assistant_tool_calls = []
+        for tc in pending_completed:
+            assistant_tool_calls.append({
+                "id": tc.call_id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": _jsonmod.dumps(tc.arguments, ensure_ascii=False),
+                },
+            })
+
+        working_messages.append({
+            "role": "assistant",
+            "content": chunk_data or None,
+            "tool_calls": assistant_tool_calls,
+        })
+
+        # Execute tools and append results
+        loop = asyncio.get_event_loop()
+        for tc in pending_completed:
+            result = await loop.run_in_executor(
+                None,
+                lambda n=tc.name, a=tc.arguments: registry.execute(
+                    n, a,
+                    memory_backend=memory_backend,
+                    character_id=user_id,
+                ),
+            )
+            working_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.call_id,
+                "content": result,
+            })
+
+        # Yield tool done event
+        for tc in pending_completed:
+            yield f"data: {_jsonmod.dumps({'type': 'tool_call', 'name': tc.name, 'status': 'done'})}\n\n"
+
+    # Store to memory if applicable
+    if use_mem0 and last_input and reply_chunks:
+        chat_session.store_memory_async(memory_backend, last_input, "".join(reply_chunks), user_id)
+
+    yield "data: [DONE]\n\n"
+
+
+def _resolve_upstream_url(model: str) -> str:
+    if cfg.is_deepseek_model(model):
+        return cfg.deepseek_url()
+    if USE_KOKOROMO and cfg.kokoromo_url():
+        return cfg.kokoromo_url()
+    return LLM_URL
 
 
 async def asyncio_get_context(last_input: str, user_id: str) -> str:

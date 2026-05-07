@@ -34,8 +34,12 @@ def upstream_url_for(model: str, prefer_kokoromemo: bool = False) -> str:
     return cfg.llm_url()
 
 
-def build_payload(model: str, messages: list[dict], stream: bool = True) -> dict:
+def build_payload(model: str, messages: list[dict], stream: bool = True,
+                  tools: list[dict] | None = None) -> dict:
     payload = {"model": model, "messages": messages, "stream": stream}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     if cfg.is_deepseek_model(model):
         payload["thinking"] = {"type": "disabled"}
     return payload
@@ -65,6 +69,7 @@ def stream_chat(
     cancel_event: Optional[threading.Event] = None,
     api_base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    tools: Optional[list[dict]] = None,
 ) -> Iterable[str]:
     base_url = api_base_for(model)
     if api_base_url:
@@ -78,7 +83,7 @@ def stream_chat(
         headers["Authorization"] = f"Bearer {cfg.get('api_key')}"
     resp = requests.post(
         f"{base_url}/chat/completions",
-        json=build_payload(model, messages, stream=True),
+        json=build_payload(model, messages, stream=True, tools=tools),
         headers=headers,
         stream=True,
         timeout=timeout,

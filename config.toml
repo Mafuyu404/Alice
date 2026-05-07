@@ -482,3 +482,34 @@ search_threshold = 0.3
 # 召回的记忆会注入到对话上下文中，太多会让 LLM 分心。
 # 推荐范围: 3 ~ 12。
 search_top_k = 8
+
+# ===========================================================================
+# 工具调用 (Tool Calling / Function Calling)
+# ===========================================================================
+# 启用后，LLM 可以调用预定义的工具（如查看屏幕、搜索记忆等）。
+# 工具调用采用 OpenAI 兼容的 function calling 格式。
+# 关闭后使用旧版正则命令匹配（user_commands.py）。
+
+[tool_calling]
+# 总开关。设为 false 时使用旧版正则命令匹配。
+# 类型: bool (true/false)
+enabled = true
+
+# 启用的工具列表。
+# 类型: string 数组
+# 可选: "look_at_screen", "search_memory", "get_current_time", "get_current_app", "save_to_memory"
+tools = [
+  "look_at_screen",
+  "search_memory",
+  "get_current_time",
+  "get_current_app",
+  "save_to_memory",
+]
+
+# 单次对话中工具调用的最大循环次数（防止死循环）。
+# 类型: int。建议 3 ~ 8。
+max_iterations = 5
+
+# 单次工具调用超时（秒）。
+# 类型: float
+tool_timeout = 45.0

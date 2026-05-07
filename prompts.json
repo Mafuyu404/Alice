@@ -58,5 +58,13 @@
   },
   "vision": {
     "analyze_suffix": "\n\n===== 系统进程信息 =====\n{app_text}请结合上方截图和下方进程列表，综合分析当前桌面状态：截图里能看到什么、用户可能正在做什么、前后台有哪些应用在运行。"
+  },
+  "tool_calling": {
+    "system_suffix": "你拥有以下工具可以在需要时使用。工具调用对用户透明——直接基于工具返回的结果回复用户，不要解释你在使用工具。",
+    "look_at_screen_prefix": "屏幕识别结果：\n",
+    "search_memory_prefix": "记忆搜索结果：\n",
+    "search_memory_empty": "没有找到相关的过往记忆。",
+    "privacy_blocked": "当前窗口可能包含隐私内容，已跳过屏幕识别。",
+    "tool_error": "工具调用失败：{error}"
   }
 }
