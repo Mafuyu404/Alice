@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 from typing import Iterable, Optional
 
@@ -68,7 +69,7 @@ def stream_chat(
     base_url = api_base_for(model)
     if api_base_url:
         base_url = api_base_url.rstrip("/")
-        if not base_url.endswith("/v1"):
+        if not re.search(r'/v\d+$', base_url):
             base_url += "/v1"
     headers = api_headers(model)
     if api_key:

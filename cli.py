@@ -88,6 +88,7 @@ def chat_stream(
     model: str,
     tts_engine: object | None,
     cancel_event: threading.Event | None = None,
+    character_config: dict | None = None,
 ) -> tuple[str, bool]:
     """Stream LLM response. Returns (reply_text, was_cancelled)."""
     print(f"\n{char_name}: ", end="", flush=True)
@@ -97,7 +98,7 @@ def chat_stream(
     paren_filter = _ParenFilter()
     cancelled = False
 
-    char_cfg = session.character_config
+    char_cfg = character_config or {}
     _llm_api_base = char_cfg.get("llm_url") or None
     _llm_api_key = char_cfg.get("api_key") or None
 
@@ -312,7 +313,7 @@ def main() -> None:
             messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline)
 
             try:
-                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event)
+                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                 machine.emit_error("llm_connection")
@@ -528,7 +529,7 @@ def main() -> None:
                     f"desire={decision.desire:.1f} disturb={decision.disturbance:.1f}"
                 )
                 try:
-                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel)
+                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel, character_config=session.character_config)
                 except requests.exceptions.ConnectionError:
                     print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                     machine.emit_error("proactive_llm")

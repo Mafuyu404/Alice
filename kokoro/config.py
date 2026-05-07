@@ -141,6 +141,11 @@ def stt_skip_short_refine_max_chars() -> int:
     return int(get("stt_skip_short_refine_max_chars", 18))
 
 
+def portrait_model() -> str:
+    """Model for portrait expression selection. Empty = use conversation model."""
+    return get("portrait_model", "")
+
+
 def api_base() -> str:
     kb = kokoromo_url()
     mb = memory_backend()

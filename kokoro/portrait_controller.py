@@ -277,5 +277,6 @@ def create_controller(character_id: str, model: str) -> tuple[PortraitOverlayCli
     port = int(cfg.get("portrait_overlay_port", DEFAULT_PORT))
     client = PortraitOverlayClient(host=host, port=port, character_id=character_id)
     client.start()
-    worker = PortraitDecisionWorker(client=client, model=model, character_id=character_id)
+    portrait_model = cfg.portrait_model()
+    worker = PortraitDecisionWorker(client=client, model=portrait_model or model, character_id=character_id)
     return client, worker

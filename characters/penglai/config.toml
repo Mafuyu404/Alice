@@ -2,12 +2,11 @@
 # 此处设置会覆盖全局 config.toml 的同名配置。
 # 没有在此列出的配置项自动使用全局默认值。
 
-# 对话模型。模型名以 "deepseek" 开头时自动走 DeepSeek API。
-# llm_model = "deepseek-v4-flash"
+# 对话模型。使用智谱 CharGLM-4
+llm_model = "charglm-4"
 
-# LLM 服务地址（非 DeepSeek 模型时生效）。
-# 格式与全局 llm_url 一致，例如 http://127.0.0.1:11434。
-# llm_url = "http://127.0.0.1:11434"
+# LLM 服务地址
+llm_url = "https://open.bigmodel.cn/api/paas/v4"
 
-# API 密钥（使用非 DeepSeek 云端模型时需要）。
-# api_key = ""
+# API 密钥
+api_key = "0860b32a2ee146c385bca37e8638a613.rLeJMEJCYYVYOFFD"
