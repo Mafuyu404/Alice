@@ -62,11 +62,23 @@ def stream_chat(
     model: str,
     timeout: int = 120,
     cancel_event: Optional[threading.Event] = None,
+    api_base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Iterable[str]:
+    base_url = api_base_for(model)
+    if api_base_url:
+        base_url = api_base_url.rstrip("/")
+        if not base_url.endswith("/v1"):
+            base_url += "/v1"
+    headers = api_headers(model)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif not headers.get("Authorization") and cfg.get("api_key"):
+        headers["Authorization"] = f"Bearer {cfg.get('api_key')}"
     resp = requests.post(
-        f"{api_base_for(model)}/chat/completions",
+        f"{base_url}/chat/completions",
         json=build_payload(model, messages, stream=True),
-        headers=api_headers(model),
+        headers=headers,
         stream=True,
         timeout=timeout,
     )

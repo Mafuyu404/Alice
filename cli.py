@@ -97,7 +97,16 @@ def chat_stream(
     paren_filter = _ParenFilter()
     cancelled = False
 
-    for content in llm_client.stream_chat(messages, model, cancel_event=cancel_event):
+    char_cfg = session.character_config
+    _llm_api_base = char_cfg.get("llm_url") or None
+    _llm_api_key = char_cfg.get("api_key") or None
+
+    for content in llm_client.stream_chat(
+        messages, model,
+        cancel_event=cancel_event,
+        api_base_url=_llm_api_base,
+        api_key=_llm_api_key,
+    ):
         content = paren_filter.filter(content)
         if not content:
             continue
@@ -175,7 +184,7 @@ def main() -> None:
     session.summary_file = os.path.join(summary_dir, f"summary_{args.character}.json")
     session.load_summary()
 
-    model = args.model or cfg.llm_model()
+    model = args.model or session.character_config.get("llm_model") or cfg.llm_model()
     tts_engine = create_tts_engine(not args.no_tts, session.character_data.get("tts_voice_id"))
     portrait_client = None
     portrait_worker = None

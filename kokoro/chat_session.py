@@ -41,6 +41,12 @@ class ChatSession:
     def system_prompt(self) -> str:
         return character.build_system_prompt(self.character_data)
 
+    @property
+    def character_config(self) -> dict:
+        """Per-character config from characters/{id}/config.toml.
+        Re-reads from disk on every access for hot-reload during debugging."""
+        return character.load_config(self.character_id)
+
     def add_screen_context(self, content: str) -> None:
         self.screen_contexts.append(content)
         if len(self.screen_contexts) > self.max_screen_contexts:
@@ -75,21 +81,23 @@ class ChatSession:
         stt_refine_inline: bool = False,
     ) -> list[dict]:
         messages = [{"role": "system", "content": self.system_prompt}]
-        if extra_context:
-            messages.append({"role": "system", "content": extra_context})
+        # History first — stable prefix for API prompt caching
+        messages.extend(self.history)
+        # Everything below varies per turn but sits AFTER history,
+        # so the cache prefix (system prompt + history) stays intact.
+        with self._summarize_lock:
+            if self.summary:
+                messages.append({"role": "system", "content": f"【对话摘要】\n{self.summary}"})
         if include_screen and self.screen_contexts:
             screen_text = prompts.get("chat_session.screen_context_prefix", "")
             for i, ctx in enumerate(self.screen_contexts, 1):
                 screen_text += f"{i}. {ctx}\n"
             messages.append({"role": "system", "content": screen_text})
+        if extra_context:
+            messages.append({"role": "system", "content": extra_context})
         memory_ctx = self.memory_backend.get_context(user_text, user_id=self.character_id)
         if memory_ctx:
             messages.append({"role": "system", "content": memory_ctx})
-        # Inject conversation summary before recent history
-        with self._summarize_lock:
-            if self.summary:
-                messages.append({"role": "system", "content": f"【对话摘要】\n{self.summary}"})
-        messages.extend(self.history)
         if stt_refine_inline:
             inline_prompt = prompts.get("stt_refine_inline.system", "")
             if inline_prompt:

@@ -16,9 +16,6 @@ from typing import Any
 _ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_TOML_PATH = _ROOT / "config.toml"
 _CONFIG_JSON_PATH = _ROOT / "config.json"
-_CONFIG: dict | None = None
-
-
 def _clean_proxy() -> None:
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(key, None)
@@ -50,13 +47,10 @@ def _merge_fallback(primary: dict, fallback: dict) -> dict:
 
 
 def load() -> dict:
-    global _CONFIG
-    if _CONFIG is None:
-        _clean_proxy()
-        toml_config = _load_toml()
-        json_config = _load_json()
-        _CONFIG = _merge_fallback(toml_config, json_config)
-    return _CONFIG
+    _clean_proxy()
+    toml_config = _load_toml()
+    json_config = _load_json()
+    return _merge_fallback(toml_config, json_config)
 
 
 def get(key: str, default: Any = None) -> Any:
