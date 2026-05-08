@@ -59,6 +59,14 @@ python cli.py --list-devices
 
 ```
 
+### 记忆查看器
+
+```bash
+python memory_viewer.py
+```
+
+默认地址是 `http://127.0.0.1:17410/`，只读显示当前 mem0 记忆。
+
 ## 当前目录结构
 
 ```text

@@ -6,6 +6,7 @@ import datetime
 import logging
 import os
 import warnings
+from typing import Any
 
 from . import config as cfg_mod
 from . import prompts
@@ -26,6 +27,12 @@ class MemoryBackend:
         return ""
 
     def store(self, user_msg: str, assistant_msg: str, user_id: str = "default") -> None:
+        pass
+
+    def list_memories(self, user_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
+        return []
+
+    def close(self) -> None:
         pass
 
     @property
@@ -239,6 +246,43 @@ class Mem0Backend(MemoryBackend):
                 self._cleanup(user_id)
         except Exception as exc:
             logger.warning("mem0 store failed: %s", exc)
+
+    def list_memories(self, user_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
+        if not self._ok:
+            return []
+        try:
+            result = self._mem.get_all(filters={"user_id": user_id}, top_k=max(1, limit))
+            items = result.get("results") or []
+        except Exception as exc:
+            logger.warning("mem0 list failed: %s", exc)
+            return []
+
+        normalized: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                {
+                    "id": item.get("id", ""),
+                    "memory": item.get("memory", ""),
+                    "created_at": item.get("created_at", ""),
+                    "updated_at": item.get("updated_at", ""),
+                    "score": item.get("score"),
+                    "metadata": item.get("metadata") or {},
+                }
+            )
+        normalized.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return normalized
+
+    def close(self) -> None:
+        if self._mem is None:
+            return
+        try:
+            close = getattr(self._mem, "close", None)
+            if callable(close):
+                close()
+        except Exception as exc:
+            logger.debug("mem0 close failed: %s", exc)
 
     def _cleanup(self, user_id: str) -> None:
         limit = self._lc["max_memories_per_user"]
