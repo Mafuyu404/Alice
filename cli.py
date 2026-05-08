@@ -27,6 +27,7 @@ from kokoro import portrait_controller
 from kokoro import pool as pool_mod
 from kokoro import prompts
 from kokoro import proactive
+from kokoro import impulse as impulse_mod
 from kokoro import screen_interest
 from kokoro import state_machine as sm
 from kokoro import stt as stt_mod
@@ -74,6 +75,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no-tts", action="store_true", help="Disable speech output")
     parser.add_argument("--no-portrait", action="store_true", help="Disable portrait overlay")
     parser.add_argument("--no-proactive", action="store_true", help="Disable proactive speech scheduler")
+    parser.add_argument("--no-impulse", action="store_true", help="Disable impulse planner")
     parser.add_argument("--no-screen-watch", action="store_true", help="Disable proactive screen interest events")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
     return parser.parse_args()
@@ -236,10 +238,6 @@ def main() -> None:
     scheduler = proactive.from_config(CONFIG)
     if args.no_proactive:
         scheduler.config.enabled = False
-    if scheduler.config.enabled:
-        machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-    else:
-        machine.set_proactive_state(sm.ProactiveState.DISABLED)
 
     # ── tool calling ──────────────────────────────────────────────────────────
     _agent_config: agent_loop.AgentConfig | None = None
@@ -282,10 +280,39 @@ def main() -> None:
     # ── shared cancel token for barge-in ──────────────────────────────────────
     _current_cancel: list[threading.Event | None] = [None]
 
+    # ── impulse planner ─────────────────────────────────────────────────────
+    _stt_refine_mode = cfg.stt_refine_mode()
+    _stt_refine_inline = _stt_refine_mode == "inline"
+    _use_impulse = cfg.impulse_enabled() and not args.no_impulse
+    if _use_impulse:
+        scheduler.config.enabled = False
+        machine.set_proactive_state(sm.ProactiveState.DISABLED)
+        _impulse = impulse_mod.ImpulsePlanner(
+            config=CONFIG,
+            session=session,
+            model=model,
+            tts_engine=tts_engine,
+            portrait_worker=portrait_worker,
+            machine=machine,
+            agent_config=_agent_config,
+            cancel_slot=_current_cancel,
+            memory_backend=memory_backend,
+            chat_stream_fn=chat_stream,
+            stt_refine_inline=_stt_refine_inline,
+        )
+    else:
+        _impulse = None
+        if scheduler.config.enabled:
+            machine.set_proactive_state(sm.ProactiveState.ACCRUING)
+        else:
+            machine.set_proactive_state(sm.ProactiveState.DISABLED)
+
     # ── conversation handler (called by pool when STT text is ready) ───────
     def on_refined(text: str) -> None:
         scheduler.record_user_activity()
         scheduler.reset_all()
+        if _impulse is not None:
+            _impulse.reset()
         display_user(text)
 
         # Emit state transition: LISTENING → THINKING
@@ -372,7 +399,7 @@ def main() -> None:
                             print(f"\n  [screen] command {label}: {result.user_visible_note}")
                             command_context = result.context or result.user_visible_note
 
-            messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline, inject_memory=not _tool_enabled)
+            messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=_stt_refine_inline, inject_memory=not _tool_enabled)
 
             try:
                 reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
@@ -416,6 +443,10 @@ def main() -> None:
             machine.emit(sm.SystemEvent.TTS_DONE)
             machine.reset_error_count()
 
+            # Trigger impulse planning after conversation ends
+            if _impulse is not None:
+                _impulse.on_conversation_end()
+
         except Exception as exc:
             print(f"\n[error] on_refined: {type(exc).__name__}: {exc}")
             traceback.print_exc()
@@ -425,14 +456,12 @@ def main() -> None:
 
     # ── STT pool ───────────────────────────────────────────────────────────
     refine_url, refine_model, refine_key = refine_endpoint()
-    stt_refine_mode = cfg.stt_refine_mode()
-    stt_refine_inline = stt_refine_mode == "inline"
     pool = pool_mod.ConversationPool(
         llm_url=refine_url,
         llm_model=refine_model,
         on_refined=on_refined,
         api_key=refine_key,
-        mode=stt_refine_mode,
+        mode=_stt_refine_mode,
     )
 
     device = args.device if args.device is not None else stt_mod.find_input_device()
@@ -459,6 +488,7 @@ def main() -> None:
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
     print(f"  Proactive: {scheduler.config.enabled}")
+    print(f"  Impulse: {_use_impulse}")
     print(f"  Tool calling: {_tool_enabled}")
     print(f"  Screen watch: {screen_watch_enabled}")
     print(f"  Memory events: {memory_detector.config.enabled}")
@@ -644,8 +674,9 @@ def main() -> None:
             finally:
                 _current_cancel[0] = None
 
-    proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
-    proactive_thread.start()
+    if not _use_impulse:
+        proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
+        proactive_thread.start()
 
     # ── screen watch worker ────────────────────────────────────────────────
     def screen_watch_worker() -> None:

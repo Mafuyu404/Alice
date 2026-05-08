@@ -192,3 +192,12 @@ def tool_timeout() -> float:
     if not isinstance(section, dict):
         return 45.0
     return float(section.get("tool_timeout", 45.0))
+
+
+# ── impulse ──────────────────────────────────────────────────────────────────
+
+def impulse_enabled() -> bool:
+    section = get("impulse", {})
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
