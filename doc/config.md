@@ -147,15 +147,15 @@ mem0 子配置：
 
 ### 主动搭话调度器
 
-全局 `[proactive]` + 四类行为子配置：`[proactive.idle]` `[proactive.recent]` `[proactive.mem]` `[proactive.screen]`
+全局 `[impulse]` + 四类行为子配置：`[impulse.idle]` `[impulse.recent]` `[impulse.mem]` `[impulse.screen]`
 
-详见 [proactive.md](proactive.md)。
+详见 [impulse.md](impulse.md)。
 
 ### 屏幕监控 + 记忆事件
 
 `[screen_watch]` 控制周期性截图分析的参数（`watch_interval` `interest_threshold` `vision_timeout`）。
 
-记忆事件配置位于 `[proactive]` 下：`memory_events_enabled` `memory_check_interval` `memory_cooldown_seconds` `memory_date_score` `memory_lookup_score` `memory_lookup_query` `[[proactive.memory_date_events]]`。
+记忆事件配置位于 `[impulse]` 下：`memory_events_enabled` `memory_check_interval` `memory_cooldown_seconds` `memory_date_score` `memory_lookup_score` `memory_lookup_query` `[[impulse.memory_date_events]]`。
 
 详见 [screen_interest.md](screen_interest.md) 和 [memory.md](memory.md)。
 

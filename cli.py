@@ -15,6 +15,7 @@ import sys
 import time
 import traceback
 import threading
+from datetime import datetime
 
 import requests
 
@@ -25,8 +26,6 @@ from kokoro import memory_events
 from kokoro import memory as mem_mod
 from kokoro import portrait_controller
 from kokoro import pool as pool_mod
-from kokoro import prompts
-from kokoro import proactive
 from kokoro import impulse as impulse_mod
 from kokoro import screen_interest
 from kokoro import state_machine as sm
@@ -38,7 +37,7 @@ from kokoro import token_usage
 from kokoro import tool_registry as tool_registry_mod
 
 
-_PAREN_STRIP_RE = re.compile(r"\s*[（(][^）)]*[）)]\s*")
+_PAREN_STRIP_RE = re.compile(r"\s*[\uff08(][^\uff09)]*[\uff09)]\s*")
 
 def _strip_parens(text: str) -> str:
     return _PAREN_STRIP_RE.sub("", text).strip()
@@ -53,9 +52,9 @@ class _ParenFilter:
     def filter(self, text: str) -> str:
         result: list[str] = []
         for ch in text:
-            if ch in "（(":
+            if ch in "\uff08(":
                 self._depth += 1
-            elif ch in "）)":
+            elif ch in "\uff09)":
                 if self._depth > 0:
                     self._depth -= 1
             elif self._depth == 0:
@@ -66,6 +65,41 @@ class _ParenFilter:
 CONFIG = cfg.load()
 
 
+class _TeeStream:
+    def __init__(self, console, logfile):
+        self._console = console
+        self._logfile = logfile
+        self.encoding = getattr(console, "encoding", "utf-8")
+        self.errors = getattr(console, "errors", "replace")
+
+    def write(self, text: str) -> int:
+        self._console.write(text)
+        self._logfile.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self._console.flush()
+        self._logfile.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._console, "isatty", lambda: False)())
+
+
+def _install_cli_log() -> object:
+    root = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(root, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(log_dir, f"cli-{stamp}.log")
+    logfile = open(path, "a", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = _TeeStream(original_stdout, logfile)
+    sys.stderr = _TeeStream(original_stderr, logfile)
+    print(f"[cli] Log file: {path}")
+    return logfile, original_stdout, original_stderr
+
+
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="KokoroMemo voice CLI")
     parser.add_argument("--character", "-c", default="alice", help="Character id (default: alice)")
@@ -74,9 +108,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--model", default=None, help="Chat model")
     parser.add_argument("--no-tts", action="store_true", help="Disable speech output")
     parser.add_argument("--no-portrait", action="store_true", help="Disable portrait overlay")
-    parser.add_argument("--no-proactive", action="store_true", help="Disable proactive speech scheduler")
     parser.add_argument("--no-impulse", action="store_true", help="Disable impulse planner")
-    parser.add_argument("--no-screen-watch", action="store_true", help="Disable proactive screen interest events")
+    parser.add_argument("--no-screen-watch", action="store_true", help="Disable screen context watcher")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
     return parser.parse_args()
 
@@ -235,9 +268,6 @@ def main() -> None:
         except Exception as exc:
             print(f"  [cli] Portrait overlay init failed: {exc}")
 
-    scheduler = proactive.from_config(CONFIG)
-    if args.no_proactive:
-        scheduler.config.enabled = False
 
     # ── tool calling ──────────────────────────────────────────────────────────
     _agent_config: agent_loop.AgentConfig | None = None
@@ -263,14 +293,11 @@ def main() -> None:
             _tool_enabled = False
             print("  [tool] No tools enabled (check config or model compatibility)")
 
-    proactive_config = CONFIG.get("proactive", {})
-    if not isinstance(proactive_config, dict):
-        proactive_config = {}
     screen_cfg = CONFIG.get("screen_watch", {})
     if not isinstance(screen_cfg, dict):
         screen_cfg = {}
     screen_watch_enabled = bool(screen_cfg.get("enabled", False))
-    if args.no_screen_watch or not scheduler.config.enabled:
+    if args.no_screen_watch:
         screen_watch_enabled = False
     screen_watch_interval = max(10.0, float(screen_cfg.get("watch_interval", 45.0)))
     screen_interest_threshold = max(0.0, float(screen_cfg.get("interest_threshold", 70.0)))
@@ -285,8 +312,7 @@ def main() -> None:
     _stt_refine_inline = _stt_refine_mode == "inline"
     _use_impulse = cfg.impulse_enabled() and not args.no_impulse
     if _use_impulse:
-        scheduler.config.enabled = False
-        machine.set_proactive_state(sm.ProactiveState.DISABLED)
+        machine.set_proactive_state(sm.ProactiveState.ACCRUING)
         _impulse = impulse_mod.ImpulsePlanner(
             config=CONFIG,
             session=session,
@@ -302,15 +328,9 @@ def main() -> None:
         )
     else:
         _impulse = None
-        if scheduler.config.enabled:
-            machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-        else:
-            machine.set_proactive_state(sm.ProactiveState.DISABLED)
-
+        machine.set_proactive_state(sm.ProactiveState.DISABLED)
     # ── conversation handler (called by pool when STT text is ready) ───────
     def on_refined(text: str) -> None:
-        scheduler.record_user_activity()
-        scheduler.reset_all()
         if _impulse is not None:
             _impulse.reset()
         display_user(text)
@@ -390,8 +410,6 @@ def main() -> None:
                     else:
                         command_context = result.context
                         if result.ok and result.screen_context:
-                            scheduler.desires[proactive.Behavior.SCREEN] = 0.0
-                            scheduler.screen_context = ""
                             session.add_screen_context(result.screen_context)
                             print(f"\n  [screen] command interest={result.score:.1f} {result.screen_context.split(chr(10))[0]}")
                         elif result.user_visible_note:
@@ -425,7 +443,6 @@ def main() -> None:
                 machine.set_tts_state(sm.TTSState.STREAMING)
 
             session.remember(text, reply, async_store=True)
-            scheduler.record_conversation_end(text, reply)
             if portrait_worker:
                 portrait_worker.submit(text, reply)
 
@@ -435,7 +452,6 @@ def main() -> None:
                 if cancel_event.is_set():
                     _current_cancel[0] = None
                     return
-                scheduler.record_tts_end()
                 tts_engine.prepare()
 
             # TTS done → back to IDLE
@@ -487,7 +503,6 @@ def main() -> None:
     print(f"  Microphone: [{device}]")
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
-    print(f"  Proactive: {scheduler.config.enabled}")
     print(f"  Impulse: {_use_impulse}")
     print(f"  Tool calling: {_tool_enabled}")
     print(f"  Screen watch: {screen_watch_enabled}")
@@ -578,107 +593,6 @@ def main() -> None:
 
     stt_thread = threading.Thread(target=stt_worker, daemon=True)
     stt_thread.start()
-
-    # ── proactive worker ───────────────────────────────────────────────────
-    def send_snapshot() -> None:
-        if portrait_client:
-            portrait_client.send_debug(scheduler.snapshot())
-
-    def proactive_worker() -> None:
-        while not machine.is_shutting_down:
-            time.sleep(scheduler.config.tick_seconds)
-            send_snapshot()
-            if not scheduler.config.enabled:
-                continue
-
-            busy = machine.is_busy
-            decision = scheduler.tick(busy=busy)
-            if decision is None:
-                continue
-
-            # Only fire if state machine allows (atomic claim)
-            if not machine.emit(sm.SystemEvent.PROACTIVE_TRIGGERED):
-                # Lost the race — desire already consumed by tick(), will re-accrue
-                continue
-
-            machine.set_proactive_state(sm.ProactiveState.EXECUTING)
-            proactive_cancel = threading.Event()
-            _current_cancel[0] = proactive_cancel
-            try:
-                messages = session.build_messages(decision.prompt, inject_memory=not _tool_enabled)
-                guidance = session.character_data.get("proactive_guidance", "")
-                sys_content = prompts.get("proactive.trigger_system", "")
-                if guidance:
-                    sys_content += prompts.format_prompt("proactive.trigger_guidance_label", guidance=guidance)
-                messages.insert(
-                    1,
-                    {
-                        "role": "system",
-                        "content": sys_content,
-                    }
-                )
-                print(
-                    f"\n  [proactive] {decision.behavior.value} "
-                    f"desire={decision.desire:.1f} disturb={decision.disturbance:.1f}"
-                )
-                try:
-                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "proactive"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
-                except requests.exceptions.ConnectionError:
-                    print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
-                    machine.emit_error("proactive_llm")
-                    machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-                    continue
-                except Exception as exc:
-                    print(f"\n[proactive error] {type(exc).__name__}: {exc}")
-                    machine.emit_error("proactive_stream")
-                    machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-                    continue
-
-                if cancelled:
-                    _current_cancel[0] = None
-                    machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-                    continue
-
-                if reply:
-                    session.history.append({"role": "assistant", "content": reply})
-                    if len(session.history) > session.max_history * 2:
-                        session.history[:] = session.history[-session.max_history * 2 :]
-                    if portrait_worker:
-                        portrait_worker.submit("", reply)
-
-                # LLM done → SPEAKING
-                machine.emit(sm.SystemEvent.LLM_DONE)
-                if tts_engine:
-                    machine.set_tts_state(sm.TTSState.STREAMING)
-
-                if tts_engine:
-                    while tts_engine.is_playing and not proactive_cancel.is_set():
-                        time.sleep(0.1)
-                    if proactive_cancel.is_set():
-                        _current_cancel[0] = None
-                        machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-                        continue
-                    scheduler.record_tts_end()
-                    tts_engine.prepare()
-
-                machine.set_tts_state(sm.TTSState.IDLE)
-                machine.emit(sm.SystemEvent.TTS_DONE)
-                machine.reset_error_count()
-                machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-
-            except Exception as exc:
-                print(f"\n[proactive error] {type(exc).__name__}: {exc}")
-                traceback.print_exc()
-                machine.emit_error("proactive")
-                machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-            finally:
-                _current_cancel[0] = None
-
-    if not _use_impulse:
-        proactive_thread = threading.Thread(target=proactive_worker, daemon=True)
-        proactive_thread.start()
-
-    # ── screen watch worker ────────────────────────────────────────────────
     def screen_watch_worker() -> None:
         while not machine.is_shutting_down:
             time.sleep(screen_watch_interval)
@@ -697,12 +611,8 @@ def main() -> None:
             if machine.is_busy or not machine.can_start_conversation:
                 continue
 
-            if result.private:
-                scheduler.quiet_until = max(scheduler.quiet_until, time.monotonic() + screen_watch_interval)
-                continue
             if result.score >= screen_interest_threshold:
                 context = result.content or result.reason
-                scheduler.add_screen_interest(result.score, context)
                 session.add_screen_context(context)
                 print(f"\n  [screen] interest={result.score:.1f} {context.split(chr(10))[0]}")
 
@@ -713,12 +623,12 @@ def main() -> None:
     def memory_event_worker() -> None:
         while not machine.is_shutting_down:
             time.sleep(memory_detector.config.check_interval)
-            if not scheduler.config.enabled or not memory_detector.config.enabled:
+            if not memory_detector.config.enabled:
                 continue
             if machine.is_busy:
                 continue
             for event in memory_detector.poll():
-                scheduler.add_memory_interest(event.score, event.context)
+                session.add_screen_context(event.context)
                 memory_detector.mark_emitted(event)
                 print(f"\n  [memory] {event.source} interest={event.score:.1f}")
 
@@ -762,6 +672,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    _cli_log, _stdout, _stderr = _install_cli_log()
     try:
         main()
     except KeyboardInterrupt:
@@ -771,3 +682,6 @@ if __name__ == "__main__":
         traceback.print_exc()
     finally:
         time.sleep(0.3)
+        sys.stdout = _stdout
+        sys.stderr = _stderr
+        _cli_log.close()

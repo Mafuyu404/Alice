@@ -17,7 +17,7 @@ Alice Chat 由一组松耦合模块组成：输入层负责语音或文字，调
 5. `kokoro.llm_client` 调用 OpenAI 兼容聊天接口并解析流式输出。
 6. `kokoro.tts` 按 `tts_backend` 调度 MiniMax 或 Cartesia。
 7. `kokoro.portrait_controller` 根据本轮对话从角色立绘目录中选择差分。
-8. `kokoro.proactive` 在空闲时根据冲动值触发主动搭话。
+8. `kokoro.impulse` 在空闲时根据冲动值触发主动搭话。
 9. `kokoro.screen_interest` 周期性分析屏幕，必要时生成主动上下文。
 10. `kokoro.state_machine` 统一管理 listening、thinking、speaking、portrait 等状态。
 
@@ -30,7 +30,7 @@ python cli.py --model deepseek-v4-flash
 python cli.py --device 1
 python cli.py --no-tts
 python cli.py --no-portrait
-python cli.py --no-proactive
+python cli.py --no-impulse
 python cli.py --no-screen-watch
 python cli.py --list-devices
 ```
@@ -103,7 +103,7 @@ characters/
 | STT Pool | `kokoro/pool.py` | 文本片段聚合和精炼 |
 | TTS | `kokoro/tts.py` | 动态选择 TTS 后端 |
 | 记忆 | `kokoro/memory.py` | mem0、KokoroMemo 或 none |
-| 主动搭话 | `kokoro/proactive.py` | 空闲触发、记忆触发、屏幕触发 |
+| 主动搭话 | `kokoro/impulse.py` | 空闲触发、记忆触发、屏幕触发 |
 | 屏幕感知 | `kokoro/screen_interest.py` | 截图分析、隐私过滤、兴趣评分 |
 | 视觉 | `kokoro/vision.py` | 截图、窗口枚举、多模态接口 |
 | 立绘控制 | `kokoro/portrait_controller.py` | 启动 overlay、选择立绘 |

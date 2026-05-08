@@ -5,12 +5,20 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import warnings
 
 from . import config as cfg_mod
 from . import prompts
 from . import token_usage
 
 logger = logging.getLogger("memory")
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Payload indexes have no effect in the local Qdrant\..*",
+    category=UserWarning,
+    module=r"mem0\.vector_stores\.qdrant",
+)
 
 
 class MemoryBackend:

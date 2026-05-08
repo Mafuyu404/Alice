@@ -66,14 +66,14 @@ content = prompts.format_prompt("section.key", var1=value1, var2=value2)
 
 | 键 | 用途 |
 |------|------|
-| `proactive.idle` | IDLE 主动搭话的角色提示 |
-| `proactive.recent` | RECENT 主动搭话的角色提示 |
-| `proactive.mem` | MEM 主动搭话的角色提示 |
-| `proactive.screen` | SCREEN 主动搭话的角色提示 |
-| `proactive.screen_context_label` | SCREEN 上下文标签。参数：`{context}` |
-| `proactive.mem_context_label` | MEM 上下文标签。参数：`{context}` |
-| `proactive.trigger_system` | 主动搭话触发时的 system 提示词后缀 |
-| `proactive.trigger_guidance_label` | 角色特定指导标签。参数：`{guidance}` |
+| `impulse.idle` | IDLE 主动搭话的角色提示 |
+| `impulse.recent` | RECENT 主动搭话的角色提示 |
+| `impulse.mem` | MEM 主动搭话的角色提示 |
+| `impulse.screen` | SCREEN 主动搭话的角色提示 |
+| `impulse.screen_context_label` | SCREEN 上下文标签。参数：`{context}` |
+| `impulse.mem_context_label` | MEM 上下文标签。参数：`{context}` |
+| `impulse.trigger_system` | 主动搭话触发时的 system 提示词后缀 |
+| `impulse.trigger_guidance_label` | 角色特定指导标签。参数：`{guidance}` |
 
 ### 屏幕兴趣
 
@@ -136,9 +136,9 @@ user: 当前输入（经 local_clean_stt 清洗）
 ### 主动搭话
 ```
 system: character_system.template + expression_calibration
-system: proactive.trigger_system + proactive.trigger_guidance_label
-system: proactive.{behavior}
-system: proactive.{screen/mem}_context_label（含 context）
+system: impulse.trigger_system + impulse.trigger_guidance_label
+system: impulse.{behavior}
+system: impulse.{screen/mem}_context_label（含 context）
 system: 最近屏幕观察记录
 system: 记忆上下文
 history...

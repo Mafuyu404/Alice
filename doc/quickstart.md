@@ -101,7 +101,7 @@ python cli.py
 | `--list-devices` | 列出可用麦克风设备 |
 | `--no-tts` | 禁用语音输出 |
 | `--no-portrait` | 禁用立绘覆盖层 |
-| `--no-proactive` | 禁用主动搭话 |
+| `--no-impulse` | 禁用主动搭话 |
 | `--no-screen-watch` | 禁用屏幕感知 |
 
 示例：

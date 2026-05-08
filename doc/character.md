@@ -37,7 +37,7 @@ characters/penglai/portrait/penglai_seated_hands_lap_quiet_neutral_p01.png
   "relationship": "和玩家是熟人。",
   "greeting": "你在干什么？",
   "example_dialogue": "玩家：你好。\n蓬莱：现在才想起来打招呼？",
-  "proactive_guidance": "主动搭话时保持简短。",
+  "impulse guidance": "主动搭话时保持简短。",
   "tts_voice_id": "English_PlayfulGirl"
 }
 ```
@@ -53,7 +53,7 @@ characters/penglai/portrait/penglai_seated_hands_lap_quiet_neutral_p01.png
 | `relationship` | 与用户的关系 | 否 |
 | `greeting` | CLI 启动后显示的问候语 | 否 |
 | `example_dialogue` | 对话示例，帮助 LLM 校准语气 | 否 |
-| `proactive_guidance` | 主动搭话额外约束 | 否 |
+| `impulse guidance` | 主动搭话额外约束 | 否 |
 | `tts_voice_id` | 当前角色的 TTS 声线覆盖 | 否 |
 | `system_prompt_template` | 覆盖全局角色 system prompt 模板 | 否 |
 | `expression_calibration` | 覆盖全局表达校准规则 | 否 |

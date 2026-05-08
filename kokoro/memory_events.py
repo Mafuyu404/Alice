@@ -1,4 +1,4 @@
-"""Memory/date event detector for proactive MEM desire."""
+"""Memory/date event detector for impulse planning context."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ class MemoryEventDetector:
 
 
 def from_config(config: dict, memory_backend: object, user_id: str) -> MemoryEventDetector:
-    section = config.get("proactive", {})
+    section = config.get("impulse", {})
     if not isinstance(section, dict):
         section = {}
 

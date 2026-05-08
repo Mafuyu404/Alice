@@ -2,7 +2,7 @@
 
 ## 概述
 
-`kokoro/screen_interest.py` 周期性分析屏幕截图，判断内容是否"有趣"，输出给 proactive 调度器的 SCREEN 行为，同时也通过 `session.add_screen_context()` 注入对话历史。
+`kokoro/screen_interest.py` 周期性分析屏幕截图，判断内容是否"有趣"，输出给 impulse 规划器的 SCREEN 行为，同时也通过 `session.add_screen_context()` 注入对话历史。
 
 ## 数据流
 
@@ -115,7 +115,7 @@ interest_threshold = 70.0      # 兴趣度阈值（0-100）
 vision_timeout = 45            # 视觉 API 超时（秒），最小 5
 ```
 
-记忆事件配置已移至 `[proactive]` 节下，详见 [memory.md](memory.md)。
+记忆事件配置已移至 `[impulse]` 节下，详见 [memory.md](memory.md)。
 
 ## 禁用
 

@@ -53,7 +53,7 @@ python cli.py --character penglai
 python cli.py --model qwen2.5:7b
 python cli.py --no-tts
 python cli.py --no-portrait
-python cli.py --no-proactive
+python cli.py --no-impulse
 python cli.py --no-screen-watch
 python cli.py --list-devices
 
@@ -127,7 +127,7 @@ characters/{character_id}/portrait/*.png
 | [stt.md](doc/stt.md) | 语音识别 |
 | [tts.md](doc/tts.md) | 语音合成 |
 | [memory.md](doc/memory.md) | 长期记忆 |
-| [proactive.md](doc/proactive.md) | 主动搭话 |
+| [impulse.md](doc/impulse.md) | 主动搭话 |
 | [screen_interest.md](doc/screen_interest.md) | 屏幕感知 |
 
 ## 注意事项

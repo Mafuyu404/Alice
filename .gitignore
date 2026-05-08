@@ -20,6 +20,7 @@ config.json
 # Generated data
 mem0_data/
 data/
+logs/
 stt_error.log
 models/
 portrait_overlay_state.json

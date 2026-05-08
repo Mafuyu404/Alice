@@ -1,4 +1,4 @@
-# Alice Chat 框架配置文件
+﻿# Alice Chat 框架配置文件
 # 真实的 API 密钥不要提交到 git。空密钥会禁用对应的云功能。
 #
 # 本文件所有可配置项均已列出。注释中标注了类型、取值范围、效果说明。
@@ -244,124 +244,6 @@ vision_api_key = ""
 # 默认 921600 = 1280×720。减小可节省带宽和 visual token，增大可提升识别精细度。
 vision_max_pixels = 921600
 
-# ===========================================================================
-# 主动语音调度器
-# ===========================================================================
-# 调度器通过冲动值积累机制让角色在空闲时主动说话。
-# 基于四种行为（IDLE/RECENT/MEM/SCREEN）各自的冲动值、用户沉默时长、
-# 最近对话、记忆事件、屏幕内容等因素综合决策。
-#
-# 冲动值概念：每种行为有独立冲动值（0 ~ 100+），
-#   达到 active_threshold 后才可能触发，触发后归零重新积累。
-# 干扰值概念：用户活跃度越高干扰值越大，超过 max_disturbance 的行为被过滤。
-# 多样性窗口：同一类行为触发后需等待 diversity_window_seconds 后才能再次触发。
-
-[proactive]
-# 所有主动行为的总开关。
-# 类型: bool (true/false)
-# 设为 false 完全禁用主动搭话。也可通过 --no-proactive 启动参数临时禁用。
-enabled = true
-
-# 调度器 tick 间隔（秒）。
-# 类型: float
-# 主循环每 tick_seconds 秒检查一次是否需要触发主动搭话。
-# 越小响应越快，但 CPU 开销略高。推荐 2.0 ~ 5.0。
-tick_seconds = 3.0
-
-# 所有冲动值累积/衰减速率的全局倍率。
-# 类型: float
-# 1.0 = 正常速率，4.0 = 所有速率乘以 4（主动频率翻倍）。
-# 仅调整此值可整体控制主动发言的积极程度，无需逐项调整各行为的 rate。
-drive_rate = 4.0
-
-# 多样性窗口（秒）。
-# 类型: float
-# 在此时间内不会重复触发同一类行为。
-# 例如 SCREEN 触发后 60 秒内不会再触发 SCREEN。
-# 推荐范围: 30 ~ 120。
-diversity_window_seconds = 60.0
-
-# 备选行为挑选概率。
-# 类型: float (0.0 ~ 1.0)
-# 当冲动值最高的行为被多样性窗口过滤后，有 secondary_pick_chance 的概率
-# 选择第二高的行为，否则本轮不触发任何行为。
-# 0.0 = 从不选第二候选人，1.0 = 只要最高被过滤就一定选第二。
-secondary_pick_chance = 0.2
-
-# ── IDLE（空闲搭话） ──
-# 用户长时间不说话时触发。被同类对话类的 AI 替代后默认关闭。
-[proactive.idle]
-# 该行为的总开关。
-enabled = false
-# IDLE 冲动值的每秒增长量（原始值，最终乘以 drive_rate）。
-# 类型: float。越大空闲时越想搭话。
-rate = 0.08
-# 触发该行为所需的最小冲动值。
-# 类型: float。推荐 50 ~ 80。
-active_threshold = 60.0
-# 行为触发后的冷却时间（秒）。冷却期间行为不参与选择。
-cooldown_seconds = 30.0
-# 因 TTS/STT 繁忙而被延期后扣除的冲动值。
-# 类型: float。扣减后延迟下轮触发，避免立即重试。
-defer_penalty = 20.0
-# 该行为能承受的最大干扰值。
-# 类型: float。用户越活跃干扰越大，超过此值的行为被过滤。
-# 小值：只在用户完全安静时才触发。大值：用户有事做时也可能触发。
-max_disturbance = 35.0
-# 权重倍率。
-# 类型: float。最终冲动值 = (积累值 + 注入值) * weight / sum(all_weights)
-weight = 1.0
-# 用户连续空闲多少秒后开始给予 IDLE 额外增速。
-# 类型: float。越长给 IDLE 增加速率的门槛越高。
-user_idle_bonus_after_seconds = 120.0
-
-# ── RECENT（对话余韵） ──
-# 对话刚结束后，趁热再补一句自然的延续。
-[proactive.recent]
-enabled = true
-# RECENT 冲动值的每秒衰减速度（原始值，最终乘以 drive_rate）。
-# 类型: float。越大衰减越快，错过时机就不会触发了。
-decay_rate = 2.0
-# 对话结束后多少秒 RECENT 冲动值才开始衰减。
-# 类型: float。此时间内保持峰值，给对话留余温时间。
-decay_delay_seconds = 30.0
-# 触发阈值。
-active_threshold = 70.0
-cooldown_seconds = 30.0
-defer_penalty = 20.0
-max_disturbance = 45.0
-weight = 1.0
-# 对话结束后多少秒内，IDLE 行为获得额外增速（RECENT 热度的余波）。
-bonus_window_seconds = 120.0
-
-# ── MEM（记忆事件搭话） ──
-# 基于长期记忆中的内容（纪念日、过往对话、定期查询结果）触发搭话。
-[proactive.mem]
-enabled = true
-# MEM 冲动值（由 memory_events 事件注入）的每秒增长量。
-rate = 0.1
-active_threshold = 70.0
-cooldown_seconds = 30.0
-defer_penalty = 20.0
-# 记忆事件对干扰敏感，用户正忙时不要提记忆话题。
-max_disturbance = 25.0
-weight = 1.0
-
-# ── SCREEN（屏幕搭话） ──
-# 屏幕监控发现有趣内容时，对用户当前操作进行评论/提问。
-[proactive.screen]
-enabled = true
-# SCREEN 冲动值的每秒衰减速度（原始值，最终乘以 drive_rate）。
-# 屏幕兴趣是瞬时的，衰减越快，错过窗口就不评论了。
-decay_rate = 5.0
-active_threshold = 70.0
-cooldown_seconds = 30.0
-defer_penalty = 20.0
-# 屏幕搭话可以容忍较高的干扰值——用户在操作屏幕本身就是一种背景。
-max_disturbance = 50.0
-weight = 1.0
-# 对话结束后扣除的 SCREEN 冲动值，避免正常对话过程中突然插话评论屏幕。
-post_conversation_decay = 30.0
 
 # ===========================================================================
 # 屏幕监控 — 周期性截图 + 视觉分析
@@ -371,7 +253,7 @@ post_conversation_decay = 30.0
 
 [screen_watch]
 # 是否开启周期性屏幕截图分析。
-enabled = true
+enabled = false
 
 # 截图/分析周期（秒）。
 # 类型: float
@@ -395,16 +277,6 @@ interest_threshold = 70.0
 # DashScope 云端通常 10~30 秒，Ollama 本地可能更长。
 vision_timeout = 45
 
-# 是否开启周期性记忆事件轮询。
-# 类型: bool
-# 独立于屏幕监控，另外开一个线程轮询记忆事件（纪念日匹配、定期记忆查询）。
-memory_events_enabled = true
-
-# 记忆事件轮询间隔（秒）。
-# 类型: float
-# 每 memory_check_interval 秒检查一次是否有记忆事件触发。
-# 推荐范围: 120 ~ 600（2 分钟 ~ 10 分钟）。
-memory_check_interval = 300.0
 
 # ===========================================================================
 # 主动语音调度器 v2 — LLM 规划式
@@ -415,7 +287,7 @@ memory_check_interval = 300.0
 # 用户一旦开口说话，所有待执行计划项自动作废。
 
 [impulse]
-# 是否启用 impulse 规划式主动搭话（与旧 [proactive] 互斥，impulse 优先）。
+# 是否启用 impulse 规划式主动搭话。
 # 类型: bool (true/false)
 enabled = true
 
@@ -434,22 +306,27 @@ min_plans = 1
 # 规划用模型名。留空则使用默认对话模型。
 # 类型: string
 # 规划不需要很强的模型，可以用小模型节省开销。
-planning_model = ""
+planning_model = "deepseek-v4-flash"
 
 # 规划时的屏幕分析超时（秒）。
 # 类型: int
 # 推荐 30 ~ 60。
 screen_timeout = 45
 
+# 计划表为空时，等待多少秒后重新读取屏幕并再次规划。
+# 类型: float
+# 设得太低会增加视觉和规划模型调用频率。推荐 30 ~ 120。
+empty_plan_retry_seconds = 30.0
+
 # 最大连续主动搭话次数。
 # 类型: int
 # 一次对话结束后，连续主动搭话的最大次数。超过后自动停止，等用户回应。
 # 防止 LLM 无限循环自言自语。推荐 2 ~ 5。
-max_consecutive_proactive = 3
+max_consecutive_impulse = 3
 
 # 是否在控制台输出计划表内容（调试用）。
 # 类型: bool
-log_plan_table = false
+log_plan_table = true
 
 # 同一记忆事件的冷却时间（秒）。
 # 类型: float
@@ -472,13 +349,23 @@ memory_lookup_score = 70.0
 # 预设查询会传入记忆后端进行语义搜索。
 # 可修改为关注特定类型记忆，如 "user's hobbies, recent plans"
 memory_lookup_query = "recent important user preferences, plans, dates, anniversaries, goals"
+# 是否开启周期性记忆事件轮询。
+# 类型: bool
+# 独立于屏幕监控，另外开一个线程轮询记忆事件（纪念日匹配、定期记忆查询）。
+memory_events_enabled = true
+
+# 记忆事件轮询间隔（秒）。
+# 类型: float
+# 每 memory_check_interval 秒检查一次是否有记忆事件触发。
+# 推荐范围: 120 ~ 600（2 分钟 ~ 10 分钟）。
+memory_check_interval = 300.0
 
 # 预约日期记忆事件示例（可按需添加更多）：
 # 每个事件是一个 TOML 数组元素，结构固定：
 #   date  - 月-日格式，每年匹配
 #   label - 事件名称（显示和去重用）
 #   note  - 给 LLM 的提醒（如何/何时提起）
-# [[proactive.memory_date_events]]
+# [[impulse.memory_date_events]]
 # date = "05-04"
 # label = "Alice project anniversary"
 # note = "Mention it only if the user seems idle and the mood is relaxed."

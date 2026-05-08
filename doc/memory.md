@@ -52,16 +52,16 @@ class MemoryBackend:
 `kokoro/memory_events.py` 中的 `MemoryEventDetector` 周期性触发两种事件：
 
 ### 日期匹配
-在 `config.toml` 的 `[[proactive.memory_date_events]]` 中预定义日期事件：
+在 `config.toml` 的 `[[impulse.memory_date_events]]` 中预定义日期事件：
 
 ```toml
-[[proactive.memory_date_events]]
+[[impulse.memory_date_events]]
 date = "05-04"
 label = "Alice project anniversary"
 note = "Mention it only if the user seems idle and the mood is relaxed."
 ```
 
-支持 `YYYY-MM-DD`（精确年份）和 `MM-DD`（每年匹配）两种格式。当前日期匹配时，向 proactive 调度器注入 MEM 冲动值。
+支持 `YYYY-MM-DD`（精确年份）和 `MM-DD`（每年匹配）两种格式。当前日期匹配时，向 impulse 规划器注入 MEM 冲动值。
 
 ### 定期记忆查询
 按 `memory_check_interval`（默认 300 秒）轮询，使用预设的 `memory_lookup_query` 从记忆后端搜索，结果注入 MEM 冲动值。搜索结果经 `_compact_context()` 压缩（去标题行、截断至 700 字符、最多 4 行）。
@@ -71,10 +71,10 @@ note = "Mention it only if the user seems idle and the mood is relaxed."
 
 ### 配置
 
-记忆事件配置位于 `config.toml` 的 `[proactive]` 节下：
+记忆事件配置位于 `config.toml` 的 `[impulse]` 节下：
 
 ```toml
-[proactive]
+[impulse]
 memory_events_enabled = true
 memory_check_interval = 300.0       # 轮询间隔（秒），最小 30
 memory_cooldown_seconds = 21600.0   # 冷却时间（6 小时），最小 60

@@ -29,6 +29,30 @@ from kokoro.tool_parser import (
 )
 
 logger = logging.getLogger(__name__)
+_PAREN_STRIP_RE = re.compile(r"\s*[\uff08(][^\uff09)]*[\uff09)]\s*")
+
+
+def _strip_parens(text: str) -> str:
+    return _PAREN_STRIP_RE.sub("", text).strip()
+
+
+class _ParenFilter:
+    """Stateful filter to remove parenthetical content during streaming."""
+
+    def __init__(self):
+        self._depth = 0
+
+    def filter(self, text: str) -> str:
+        result: list[str] = []
+        for ch in text:
+            if ch in "\uff08(":
+                self._depth += 1
+            elif ch in "\uff09)":
+                if self._depth > 0:
+                    self._depth -= 1
+            elif self._depth == 0:
+                result.append(ch)
+        return "".join(result)
 
 
 class AgentConfig:
@@ -129,6 +153,7 @@ def _agent_chat_impl(
     total_completion = 0
     final_reply = ""
     working_messages = list(messages)
+    paren_filter = _ParenFilter()
 
     for iteration in range(max_iter):
         accumulator = ToolCallAccumulator()
@@ -170,10 +195,13 @@ def _agent_chat_impl(
                 chunk = parse_sse_chunk(line)
 
                 if chunk.content:
-                    print(chunk.content, end="", flush=True)
-                    iteration_reply += chunk.content
+                    content = paren_filter.filter(chunk.content)
+                    if not content:
+                        continue
+                    print(content, end="", flush=True)
+                    iteration_reply += content
                     if tts_engine:
-                        tts_engine.push(chunk.content)
+                        tts_engine.push(content)
 
                 if chunk.tool_call_deltas:
                     had_tool_calls = True
@@ -247,6 +275,7 @@ def _simple_stream(
 ) -> tuple[str, bool]:
     """Fallback: plain streaming without tools."""
     reply = ""
+    paren_filter = _ParenFilter()
     for content in llm_client.stream_chat(
         messages, model,
         cancel_event=cancel_event,
@@ -256,8 +285,11 @@ def _simple_stream(
     ):
         if cancel_event and cancel_event.is_set():
             return reply, True
+        content = paren_filter.filter(content)
+        if not content:
+            continue
         print(content, end="", flush=True)
         reply += content
         if tts_engine:
             tts_engine.push(content)
-    return reply, False
+    return _strip_parens(reply), False

@@ -23,6 +23,8 @@ MINIMAX_API_KEY = cfg.minimax_api_key()
 MINIMAX_MODEL = cfg.minimax_model()
 SAMPLE_RATE = int(cfg.get("minimax_sample_rate", 32000))
 WS_URL = "wss://api.minimax.io/ws/v1/t2a_v2"
+WS_OPEN_TIMEOUT = 10
+WS_CLOSE_TIMEOUT = 1
 
 VOICE_PRESETS = {
     "default": "Chinese (Mandarin)_Crisp_Girl",
@@ -40,6 +42,25 @@ _streaming_tts: Optional["StreamingTTS"] = None
 
 def _ws_headers() -> dict:
     return {"Authorization": f"Bearer {MINIMAX_API_KEY}"}
+
+
+def _connect_ws():
+    """Open MiniMax WebSocket with library keepalive disabled.
+
+    MiniMax TTS connections can sit idle between utterances. The default
+    websockets keepalive thread may time out during that idle period and print a
+    noisy traceback ("keepalive ping failed"). The receiver loop below already
+    detects closed connections and reconnects, so avoid protocol-level pings.
+    """
+    import websockets.sync.client as ws_sync
+
+    return ws_sync.connect(
+        WS_URL,
+        additional_headers=_ws_headers(),
+        open_timeout=WS_OPEN_TIMEOUT,
+        close_timeout=WS_CLOSE_TIMEOUT,
+        ping_interval=None,
+    )
 
 
 def _task_start(voice_id: str, speed: float) -> dict:
@@ -75,10 +96,9 @@ def _decode_audio_chunk(data: dict) -> Optional[np.ndarray]:
 
 
 def _send_and_receive_stream(text: str, voice_id: str, speed: float) -> Generator[np.ndarray, None, None]:
-    import websockets.sync.client as ws_sync
     from websockets.exceptions import ConnectionClosed
 
-    with ws_sync.connect(WS_URL, additional_headers=_ws_headers()) as ws:
+    with _connect_ws() as ws:
         ws.send(json.dumps(_task_start(voice_id, speed)))
         while True:
             try:
@@ -366,13 +386,12 @@ class StreamingTTS:
 
     def _ws_recv_worker(self) -> None:
         """Receiver loop. Reconnects automatically on unexpected drops."""
-        import websockets.sync.client as ws_sync
         from websockets.exceptions import ConnectionClosed
 
         while not self._should_stop:
             self._ws_started.clear()
             try:
-                self._ws = ws_sync.connect(WS_URL, additional_headers=_ws_headers(), open_timeout=10)
+                self._ws = _connect_ws()
                 self._ws.send(json.dumps(_task_start(self._voice_id, self._speed)))
             except Exception:
                 if self._should_stop:
