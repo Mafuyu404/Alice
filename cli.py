@@ -99,7 +99,13 @@ def chat_stream(
     print(f"\n{char_name}: ", end="", flush=True)
     char_cfg = character_config or {}
     _llm_api_base = char_cfg.get("llm_url") or None
-    _llm_api_key = char_cfg.get("api_key") or None
+    # Resolve API key by model: DeepSeek is handled in api_headers(),
+    # CharGLM uses its own named config key, other local models need none.
+    model_lower = model.lower()
+    if model_lower.startswith("charglm"):
+        _llm_api_key = cfg.charglm_api_key() or None
+    else:
+        _llm_api_key = None
 
     if agent_config is not None:
         # Tool-calling path: agent loop handles streaming + tools

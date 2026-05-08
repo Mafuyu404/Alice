@@ -63,7 +63,12 @@ ChatSession
     ├── 记忆上下文
     └── 屏幕观察上下文
     ↓
-LLM Client
+Agent Loop（启用工具时）
+    ├── 发送 messages + tool schemas → LLM
+    ├── 若返回 tool_calls → 执行工具 → 结果回填 → 再次请求 LLM
+    └── 若返回文本 → 最终回复
+    ↓
+LLM Client（无工具时直连）
     ↓
 回复文本
     ├── TTS 播放
@@ -105,6 +110,11 @@ characters/
 | 角色 | `kokoro/character.py` | 扫描角色目录、构建 system prompt |
 | 会话 | `kokoro/chat_session.py` | 对话历史、记忆注入、屏幕上下文 |
 | LLM | `kokoro/llm_client.py` | OpenAI 兼容请求、SSE 解析、模型路由 |
+| Agent 循环 | `kokoro/agent_loop.py` | 工具调用编排：流式响应 → 解析 tool_call → 执行 → 回填 |
+| 工具注册 | `kokoro/tool_registry.py` | 工具 schema 和 handler 的统一注册、超时执行 |
+| 工具解析 | `kokoro/tool_parser.py` | SSE delta 累加、tool_call 参数合并 |
+| 工具 schema | `kokoro/tool_schemas.py` | OpenAI 格式工具定义（查看屏幕、搜索记忆等） |
+| 工具 handler | `kokoro/tool_handlers.py` | 各工具的实际执行逻辑 |
 | STT | `kokoro/stt.py` | 麦克风流式识别 |
 | STT Pool | `kokoro/pool.py` | 文本片段聚合和精炼 |
 | TTS | `kokoro/tts.py` | 动态选择 TTS 后端 |

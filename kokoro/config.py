@@ -101,6 +101,10 @@ def deepseek_api_key() -> str:
     return os.environ.get("DEEPSEEK_API_KEY") or get("deepseek_api_key", "")
 
 
+def charglm_api_key() -> str:
+    return get("charglm_api_key", "")
+
+
 def deepseek_url() -> str:
     return "https://api.deepseek.com"
 

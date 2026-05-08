@@ -146,3 +146,4 @@ characters/{character_id}/portrait/*.png
 - 当前运行时角色主入口是 `characters/` 目录，不是根目录的 `characters.json`。
 - WebUI 是文字模式；语音、立绘和主动搭话主要在 CLI 中运行。
 - 立绘窗口会把位置和缩放保存到 `portrait_overlay_state.json`。
+- 工具调用（tool calling / function calling）默认启用，使用 OpenAI 兼容格式。小模型（≤3B）对工具调用的支持不稳定，容易出现误触发或参数格式错误。如果使用 `qwen2.5:1.5b` 等小模型，建议通过 `--no-tools` 关闭，或只保留少数简单工具（如 `get_current_time`）。详见 `doc/config.md` 的「工具调用」章节。

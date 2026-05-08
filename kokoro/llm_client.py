@@ -79,8 +79,6 @@ def stream_chat(
     headers = api_headers(model)
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    elif not headers.get("Authorization") and cfg.get("api_key"):
-        headers["Authorization"] = f"Bearer {cfg.get('api_key')}"
     resp = requests.post(
         f"{base_url}/chat/completions",
         json=build_payload(model, messages, stream=True, tools=tools),

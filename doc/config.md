@@ -61,6 +61,7 @@
 | `minimax_model()` | `speech-2.8-turbo` | MiniMax 语音模型 |
 | `kokoromo_url()` | `""` | KokoroMemo 服务地址 |
 | `deepseek_api_key()` | 环境变量 > config.json | DeepSeek API 密钥 |
+| `charglm_api_key()` | config.json | 智谱 CharGLM API 密钥 |
 | `deepseek_url()` | `https://api.deepseek.com` | DeepSeek API 地址 |
 | `is_deepseek_model(m)` | — | 模型名是否以 `deepseek` 开头 |
 | `stt_refine_model()` | `qwen2.5:1.5b` | STT 精炼用模型 |
@@ -157,6 +158,29 @@ mem0 子配置：
 记忆事件配置位于 `[proactive]` 下：`memory_events_enabled` `memory_check_interval` `memory_cooldown_seconds` `memory_date_score` `memory_lookup_score` `memory_lookup_query` `[[proactive.memory_date_events]]`。
 
 详见 [screen_interest.md](screen_interest.md) 和 [memory.md](memory.md)。
+
+### 工具调用 (Tool Calling)
+
+启用后，LLM 可以调用预定义的工具（查看屏幕、搜索记忆、获取时间等），替代旧版正则命令匹配。
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `enabled` | `true` | 总开关。关闭后使用旧版正则命令匹配 |
+| `tools` | 全部 5 个工具 | 启用的工具列表 |
+| `max_iterations` | `5` | 单次对话中工具调用的最大循环次数，防止死循环 |
+| `tool_timeout` | `45.0` | 单次工具调用的超时时间（秒） |
+
+可用工具：
+- `look_at_screen` — 截取屏幕截图并分析
+- `search_memory` — 搜索长期记忆
+- `get_current_time` — 获取当前日期时间
+- `get_current_app` — 获取前台窗口信息
+- `save_to_memory` — 保存信息到长期记忆
+
+**注意事项：**
+- 工具调用会增加 token 用量：每个请求携带工具 schema（约 500-800 tokens），每次工具调用会额外增加一轮 LLM 请求。`max_iterations` 越大，潜在开销越高。
+- 小模型（≤3B）对 function calling 支持不稳定。`qwen2.5:1.5b` 容易出现误触发或参数格式错误，建议降级为 `--no-tools` 或只启用 `get_current_time`。
+- 可通过 `config.toml` 中的 `[tool_calling]` 块调整，或 CLI 启动时用 `--no-tools` 临时关闭。
 
 ### 其他
 

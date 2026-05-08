@@ -83,7 +83,12 @@ def load_config(character_id: str) -> dict:
     """Load per-character config from characters/{id}/config.toml.
 
     Keys in this file override the global ``config.toml`` when this character
-    is active.  Supported overrides: ``llm_model``, ``llm_url``, ``api_key``.
+    is active.  Supported overrides: ``llm_model``, ``llm_url``.
+
+    Per-character config should only contain non-sensitive overrides.
+    API keys must NOT be stored here — use ``config.json`` with a named
+    config key (e.g. ``charglm_api_key``) instead.
+
     Returns an empty dict if no config file exists.
     """
     path = os.path.join(_CHARACTERS_DIR, character_id, "config.toml")

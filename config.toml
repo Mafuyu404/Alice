@@ -39,6 +39,11 @@ available_models = [
 # 类型: string
 deepseek_api_key = ""
 
+# 智谱 CharGLM API 密钥。使用 charglm 模型时需要。
+# 留空时从 config.json 的 charglm_api_key 读取。
+# 类型: string
+charglm_api_key = ""
+
 # 本地 transformers 模型名，作为 LLM 不可用时的后备。
 # 仅在 local_llm.py 中使用，直接加载 HuggingFace 模型到内存。
 # 类型: string（HuggingFace 模型 ID）
