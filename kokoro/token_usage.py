@@ -7,6 +7,9 @@ Usage
     # Record a call
     token_usage.record("qwen2.5:7b", "chat", prompt_tokens=100, completion_tokens=50)
 
+    # Record a vision call
+    token_usage.record("qwen-vl-plus", "vision_describe", prompt_tokens=200, completion_tokens=30)
+
     # Print summary
     print(token_usage.summary())
 """
@@ -40,12 +43,12 @@ class _TokenTracker:
 
     def summary(self) -> str:
         if not self._data:
-            return "  [token] No LLM calls recorded."
+            return "  [token] No model calls recorded."
 
-        lines = ["  [token] LLM token usage by model × function:"]
+        lines = ["  [token] Token usage by model × function:"]
         header = (
             f"  {'Model':<22} {'Function':<22} {'Calls':>7} "
-            f"{'Prompt Tokens':>14} {'Completion Tokens':>18} {'Total':>12}"
+            f"{'Input':>14} {'Output':>18} {'Total':>12}"
         )
         lines.append(header)
         lines.append("  " + "-" * 99)

@@ -15,6 +15,7 @@ import numpy as np
 import sounddevice as sd
 
 from kokoro import config as cfg
+from kokoro import token_usage
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,9 @@ def _send_and_receive_stream(text: str, voice_id: str, speed: float) -> Generato
 
 
 def text_to_speech_stream(text: str, voice: str = None, speed: float = 1.0) -> Generator[Tuple[np.ndarray, int], None, None]:
+    cc = len(text)
+    if cc:
+        token_usage.record(MINIMAX_MODEL, "tts", cc, 0)
     for audio in _send_and_receive_stream(text, _resolve_voice(voice), speed):
         yield audio, SAMPLE_RATE
 
@@ -250,6 +254,9 @@ class StreamingTTS:
         """Send a sentence. Returns False if WS is down (caller should retry)."""
         if not self._ws_started.is_set() or not self._ws:
             return False
+        cc = len(text)
+        if cc:
+            token_usage.record(MINIMAX_MODEL, "tts", cc, 0)
         try:
             with self._pending_lock:
                 self._pending_count += 1

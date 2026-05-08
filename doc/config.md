@@ -81,12 +81,11 @@
 
 ### LLM
 
-`llm_url` `llm_model` `available_models` `deepseek_api_key` `local_model`
+`llm_url` `llm_model` `deepseek_api_key` `local_model`
 
 - LLM 地址兼容 OpenAI/Ollama 格式，程序自动补 `/v1`
 - 模型名以 `deepseek` 开头时自动路由到 DeepSeek 云端 API（`api.deepseek.com`）
 - `local_model` 是 HuggingFace 模型 ID，作为 LLM 不可用时的后备（`local_llm.py` 使用）
-- `available_models` 供 WebUI 下拉选择
 
 ### TTS
 

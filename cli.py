@@ -2,11 +2,9 @@
 """Voice-first CLI entrypoint.
 
 CLI owns microphone/STT orchestration. Chat, memory, model routing, and TTS
-helpers live in kokoro package modules so webui.py can share the same core.
-
-State machine (kokoro/state_machine.py) is the single source of truth for
-what the system is doing. All workers consult it instead of ad-hoc flags.
-"""
+helpers live in kokoro package modules so they can be shared.  State machine
+(kokoro/state_machine.py) is the single source of truth for what the system is
+doing. All workers consult it instead of ad-hoc flags."""
 
 from __future__ import annotations
 

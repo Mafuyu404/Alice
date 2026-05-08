@@ -81,7 +81,7 @@ def analyze(
 
     image_uri = vision.screenshot_to_base64()
     prompt = _content_prompt(foreground)
-    raw = vision.analyze_image(image_uri, prompt, backend=backend, model=model, timeout=timeout)
+    raw = vision.analyze_image(image_uri, prompt, backend=backend, model=model, timeout=timeout, function="screen_interest")
     return _parse_content(raw)
 
 

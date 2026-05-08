@@ -12,6 +12,7 @@ from typing import Generator, Optional, Tuple
 import numpy as np
 
 from kokoro import config as cfg
+from kokoro import token_usage
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,9 @@ def _get_client():
 
 
 def text_to_speech_stream(text: str, voice: str = None, speed: float = 1.0) -> Generator[Tuple[np.ndarray, int], None, None]:
+    cc = len(text)
+    if cc:
+        token_usage.record("sonic-3", "tts", cc, 0)
     client = _get_client()
     voice_id = _resolve_voice(voice)
     with client.tts.websocket_connect() as connection:

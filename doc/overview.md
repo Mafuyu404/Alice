@@ -1,6 +1,6 @@
 # 架构概览
 
-Alice Chat 由一组松耦合模块组成：输入层负责语音或文字，调度层组织对话和状态，服务层连接 LLM/STT/TTS/记忆/视觉，呈现层负责立绘与 WebUI。
+Alice Chat 由一组松耦合模块组成：输入层负责语音或文字，调度层组织对话和状态，服务层连接 LLM/STT/TTS/记忆/视觉，呈现层负责立绘。
 
 ## 运行模式
 
@@ -35,27 +35,12 @@ python cli.py --no-screen-watch
 python cli.py --list-devices
 ```
 
-### WebUI 文字模式
-
-`python webui.py` 启动 FastAPI 服务和浏览器文字聊天界面。
-
-WebUI 提供：
-
-- `/`：返回 `index.html`
-- `/api/health`：检查 LLM 和记忆状态
-- `/api/models`：列出当前模型和可选模型
-- `/api/models/switch`：切换当前模型
-- `/api/characters`：读取角色列表
-- `/v1/chat/completions`：OpenAI 兼容聊天接口
-
-WebUI 不启动 STT、TTS、立绘窗口、主动搭话和屏幕感知。
-
 ## 数据流
 
 ```text
-麦克风 / 浏览器
+麦克风
     ↓
-STT / WebUI 请求
+STT 请求
     ↓
 ChatSession
     ├── 角色 system prompt
@@ -105,7 +90,6 @@ characters/
 | 模块 | 文件 | 职责 |
 | --- | --- | --- |
 | CLI | `cli.py` | 语音模式总入口 |
-| WebUI | `webui.py` | 文字聊天和 API |
 | 配置 | `kokoro/config.py` | 读取 `config.toml`、`config.json` 和环境变量 |
 | 角色 | `kokoro/character.py` | 扫描角色目录、构建 system prompt |
 | 会话 | `kokoro/chat_session.py` | 对话历史、记忆注入、屏幕上下文 |

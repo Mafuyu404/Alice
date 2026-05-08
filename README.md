@@ -1,11 +1,8 @@
 # Alice Chat
 
-Alice Chat 是一个桌面 AI 陪伴框架，支持语音对话、文字 WebUI、角色设定、立绘覆盖层、主动搭话、屏幕感知和长期记忆。
+Alice Chat 是一个桌面 AI 陪伴框架，支持语音对话、角色设定、立绘覆盖层、主动搭话、屏幕感知和长期记忆。
 
-项目当前有两个主要入口：
-
-- `cli.py`：完整语音模式，包含 STT、LLM、TTS、立绘、主动搭话和屏幕感知。
-- `webui.py`：浏览器文字模式，提供文本聊天、角色列表、模型切换和 OpenAI 兼容聊天接口。
+项目当前主要入口是 `cli.py`，包含 STT、LLM、TTS、立绘、主动搭话和屏幕感知的完整语音模式。
 
 核心代码在 `kokoro/`，角色数据在 `characters/`，配置在 `config.toml` 和本地密钥文件 `config.json`。
 
@@ -28,7 +25,7 @@ pip install cartesia
 pip install mem0ai fastembed
 ```
 
-按实际功能安装即可：只用 WebUI 时不需要 STT、TTS、PySide6；只用本地无记忆模式时不需要 mem0。
+按实际功能安装即可：只用本地无记忆模式时不需要 mem0。
 
 ### 配置
 
@@ -60,18 +57,13 @@ python cli.py --no-proactive
 python cli.py --no-screen-watch
 python cli.py --list-devices
 
-python webui.py
 ```
-
-WebUI 默认访问 `http://127.0.0.1:8080`。
 
 ## 当前目录结构
 
 ```text
 .
 ├── cli.py                         # 语音入口
-├── webui.py                       # 文字 WebUI 入口
-├── index.html                     # WebUI 前端
 ├── overlay_slideshow.py           # 透明立绘窗口和 HTTP 控制服务
 ├── config.toml                    # 主配置
 ├── config.json                    # 本地密钥，已忽略
@@ -137,13 +129,11 @@ characters/{character_id}/portrait/*.png
 | [memory.md](doc/memory.md) | 长期记忆 |
 | [proactive.md](doc/proactive.md) | 主动搭话 |
 | [screen_interest.md](doc/screen_interest.md) | 屏幕感知 |
-| [webui.md](doc/webui.md) | WebUI |
 
 ## 注意事项
 
 - 不要提交真实 API key。
 - `config.toml` 是主配置，`config.json` 适合放本机密钥。
 - 当前运行时角色主入口是 `characters/` 目录，不是根目录的 `characters.json`。
-- WebUI 是文字模式；语音、立绘和主动搭话主要在 CLI 中运行。
 - 立绘窗口会把位置和缩放保存到 `portrait_overlay_state.json`。
 - 工具调用（tool calling / function calling）默认启用，使用 OpenAI 兼容格式。小模型（≤3B）对工具调用的支持不稳定，容易出现误触发或参数格式错误。如果使用 `qwen2.5:1.5b` 等小模型，建议通过 `--no-tools` 关闭，或只保留少数简单工具（如 `get_current_time`）。详见 `doc/config.md` 的「工具调用」章节。

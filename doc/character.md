@@ -1,6 +1,6 @@
 # 角色系统
 
-角色系统负责加载角色设定、生成 system prompt，并为 CLI/WebUI 提供可选角色列表。
+角色系统负责加载角色设定、生成 system prompt，并为 CLI 提供可选角色列表。
 
 ## 文件布局
 
@@ -80,8 +80,6 @@ python cli.py -c yuki
 ```
 
 如果指定角色不存在，CLI 会打印当前可用角色列表。
-
-WebUI 的 `/api/characters` 也调用同一个加载逻辑，因此它看到的角色列表与 CLI 一致。
 
 ## 新增角色
 

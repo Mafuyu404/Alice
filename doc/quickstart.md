@@ -40,7 +40,6 @@ pip install mem0ai fastembed
 ```toml
 llm_url = "http://127.0.0.1:11434"
 llm_model = "deepseek-v4-flash"
-available_models = ["qwen2.5:7b", "deepseek-v4-flash"]
 
 memory_backend = "mem0"      # mem0 / kokoromemo / none
 tts_backend = "minimax"      # minimax / cartesia
@@ -112,20 +111,6 @@ python cli.py --character penglai --no-screen-watch
 python cli.py --character alice --model deepseek-v4-flash
 ```
 
-## 启动 WebUI
-
-```bash
-python webui.py
-```
-
-然后打开：
-
-```text
-http://127.0.0.1:8080
-```
-
-WebUI 是文字模式，不启动 STT、TTS、立绘覆盖层、主动搭话和屏幕感知。
-
 ## 快速检查
 
 确认 LLM 后端可用：
@@ -154,4 +139,3 @@ python -c "import json,pathlib; r=pathlib.Path('characters/penglai/portrait'); d
 - `Character 'xxx' not found`：检查是否存在 `characters/xxx/xxx.json`。
 - 立绘窗口没有出现：确认安装了 `PySide6`，并检查 `characters/{id}/portrait/portrait.json` 中的 `id` 是否对应 PNG。
 - 端口 17352 被占用：修改 `portrait_overlay_port`，或关闭已有立绘窗口。
-- WebUI 显示 LLM 不可用：确认 `llm_url` 指向的服务已启动，或设置 `LLM_BACKEND_CMD` 让 WebUI 自动拉起后端。

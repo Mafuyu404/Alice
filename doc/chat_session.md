@@ -80,7 +80,7 @@ for chunk in stream_chat(messages, model="deepseek-v4-flash"):
 | 函数 | 功能 |
 |------|------|
 | `api_base_for(model)` | 获取模型对应的 API base URL（含 `/v1`） |
-| `upstream_url_for(model, prefer_kokoromemo=False)` | 获取上游地址（不含 `/v1`），供 WebUI 使用 |
+| `upstream_url_for(model, prefer_kokoromemo=False)` | 获取上游地址（不含 `/v1`） |
 | `build_payload(model, messages, stream)` | 构建请求体，DeepSeek 模型自动禁用 thinking |
 | `parse_sse_delta(line)` | 解析 SSE 行，提取 content delta。过滤 `[DONE]`、空行和注释行 |
 | `api_headers(model)` | 返回请求头，DeepSeek 模型自动附加 `Authorization: Bearer` |
