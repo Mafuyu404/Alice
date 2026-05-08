@@ -11,6 +11,7 @@ from typing import Iterable
 
 from kokoro import prompts
 from kokoro import screen_interest
+from kokoro import token_usage
 from kokoro import vision
 
 logger = logging.getLogger(__name__)
@@ -214,7 +215,16 @@ def _call_refine_style_llm(
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         result = json.loads(resp.read())
     if api_key:
+        usage = result.get("usage", {})
+        pt = int(usage.get("prompt_tokens", 0))
+        ct = int(usage.get("completion_tokens", 0))
+        if pt or ct:
+            token_usage.record(llm_model, "waiting_reply", pt, ct)
         return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+    pt = int(result.get("prompt_eval_count", 0))
+    ct = int(result.get("eval_count", 0))
+    if pt or ct:
+        token_usage.record(llm_model, "waiting_reply", pt, ct)
     return result.get("message", {}).get("content", "").strip()
 
 

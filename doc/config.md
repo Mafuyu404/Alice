@@ -64,6 +64,7 @@
 | `charglm_api_key()` | config.json | 智谱 CharGLM API 密钥 |
 | `deepseek_url()` | `https://api.deepseek.com` | DeepSeek API 地址 |
 | `is_deepseek_model(m)` | — | 模型名是否以 `deepseek` 开头 |
+| `vision_max_pixels()` | `921600` | 截图缩放上限像素数，`0` 禁用缩放 |
 | `stt_refine_model()` | `qwen2.5:1.5b` | STT 精炼用模型 |
 | `stt_refine_mode()` | `separate` | 精炼模式 |
 | `stt_refine_stable_seconds()` | `1.5` | 静默判定时间（秒） |

@@ -35,6 +35,7 @@ from kokoro import stt as stt_mod
 from kokoro import tts as tts_mod
 from kokoro import user_commands
 from kokoro import agent_loop
+from kokoro import token_usage
 from kokoro import tool_registry as tool_registry_mod
 
 
@@ -94,6 +95,7 @@ def chat_stream(
     character_config: dict | None = None,
     agent_config: agent_loop.AgentConfig | None = None,
     tool_context: dict | None = None,
+    usage_callback=None,
 ) -> tuple[str, bool]:
     """Stream LLM response. Returns (reply_text, was_cancelled)."""
     print(f"\n{char_name}: ", end="", flush=True)
@@ -118,6 +120,7 @@ def chat_stream(
             character_config=character_config,
             api_base_url=_llm_api_base,
             api_key=_llm_api_key,
+            usage_callback=usage_callback,
             **(tool_context or {}),
         )
         if not result.cancelled:
@@ -142,6 +145,7 @@ def chat_stream(
         cancel_event=cancel_event,
         api_base_url=_llm_api_base,
         api_key=_llm_api_key,
+        usage_callback=usage_callback,
     ):
         content = paren_filter.filter(content)
         if not content:
@@ -373,7 +377,7 @@ def main() -> None:
             messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=stt_refine_inline, inject_memory=not _tool_enabled)
 
             try:
-                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
+                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                 machine.emit_error("llm_connection")
@@ -590,7 +594,7 @@ def main() -> None:
                     f"desire={decision.desire:.1f} disturb={decision.disturbance:.1f}"
                 )
                 try:
-                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel, character_config=session.character_config, agent_config=_agent_config, tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
+                    reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=proactive_cancel, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "proactive"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
                 except requests.exceptions.ConnectionError:
                     print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                     machine.emit_error("proactive_llm")
@@ -718,6 +722,8 @@ def main() -> None:
     finally:
         machine.emit(sm.SystemEvent.SHUTDOWN)
         pool.stop()
+        print()
+        print(token_usage.summary())
         if portrait_worker:
             portrait_worker.stop()
         if portrait_client:

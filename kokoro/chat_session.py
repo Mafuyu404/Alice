@@ -177,6 +177,7 @@ class ChatSession:
         system = prompts.get("conversation_summary.system", "")
 
         from kokoro import config as cfg
+        from kokoro import token_usage
 
         model = cfg.stt_refine_model()
         url = cfg.llm_url()
@@ -219,8 +220,17 @@ class ChatSession:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 result = json.loads(resp.read())
             if api_key:
+                usage = result.get("usage", {})
+                pt = int(usage.get("prompt_tokens", 0))
+                ct = int(usage.get("completion_tokens", 0))
+                if pt or ct:
+                    token_usage.record(model, "conversation_summary", pt, ct)
                 text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             else:
+                pt = int(result.get("prompt_eval_count", 0))
+                ct = int(result.get("eval_count", 0))
+                if pt or ct:
+                    token_usage.record(model, "conversation_summary", pt, ct)
                 text = result.get("message", {}).get("content", "").strip()
             return text if text else None
         except Exception as exc:

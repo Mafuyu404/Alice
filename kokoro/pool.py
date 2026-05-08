@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 from kokoro import config as cfg
 from kokoro import prompts
+from kokoro import token_usage
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,16 @@ class ConversationPool:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 result = json.loads(resp.read())
             if self.api_key:
+                usage = result.get("usage", {})
+                pt = int(usage.get("prompt_tokens", 0))
+                ct = int(usage.get("completion_tokens", 0))
+                if pt or ct:
+                    token_usage.record(self.llm_model, "stt_refine", pt, ct)
                 return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            pt = int(result.get("prompt_eval_count", 0))
+            ct = int(result.get("eval_count", 0))
+            if pt or ct:
+                token_usage.record(self.llm_model, "stt_refine", pt, ct)
             return result.get("message", {}).get("content", "").strip()
         except Exception as exc:
             logger.debug("STT refine LLM call failed: %s", exc)

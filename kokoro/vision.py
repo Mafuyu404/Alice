@@ -17,7 +17,10 @@ from kokoro import prompts
 
 logger = logging.getLogger("vision")
 
-MAX_PIXELS = 1280 * 720
+
+def _max_pixels() -> int:
+    """Return max pixel count from config (0 = no scaling)."""
+    return cfg.vision_max_pixels()
 
 # ---------------------------------------------------------------------------
 # config keys
@@ -34,12 +37,13 @@ DEFAULT_DASHSCOPE_MODEL = "qwen-vl-plus"
 # ---------------------------------------------------------------------------
 
 
-def screenshot_to_base64(all_screens: bool = True, max_pixels: int = MAX_PIXELS) -> str:
+def screenshot_to_base64(all_screens: bool = True, max_pixels: int | None = None) -> str:
     """Capture screen, downscale if needed, return base64-encoded PNG data URI."""
     img = ImageGrab.grab(all_screens=all_screens)
     w, h = img.size
-    if w * h > max_pixels:
-        ratio = (max_pixels / (w * h)) ** 0.5
+    limit = _max_pixels() if max_pixels is None else max_pixels
+    if limit > 0 and w * h > limit:
+        ratio = (limit / (w * h)) ** 0.5
         new_w = int(w * ratio)
         new_h = int(h * ratio)
         img = img.resize((new_w, new_h), Image.LANCZOS)
@@ -64,7 +68,7 @@ def get_foreground_bounds() -> dict | None:
         return None
 
 
-def foreground_screenshot_to_base64(max_pixels: int = MAX_PIXELS) -> str | None:
+def foreground_screenshot_to_base64(max_pixels: int | None = None) -> str | None:
     """Capture full screen, crop to the foreground window, return base64 PNG data URI.
 
     Returns *None* if the foreground window bounds cannot be determined or are empty.
@@ -79,7 +83,8 @@ def foreground_screenshot_to_base64(max_pixels: int = MAX_PIXELS) -> str | None:
 
     img = ImageGrab.grab(all_screens=True)
     cropped = img.crop((l, t, r, b))
-    if w * h > max_pixels:
+    limit = _max_pixels() if max_pixels is None else max_pixels
+    if limit > 0 and w * h > limit:
         ratio = (max_pixels / (w * h)) ** 0.5
         new_w = int(w * ratio)
         new_h = int(h * ratio)
@@ -211,21 +216,27 @@ def format_apps(apps: list[dict], foreground: dict | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _call_ollama(image_uri: str, prompt: str, model: str, base_url: str, timeout: int) -> str:
+def _build_messages(items: list[tuple[str, str]]) -> list[dict]:
+    """Build a list of user messages, one per (image_uri, prompt) pair."""
+    messages = []
+    for image_uri, prompt in items:
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_uri}},
+            ],
+        })
+    return messages
+
+
+def _call_ollama(items: list[tuple[str, str]], model: str, base_url: str, timeout: int) -> str:
     import requests
 
     api_url = base_url.rstrip("/") + "/v1/chat/completions"
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_uri}},
-                ],
-            }
-        ],
+        "messages": _build_messages(items),
         "stream": False,
     }
     resp = requests.post(api_url, json=payload, timeout=timeout)
@@ -234,20 +245,12 @@ def _call_ollama(image_uri: str, prompt: str, model: str, base_url: str, timeout
     return resp.json()["choices"][0]["message"]["content"]
 
 
-def _call_dashscope(image_uri: str, prompt: str, model: str, api_key: str, timeout: int) -> str:
+def _call_dashscope(items: list[tuple[str, str]], model: str, api_key: str, timeout: int) -> str:
     import requests
 
     payload = {
         "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": image_uri}},
-                ],
-            }
-        ],
+        "messages": _build_messages(items),
         "stream": False,
     }
     headers = {
@@ -272,15 +275,19 @@ def _safe_print(text: str) -> None:
     sys.stdout.flush()
 
 
-def _vision_result(image_uri: str, prompt: str, model: str, backend: str,
+def _vision_result(items: list[tuple[str, str]], model: str, backend: str,
                    base_url: str | None, api_key: str | None, timeout: int) -> str:
-    """Route to the correct backend and return the vision model text."""
+    """Route a batch of (image_uri, prompt) pairs to the correct backend.
+
+    Each pair becomes a separate user message in a single API request.
+    Returns the model's combined text response.
+    """
     conf = cfg.load()
 
     if backend == "ollama":
         url = (base_url or cfg.llm_url()).rstrip("/")
-        logger.info("ollama %s  %s  timeout=%ss", model, url, timeout)
-        return _call_ollama(image_uri, prompt, model, url, timeout)
+        logger.info("ollama %s  %s  items=%d  timeout=%ss", model, url, len(items), timeout)
+        return _call_ollama(items, model, url, timeout)
 
     key = api_key or conf.get(KEY_API_KEY) or os.environ.get("DASHSCOPE_API_KEY") or ""
     if not key:
@@ -288,8 +295,8 @@ def _vision_result(image_uri: str, prompt: str, model: str, backend: str,
             "DashScope API key not set.  Provide --api-key, set config "
             f"'{KEY_API_KEY}', or export DASHSCOPE_API_KEY."
         )
-    logger.info("dashscope %s  timeout=%ss", model, timeout)
-    return _call_dashscope(image_uri, prompt, model, key, timeout)
+    logger.info("dashscope %s  items=%d  timeout=%ss", model, len(items), timeout)
+    return _call_dashscope(items, model, key, timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -306,14 +313,56 @@ def analyze_image(
     backend: str | None = None,
     timeout: int = 120,
 ) -> str:
-    """Send a pre-captured image + prompt to the vision model and return the text response."""
+    """Send a single image + prompt to the vision model and return the text response."""
     conf = cfg.load()
     if backend is None:
         backend = conf.get(KEY_BACKEND, "") or "dashscope"
     if model is None:
         model = conf.get(KEY_MODEL, "") or (
             DEFAULT_DASHSCOPE_MODEL if backend == "dashscope" else "qwen2.5vl:3b")
-    return _vision_result(image_uri, prompt, model, backend, base_url, api_key, timeout)
+    return _vision_result([(image_uri, prompt)], model, backend, base_url, api_key, timeout)
+
+
+def batch_analyze_images(
+    items: list[tuple[str, str]],
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    backend: str | None = None,
+    timeout: int = 120,
+) -> str:
+    """Send multiple (image_uri, prompt) pairs in a single vision API call.
+
+    Each pair becomes a separate user message. The model processes all images
+    in one request and returns a combined response.
+
+    Useful for analyzing multiple screenshots, comparing screen states, or
+    running different analyses in a single call.
+
+    Parameters
+    ----------
+    items : list[tuple[str, str]]
+        List of ``(image_data_uri, prompt_text)`` pairs.
+    model : str | None
+        Model name.  Defaults from config (``vision_model``) or per-backend default.
+    base_url : str | None
+        Ollama base URL (only used when backend is ``"ollama"``).
+    api_key : str | None
+        DashScope API key (only used when backend is ``"dashscope"``).
+    backend : str | None
+        ``"ollama"`` or ``"dashscope"``.  Falls back to config key ``vision_backend``.
+    timeout : int
+        HTTP request timeout in seconds.
+    """
+    if not items:
+        return ""
+    conf = cfg.load()
+    if backend is None:
+        backend = conf.get(KEY_BACKEND, "") or "dashscope"
+    if model is None:
+        model = conf.get(KEY_MODEL, "") or (
+            DEFAULT_DASHSCOPE_MODEL if backend == "dashscope" else "qwen2.5vl:3b")
+    return _vision_result(items, model, backend, base_url, api_key, timeout)
 
 
 def describe(
@@ -356,7 +405,7 @@ def describe(
     logger.info("screenshot captured in %.1fs", time.time() - t0)
 
     t1 = time.time()
-    result = _vision_result(image_uri, prompt, model, backend, base_url, api_key, timeout)
+    result = _vision_result([(image_uri, prompt)], model, backend, base_url, api_key, timeout)
     logger.info("vision response in %.1fs", time.time() - t1)
     return result
 
@@ -398,7 +447,7 @@ def detect_desktop(
     full_prompt = f"{prompt}{suffix}"
 
     t1 = time.time()
-    result = _vision_result(image_uri, full_prompt, model, backend, base_url, api_key, timeout)
+    result = _vision_result([(image_uri, full_prompt)], model, backend, base_url, api_key, timeout)
     logger.info("vision response in %.1fs", time.time() - t1)
     return result
 

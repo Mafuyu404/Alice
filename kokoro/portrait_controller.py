@@ -14,6 +14,7 @@ from urllib import error, request
 from kokoro import config as cfg
 from kokoro import llm_client
 from kokoro import prompts
+from kokoro import token_usage
 
 logger = logging.getLogger(__name__)
 
@@ -262,7 +263,8 @@ class PortraitDecisionWorker:
                 ),
             },
         ]
-        reply = "".join(llm_client.stream_chat(messages, self.model, timeout=60)).strip()
+        usage_cb = token_usage.make_callback(self.model, "portrait")
+        reply = "".join(llm_client.stream_chat(messages, self.model, timeout=60, usage_callback=usage_cb)).strip()
         for token in reply.replace("`", "").replace("\"", "").split():
             if token in valid_ids:
                 return token

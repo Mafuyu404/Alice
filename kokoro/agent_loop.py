@@ -67,6 +67,7 @@ def agent_chat(
     character_config: dict | None = None,
     api_base_url: str | None = None,
     api_key: str | None = None,
+    usage_callback=None,
     **tool_context,
 ) -> AgentResult:
     """Run the agent loop.
@@ -85,6 +86,7 @@ def agent_chat(
             character_config=character_config,
             api_base_url=api_base_url,
             api_key=api_key,
+            usage_callback=usage_callback,
         )
         return AgentResult(reply=reply, cancelled=cancelled, tool_calls_made=0)
 
@@ -100,6 +102,7 @@ def agent_chat(
         tts_engine=tts_engine,
         api_base_url=api_base_url,
         api_key=api_key,
+        usage_callback=usage_callback,
         **tool_context,
     )
 
@@ -116,11 +119,14 @@ def _agent_chat_impl(
     tts_engine: object | None,
     api_base_url: str | None,
     api_key: str | None,
+    usage_callback=None,
     **tool_context,
 ) -> AgentResult:
     """Stream LLM response with agent loop using raw SSE parsing."""
 
     total_tool_calls = 0
+    total_prompt = 0
+    total_completion = 0
     final_reply = ""
     working_messages = list(messages)
 
@@ -151,8 +157,15 @@ def _agent_chat_impl(
         try:
             for line in resp.iter_lines(decode_unicode=True):
                 if cancel_event and cancel_event.is_set():
+                    if usage_callback and (total_prompt or total_completion):
+                        usage_callback({"prompt_tokens": total_prompt, "completion_tokens": total_completion})
                     resp.close()
                     return AgentResult(reply=final_reply + iteration_reply, cancelled=True, tool_calls_made=total_tool_calls)
+
+                usage = llm_client.parse_sse_usage(line)
+                if usage:
+                    total_prompt += int(usage.get("prompt_tokens", 0))
+                    total_completion += int(usage.get("completion_tokens", 0))
 
                 chunk = parse_sse_chunk(line)
 
@@ -176,6 +189,8 @@ def _agent_chat_impl(
         final_reply += iteration_reply
 
         if not had_tool_calls or not pending_completed:
+            if usage_callback and (total_prompt or total_completion):
+                usage_callback({"prompt_tokens": total_prompt, "completion_tokens": total_completion})
             return AgentResult(reply=final_reply, cancelled=False, tool_calls_made=total_tool_calls)
 
         # Build assistant message with tool_calls
@@ -215,6 +230,8 @@ def _agent_chat_impl(
                 "content": result,
             })
 
+    if usage_callback and (total_prompt or total_completion):
+        usage_callback({"prompt_tokens": total_prompt, "completion_tokens": total_completion})
     return AgentResult(reply=final_reply, cancelled=False, tool_calls_made=total_tool_calls)
 
 
@@ -226,6 +243,7 @@ def _simple_stream(
     character_config: dict | None = None,
     api_base_url: str | None = None,
     api_key: str | None = None,
+    usage_callback=None,
 ) -> tuple[str, bool]:
     """Fallback: plain streaming without tools."""
     reply = ""
@@ -234,6 +252,7 @@ def _simple_stream(
         cancel_event=cancel_event,
         api_base_url=api_base_url,
         api_key=api_key,
+        usage_callback=usage_callback,
     ):
         if cancel_event and cancel_event.is_set():
             return reply, True

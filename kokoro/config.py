@@ -150,6 +150,11 @@ def portrait_model() -> str:
     return get("portrait_model", "")
 
 
+def vision_max_pixels() -> int:
+    """Max pixel count for screenshot scaling. 0 = no scaling."""
+    return int(get("vision_max_pixels", 921600))
+
+
 def api_base() -> str:
     kb = kokoromo_url()
     mb = memory_backend()

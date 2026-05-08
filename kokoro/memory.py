@@ -8,6 +8,7 @@ import os
 
 from . import config as cfg_mod
 from . import prompts
+from . import token_usage
 
 logger = logging.getLogger("memory")
 
@@ -190,7 +191,13 @@ class Mem0Backend(MemoryBackend):
                 timeout=15,
             )
             if resp.ok:
-                text = resp.json()["choices"][0]["message"]["content"].strip()
+                data = resp.json()
+                usage = data.get("usage", {})
+                pt = int(usage.get("prompt_tokens", 0))
+                ct = int(usage.get("completion_tokens", 0))
+                if pt or ct:
+                    token_usage.record(model, "memory_importance", pt, ct)
+                text = data["choices"][0]["message"]["content"].strip()
                 return "不重要" in text
             logger.warning("[mem0] importance LLM returned %s", resp.status_code)
         except Exception as exc:

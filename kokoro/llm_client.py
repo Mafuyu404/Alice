@@ -57,6 +57,34 @@ def parse_sse_delta(line: str) -> str:
         return ""
 
 
+def parse_sse_usage(line: str) -> dict | None:
+    """Extract token usage dict from an SSE line, or None.
+
+    Handles OpenAI / DeepSeek (``usage`` at chunk root) and Ollama
+    (``done=true`` with ``eval_count`` / ``prompt_eval_count``) formats.
+    """
+    if not line or not line.startswith("data: ") or line == "data: [DONE]":
+        return None
+    try:
+        chunk = json.loads(line[6:])
+    except json.JSONDecodeError:
+        return None
+
+    # OpenAI / DeepSeek style
+    usage = chunk.get("usage")
+    if isinstance(usage, dict):
+        return usage
+
+    # Ollama style — last chunk with done=true
+    if chunk.get("done") is True:
+        pt = chunk.get("prompt_eval_count") or 0
+        ct = chunk.get("eval_count") or 0
+        if pt or ct:
+            return {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}
+
+    return None
+
+
 class _StreamCancelled(Exception):
     """Raised internally when a streaming request is cancelled."""
     pass
@@ -70,6 +98,7 @@ def stream_chat(
     api_base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     tools: Optional[list[dict]] = None,
+    usage_callback=None,
 ) -> Iterable[str]:
     base_url = api_base_for(model)
     if api_base_url:
@@ -90,14 +119,20 @@ def stream_chat(
         raise RuntimeError(f"API error {resp.status_code}: {resp.text[:200]}")
 
     resp.encoding = "utf-8"
+    last_usage = None
     try:
         for line in resp.iter_lines(decode_unicode=True):
             if cancel_event and cancel_event.is_set():
                 resp.close()
                 return
+            usage = parse_sse_usage(line)
+            if usage:
+                last_usage = usage
             content = parse_sse_delta(line)
             if content:
                 yield content
     finally:
         if cancel_event and cancel_event.is_set():
             resp.close()
+    if last_usage and usage_callback:
+        usage_callback(last_usage)
