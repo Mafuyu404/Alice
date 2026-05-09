@@ -106,6 +106,17 @@ stt_model_dir = "models/stt"
 # 设为 "" 可跳过精炼（直接使用原始 STT 结果）。
 stt_refine_model = "qwen2.5:1.5b"
 
+# 认知层评估用模型。留空则使用 llm_model。
+# 类型: string（模型名）
+# 用于上下文总结时对认知层（cognition.json）的全量评估。
+# 建议用小模型（如 qwen2.5:1.5b）控制成本，每 ~40 轮对话执行一次。
+cognition_model = ""
+
+# 情绪层评估用模型。留空则使用 llm_model。
+# 类型: string（模型名）
+# 每次对话后对情绪状态进行评估，频率很高，强烈建议配本地小模型。
+emotion_model = ""
+
 # STT 精炼模式。
 # 类型: string
 # 可选值:

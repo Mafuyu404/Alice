@@ -113,6 +113,25 @@ def _extract_json_array(text: str) -> list:
                     except json.JSONDecodeError:
                         pass
 
+    # Strategy 3: unclosed brackets — auto-close and retry
+    if depth > 0 and start >= 0:
+        candidate = stripped[start:]
+        for _ in range(depth):
+            candidate += "]"
+        try:
+            value = json.loads(candidate)
+            if isinstance(value, list):
+                return value
+        except json.JSONDecodeError:
+            # trailing comma before auto-closed ]
+            cleaned = re.sub(r",\s*\]", "]", candidate)
+            try:
+                value = json.loads(cleaned)
+                if isinstance(value, list):
+                    return value
+            except json.JSONDecodeError:
+                pass
+
     logger.debug("_extract_json_array: no valid JSON array found (len=%d)", len(stripped))
     return []
 
@@ -211,10 +230,17 @@ class ImpulsePlanner:
         try:
             while not self._cancel_event.is_set():
                 screen_result = self._capture_screen()
+                if self._cancel_event.is_set():
+                    return
                 memories = self._fetch_memories()
+                if self._cancel_event.is_set():
+                    return
 
                 with self._lock:
                     self.plan_table = self._call_planner(screen_result, memories)
+
+                if self._cancel_event.is_set():
+                    return
 
                 items = list(self.plan_table.items)
 
@@ -407,17 +433,17 @@ class ImpulsePlanner:
             return PlanTable(max_capacity=self.max_plans, min_capacity=self.min_plans)
 
     def _idle_wait(self, seconds: float) -> bool:
-        """Wait for `seconds`, but only when system is idle. Returns False if cancelled."""
-        deadline = time.monotonic() + seconds
-        while time.monotonic() < deadline:
+        """Wait for `seconds` of idle time. Pauses countdown when system is busy.
+        Returns False if cancelled."""
+        elapsed = 0.0
+        while elapsed < seconds:
             if self._cancel_event.is_set():
                 return False
-            # Only count time when system is completely idle
             if self.machine.is_idle or self.machine.state == self.machine.state.__class__.SCREEN_WATCHING:
-                time.sleep(0.5)
+                time.sleep(0.25)
+                elapsed += 0.25
             else:
-                # System busy — pause countdown but still check for cancellation
-                time.sleep(0.5)
+                time.sleep(0.25)
         return True
 
     def _execute_item(self, item: PlanItem) -> None:

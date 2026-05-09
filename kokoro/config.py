@@ -145,6 +145,18 @@ def stt_skip_short_refine_max_chars() -> int:
     return int(get("stt_skip_short_refine_max_chars", 18))
 
 
+# ── cognition / emotion ─────────────────────────────────────────────────────────
+
+def cognition_model() -> str:
+    """认知层评估用模型。留空则使用 stt_refine_model。"""
+    return get("cognition_model", "")
+
+
+def emotion_model() -> str:
+    """情绪层评估用模型。留空则使用 stt_refine_model。"""
+    return get("emotion_model", "")
+
+
 def portrait_model() -> str:
     """Model for portrait expression selection. Empty = use conversation model."""
     return get("portrait_model", "")

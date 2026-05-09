@@ -32,6 +32,17 @@ class ChatSession:
     summary_file: str = ""
     _summarize_in_progress: bool = False
     _summarize_lock: threading.Lock = field(default_factory=threading.Lock)
+    # Three-layer personality system
+    cognition: object = field(default=None)   # CognitionStore instance
+    emotion: object = field(default=None)      # EmotionState instance
+
+    def __post_init__(self) -> None:
+        from kokoro.cognition import CognitionStore
+        from kokoro.emotion import EmotionState
+        if self.cognition is None:
+            self.cognition = CognitionStore(self.character_id, self.character_data)
+        if self.emotion is None:
+            self.emotion = EmotionState(self.character_id)
 
     @property
     def character_name(self) -> str:
@@ -100,6 +111,16 @@ class ChatSession:
             memory_ctx = self.memory_backend.get_context(user_text, user_id=self.character_id)
             if memory_ctx:
                 messages.append({"role": "system", "content": memory_ctx})
+        # Cognitive layer — runtime cache of relevant perceptions
+        cognition_ctx = self.cognition.get_context()
+        if cognition_ctx:
+            messages.append({"role": "system", "content": cognition_ctx})
+
+        # Emotion layer — shallow tone and mid-term motivation (optional)
+        emotion_ctx = self.emotion.get_context()
+        if emotion_ctx:
+            messages.append({"role": "system", "content": emotion_ctx})
+
         if stt_refine_inline:
             inline_prompt = prompts.get("stt_refine_inline.system", "")
             if inline_prompt:
@@ -147,6 +168,16 @@ class ChatSession:
         else:
             self.memory_backend.store(user_text, assistant_text, user_id=self.character_id)
 
+        # Refresh cognition cache — keyword match against current turn, no LLM
+        self.cognition.refresh_cache(user_text, assistant_text)
+
+        # Async emotion evaluation — LLM-based, non-blocking
+        threading.Thread(
+            target=self.emotion.evaluate,
+            args=(user_text, assistant_text, self.character_name),
+            daemon=True,
+        ).start()
+
     def _summarize_async(self, batch: list[dict]) -> None:
         try:
             conv_lines = []
@@ -163,6 +194,21 @@ class ChatSession:
                 with self._summarize_lock:
                     self.summary = new_summary
                 self.save_summary()
+
+                # Cognition full evaluation after summarization
+                try:
+                    memories = self.memory_backend.get_context(
+                        conv_text[:500], user_id=self.character_id,
+                    )
+                    self.cognition.evaluate(
+                        conversation=conv_text,
+                        summary=new_summary,
+                        memories=memories or "",
+                        character_name=self.character_name,
+                        character_id=self.character_id,
+                    )
+                except Exception as cexc:
+                    logger.warning("cognition evaluation failed: %s", cexc)
         except Exception as exc:
             logger.warning("conversation summarization failed: %s", exc)
         finally:

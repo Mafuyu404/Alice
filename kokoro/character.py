@@ -46,19 +46,25 @@ def load() -> dict[str, dict[str, str]]:
 def build_system_prompt(char: dict[str, str]) -> str:
     name = char.get("name", "助手")
     background = char.get("background", "")
-    relationship = char.get("relationship", "")
     example_dialogue = char.get("example_dialogue", "")
+    scene = char.get("scene", "")
     template = char.get("system_prompt_template", "")
     if not template:
         template = prompts.get("character_system.template", "")
+
+    scene_block = ""
+    if scene:
+        formatted_scene = scene.replace("{name}", name)
+        scene_block = f"\n【场景参考——仅作语气底色，不是话题来源】\n{formatted_scene}\n"
+
     base_prompt = template.format(
         name=name,
         description=char.get("description", ""),
         personality=char.get("personality", ""),
         background=background,
-        relationship=relationship,
         background_block=f"\n【背景】{background}" if background else "",
-        relationship_block=f"\n【关系】{relationship}" if relationship else "",
+        scene_block=scene_block,
+        relationship_block="",  # kept for backward compat with override templates
         example_dialogue_block=f"\n【对话示例】\n{example_dialogue}" if example_dialogue else "",
     )
     calibration = char.get("expression_calibration") or prompts.get("character_system.expression_calibration", "")
