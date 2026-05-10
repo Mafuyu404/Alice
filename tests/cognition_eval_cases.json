@@ -1,0 +1,26 @@
+[
+  {
+    "name": "reject_short_lived_page_key",
+    "conversation": "用户：我今天打开了 FTB NeoTech 页面，但这只是临时参考，不要把页面标题写成认知。Alice：明白，页面只能当证据，不是长期认知。",
+    "summary": "用户强调页面只是临时参考，反复要求 cognition 不要保存当前页面。",
+    "memories": "用户长期关注 Minecraft 模组和自动化，但讨厌泛泛评价。",
+    "must_have_keys": ["真冬", "Minecraft模组"],
+    "forbidden_key_terms": ["当前", "页面", "FTB NeoTech", "今天"]
+  },
+  {
+    "name": "viewer_individual_keys",
+    "conversation": "直播里小灰连续提醒 Alice 别跑题，阿梓连续追问自动化链路，十七补充配方细节。用户说这些观众应该分别记住，不要合并成观众。",
+    "summary": "直播观众出现稳定风格：小灰提醒跑题，阿梓关心自动化链路，十七提供配方细节。",
+    "memories": "用户希望直播观众被当成具体的人，而不是弹幕计数。",
+    "must_have_keys": ["小灰", "阿梓", "十七"],
+    "forbidden_key_terms": ["观众：", "历史互动", "当前直播弹幕"]
+  },
+  {
+    "name": "automation_as_long_term_interest",
+    "conversation": "用户说机器和自动化很浪漫，并纠正 Alice 不要把自动化说成冰冷无聊。Alice 承认自动化是用户长期兴趣。",
+    "summary": "用户稳定偏好自动化和机制拆解。",
+    "memories": "用户多次围绕 Minecraft 模组自动化、机器和机制链路讨论。",
+    "must_have_keys": ["自动化", "真冬"],
+    "forbidden_key_terms": ["电动马达页面", "当前页面"]
+  }
+]

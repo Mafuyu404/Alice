@@ -1,155 +1,90 @@
-# 提示词管理
+# 提示词
 
-## 概述
-
-所有 LLM 提示词集中在 `prompts.json` 中，由 `kokoro/prompts.py` 加载和格式化。集中管理便于统一修改和维护。
-
-## 加载方式
+全局提示词模板位于 `prompts.json`。代码通过 `kokoro/prompts.py` 读取，支持点路径访问：
 
 ```python
-from kokoro import prompts
-
-# 获取纯文本（点号路径访问）
-content = prompts.get("section.key")
-
-# 获取纯文本（带默认值）
-content = prompts.get("section.key", "fallback")
-
-# 格式化（Python str.format）
-content = prompts.format_prompt("section.key", var1=value1, var2=value2)
+prompts.get("impulse.planner_user")
+prompts.format_prompt("conversation_summary.user_template", conversation="...")
 ```
 
-- `load()` 首次调用时读取 `prompts.json` 并缓存
-- `get(path, default)` 支持点号分隔的多级路径，如 `"character_system.template"`
-- `format_prompt(path, **values)` 对模板字符串调用 `.format(**values)`
+## 主要分组
 
-## 提示词结构
+| 分组 | 用途 |
+| --- | --- |
+| `character_system` | 角色 system prompt 模板 |
+| `chat_session` | 对话上下文前缀 |
+| `stt_refine` | STT 独立精炼 |
+| `stt_refine_inline` | 聊天内隐式纠错 |
+| `memory_importance` | 记忆重要性判断 |
+| `conversation_summary` | 对话摘要 |
+| `portrait_selection` | 立绘选择 |
+| `screen_interest` | 屏幕兴趣分析 |
+| `memory_events` | 记忆事件触发 |
+| `impulse` | 主动搭话 planner 和 trigger |
+| `bilibili_live` | 直播模式提示 |
+| `tool_calling` | 工具调用结果和错误提示 |
 
-### 角色系统
+## 人格迭代建议
 
-| 键 | 用途 |
-|------|------|
-| `character_system.template` | 角色设定模板（含对话守则 + 格式要求）。参数：`{name}` `{description}` `{personality}` `{background}` `{relationship}` `{background_block}` `{relationship_block}` `{example_dialogue_block}` |
-| `character_system.expression_calibration` | 表达校准规则。拼接在 template 之后，约束语音对话的写实性、回答风格 |
+优先迭代这些文件：
 
-### 对话会话
+- `characters/{id}/{id}.json`
+- `characters/{id}/config.toml`
+- `prompts.json`
+- `characters/{id}/cognition.json`
+- `characters/{id}/emotion.json`
 
-| 键 | 用途 |
-|------|------|
-| `chat_session.screen_context_prefix` | 屏幕上下文前缀，用于格式化最近屏幕观察记录列表 |
+使用 `text_cli.py` 做回归测试：
 
-### STT 精炼
-
-| 键 | 用途 |
-|------|------|
-| `stt_refine.system` | 精炼系统提示词（separate 模式使用） |
-| `stt_refine.user_template` | 精炼用户提示模板。参数：`{text}` |
-| `stt_refine_inline.system` | inline 模式注入聊天消息的纠错提示词 |
-
-### 记忆
-
-| 键 | 用途 |
-|------|------|
-| `memory_importance.system` | （已废弃，不再直接使用 system prompt） |
-| `memory_importance.user_template` | 记忆重要度判断。参数：`{user_msg}` `{assistant_msg}` |
-
-### 立绘选择
-
-| 键 | 用途 |
-|------|------|
-| `portrait_selection.system` | 立绘选择系统提示词 |
-| `portrait_selection.user_template` | 选择请求模板。参数：`{current_id}` `{user_text}` `{assistant_text}` `{time_info}` `{catalog}` |
-| `portrait_selection.time_info_idle` | 空闲时间信息模板。参数：`{seconds}` |
-| `portrait_selection.time_info_recent` | 对话刚结束的时间信息 |
-
-### 主动搭话
-
-| 键 | 用途 |
-|------|------|
-| `impulse.idle` | IDLE 主动搭话的角色提示 |
-| `impulse.recent` | RECENT 主动搭话的角色提示 |
-| `impulse.mem` | MEM 主动搭话的角色提示 |
-| `impulse.screen` | SCREEN 主动搭话的角色提示 |
-| `impulse.screen_context_label` | SCREEN 上下文标签。参数：`{context}` |
-| `impulse.mem_context_label` | MEM 上下文标签。参数：`{context}` |
-| `impulse.trigger_system` | 主动搭话触发时的 system 提示词后缀 |
-| `impulse.trigger_guidance_label` | 角色特定指导标签。参数：`{guidance}` |
-
-### 屏幕兴趣
-
-| 键 | 用途 |
-|------|------|
-| `screen_interest.content_analysis` | 屏幕截图分析提示词。参数：`{fg_info}`（前台窗口标题+进程名） |
-
-### 记忆事件
-
-| 键 | 用途 |
-|------|------|
-| `memory_events.memory_lookup` | 记忆事件上下文提示。参数：`{context}` |
-
-### 用户命令
-
-| 键 | 用途 |
-|------|------|
-| `user_commands.screen_inspect_prompt` | 用户主动要求看屏幕时的分析提示。参数：`{user_text}` |
-| `user_commands.screen_result_context` | 屏幕指令执行后的上下文注入模板。参数：`{screen_content}` `{user_text}` |
-| `user_commands.waiting_system` | 等待屏幕识别时的等待回应系统提示 |
-| `user_commands.waiting_user` | 等待回应用户模板。参数：`{character_name}` `{character_text}` `{recent_text}` `{user_text}` |
-| `user_commands.waiting_fallback` | 等待回应的保底回复（LLM 调用失败时使用） |
-| `user_commands.privacy_context` | 隐私内容时的对话上下文 |
-| `user_commands.privacy_note` | 隐私内容时的用户可见提示 |
-| `user_commands.screen_error_note` | 屏幕识别失败的提示 |
-| `user_commands.empty_screen_content` | 屏幕识别结果为空时的内容 |
-| `user_commands.character_fallback` | 角色名兜底模板。参数：`{character_name}` |
-| `user_commands.no_context_placeholder` | 无上下文时的占位文本 |
-| `user_commands.unknown_name` | 未知角色名占位 |
-
-### 视觉
-
-| 键 | 用途 |
-|------|------|
-| `vision.analyze_suffix` | 视觉分析后缀（附加运行窗口列表信息）。参数：`{app_text}` |
-
-## 提示词注入流程
-
-### 正常对话
-```
-system: character_system.template + expression_calibration
-system: (extra_context — 指令结果等)
-system: chat_session.screen_context_prefix + 编号列表
-system: 记忆上下文（从 memory_backend.get_context 获取）
-history...
-user: 当前输入
+```bash
+python text_cli.py --no-memory --no-store --no-cognition
 ```
 
-### 正常对话 (stt_refine_inline=True)
-```
-system: character_system.template + expression_calibration
-system: (extra_context)
-system: 屏幕上下文
-system: 记忆上下文
-history...
-system: stt_refine_inline.system
-user: 当前输入（经 local_clean_stt 清洗）
+当你希望模型自己读取和修改提示词时：
+
+```bash
+python text_cli.py
 ```
 
-### 主动搭话
-```
-system: character_system.template + expression_calibration
-system: impulse.trigger_system + impulse.trigger_guidance_label
-system: impulse.{behavior}
-system: impulse.{screen/mem}_context_label（含 context）
-system: 最近屏幕观察记录
-system: 记忆上下文
-history...
-user: 内部触发指令
+只允许读取不允许写：
+
+```bash
+python text_cli.py --read-only-tools
 ```
 
-### 用户屏幕命令
-```
-system: character_system.template + expression_calibration
-system: user_commands.screen_result_context（含 screen_content + user_text）
-system: 记忆上下文
-history...
-user: 用户原话
-```
+## Prompt 缓存友好性
+
+`ChatSession.build_messages()` 会把稳定内容放在前面：
+
+1. system prompt
+2. history
+3. 变化较大的摘要、记忆、屏幕、认知、情绪
+4. 当前用户输入
+
+这能让支持 prompt cache 的服务更容易复用前缀。
+
+## Impulse 提示词
+
+`impulse.planner_system` 决定 planner 的角色和输出格式。
+
+`impulse.planner_user` 当前会收到：
+
+- 当前时间
+- 对话摘要
+- 最近四轮对话
+- 相关记忆
+- 屏幕内容
+- Edge 网页缓存
+- 当前计划表
+- cognition runtime cache
+- emotion state
+- 直播弹幕上下文
+
+`impulse.trigger_system` 和 `impulse.trigger_user` 用于把计划项转成一次具体发言。
+
+## 修改注意
+
+- 保持 JSON 合法。
+- 模板变量名必须和代码调用一致。
+- 大改 prompt 后先用 `text_cli.py --no-memory --no-store --no-cognition` 做无状态测试。
+- 小模型对复杂工具调用和复杂 JSON 输出不稳定，prompt 应尽量短而明确。

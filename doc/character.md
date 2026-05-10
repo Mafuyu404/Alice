@@ -1,103 +1,102 @@
 # 角色系统
 
-角色系统负责加载角色设定、生成 system prompt，并为 CLI 提供可选角色列表。
-
-## 文件布局
-
-当前运行时从 `characters/` 目录扫描角色：
+角色按目录组织：
 
 ```text
-characters/{character_id}/{character_id}.json
-characters/{character_id}/portrait/portrait.json
-characters/{character_id}/portrait/*.png
+characters/{character_id}/
+  {character_id}.json
+  config.toml
+  cognition.json
+  emotion.json
+  portrait/
+    portrait.json
+    *.png
 ```
+
+只有 `{character_id}.json` 是必需的。其他文件按功能需要存在。
+
+## 主角色文件
 
 示例：
 
-```text
-characters/penglai/penglai.json
-characters/penglai/portrait/portrait.json
-characters/penglai/portrait/penglai_seated_hands_lap_quiet_neutral_p01.png
-```
-
-目录名就是角色 ID。角色 JSON 文件名必须与目录名一致，否则 `kokoro.character.load()` 不会加载它。
-
-根目录的 `characters.json` 属于旧版聚合结构，当前主流程不再以它作为角色来源。
-
-## 角色 JSON
-
-最小结构：
-
 ```json
 {
-  "name": "蓬莱",
-  "description": "精致小巧的人偶少女。",
-  "personality": "高傲、嘴硬、直率。",
-  "background": "爱丽丝制作的人偶。",
-  "relationship": "和玩家是熟人。",
-  "greeting": "你在干什么？",
-  "example_dialogue": "玩家：你好。\n蓬莱：现在才想起来打招呼？",
-  "impulse guidance": "主动搭话时保持简短。",
-  "tts_voice_id": "English_PlayfulGirl"
+  "name": "爱丽丝·玛格特罗伊德",
+  "description": "...",
+  "personality": "...",
+  "background": "...",
+  "relationship": "...",
+  "speaking_style": "...",
+  "greeting": "..."
 }
 ```
 
-字段说明：
+`kokoro.character.build_system_prompt()` 会把这些字段组装成角色 system prompt。
 
-| 字段 | 用途 | 必需 |
-| --- | --- | --- |
-| `name` | 显示名，也用于对话中的角色名 | 是 |
-| `description` | 外貌和总体气质 | 否 |
-| `personality` | 说话方式、性格底色、行为边界 | 否 |
-| `background` | 背景设定 | 否 |
-| `relationship` | 与用户的关系 | 否 |
-| `greeting` | CLI 启动后显示的问候语 | 否 |
-| `example_dialogue` | 对话示例，帮助 LLM 校准语气 | 否 |
-| `impulse guidance` | 主动搭话额外约束 | 否 |
-| `tts_voice_id` | 当前角色的 TTS 声线覆盖 | 否 |
-| `system_prompt_template` | 覆盖全局角色 system prompt 模板 | 否 |
-| `expression_calibration` | 覆盖全局表达校准规则 | 否 |
+## 角色私有配置
 
-## System Prompt 构建
+`characters/{id}/config.toml` 可以覆盖部分运行配置，例如：
 
-`kokoro.character.build_system_prompt(char)` 的规则：
-
-1. 读取角色的 `name`、`description`、`personality`、`background`、`relationship`、`example_dialogue`。
-2. 如果角色定义了 `system_prompt_template`，优先使用角色自己的模板。
-3. 否则使用 `prompts.json` 中的 `character_system.template`。
-4. 再拼接表达校准规则：优先使用角色自己的 `expression_calibration`，否则使用 `character_system.expression_calibration`。
-
-因此，通用说话规范应放在 `prompts.json`，单个角色的特殊口吻或边界应放在角色自己的 JSON。
-
-## 加载和选择
-
-CLI 默认角色是 `alice`：
-
-```bash
-python cli.py
-python cli.py --character penglai
-python cli.py -c yuki
+```toml
+llm_model = "charglm-4"
+llm_url = "http://127.0.0.1:8000/v1"
 ```
 
-如果指定角色不存在，CLI 会打印当前可用角色列表。
+不要把 API key 放进角色目录。密钥应放在根目录 `config.json` 或环境变量。
 
-## 新增角色
+## Cognition
 
-1. 新建目录 `characters/{id}/`。
-2. 创建 `characters/{id}/{id}.json`。
-3. 如需立绘，新建 `characters/{id}/portrait/`。
-4. 放入 PNG 立绘。
-5. 创建 `characters/{id}/portrait/portrait.json`，格式见 [portrait.md](portrait.md)。
-6. 用 `python cli.py --character {id}` 测试。
+`cognition.json` 存完整认知条目：
 
-## 当前角色
+```json
+{
+  "entries": {
+    "用户": "对用户的长期认知",
+    "自己和用户的关系": "关系锚点"
+  }
+}
+```
 
-当前仓库中可加载的角色：
+运行时不会把整个文件塞进 prompt，而是维护一个 runtime cache，只注入相关子集。
 
-| ID | 角色文件 | 立绘数量 |
-| --- | --- | --- |
-| `alice` | `characters/alice/alice.json` | 96 |
-| `penglai` | `characters/penglai/penglai.json` | 7 |
-| `yuki` | `characters/yuki/yuki.json` | 0 |
+## Emotion
 
-`yuki` 目前有角色设定和空的立绘说明文件，但没有 PNG 立绘。
+`emotion.json` 存当前情绪：
+
+```json
+{
+  "tone": "平静但有一点担心",
+  "motivation": "想确认用户有没有休息"
+}
+```
+
+为空时不注入。
+
+## 立绘
+
+`portrait/portrait.json` 是数组：
+
+```json
+[
+  {
+    "id": "neutral.png",
+    "notes": "平静、正面、适合普通倾听"
+  }
+]
+```
+
+`id` 必须对应同目录下的图片文件。`notes` 会交给立绘选择模型。
+
+## 新建角色
+
+1. 创建目录 `characters/my_character/`
+2. 创建 `characters/my_character/my_character.json`
+3. 可选添加 `config.toml`
+4. 可选添加 `cognition.json` 和 `emotion.json`
+5. 可选添加 `portrait/`
+6. 启动：
+
+```bash
+python text_cli.py --character my_character
+python cli.py --character my_character
+```

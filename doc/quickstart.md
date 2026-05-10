@@ -1,90 +1,76 @@
 # 快速开始
 
-本文给出从安装到启动的最短路径。更完整的模块说明见同目录其他文档。
-
-## 环境要求
-
-- Windows
-- Python 3.11+
-- 可用的 LLM 后端，例如 Ollama、DeepSeek，或任意 OpenAI 兼容 `/v1/chat/completions` 服务
-- 麦克风，仅语音模式需要
-
-## 安装依赖
-
-按实际功能安装即可。
+## 1. 安装基础依赖
 
 ```bash
-# 基础
-pip install requests numpy
-
-# 语音识别
-pip install sounddevice sherpa-onnx
-
-# 立绘和屏幕感知
-pip install PySide6 pillow pywin32
-
-# TTS 后端，按需安装
-pip install websockets
-pip install cartesia
-
-# 长期记忆，按需安装
-pip install mem0ai fastembed
+pip install requests numpy websockets pywin32 pillow
 ```
 
-## 配置
+完整语音模式还需要：
 
-`config.toml` 是主配置文件，适合提交。`config.json` 用来放本地密钥，已被 `.gitignore` 忽略。
+```bash
+pip install sherpa-onnx sounddevice
+pip install PySide6
+```
 
-常用配置：
+按需要安装：
+
+```bash
+pip install mem0ai fastembed
+pip install cartesia
+```
+
+## 2. 配置 LLM
+
+本地 Ollama 示例：
 
 ```toml
 llm_url = "http://127.0.0.1:11434"
-llm_model = "deepseek-v4-flash"
-
-memory_backend = "mem0"      # mem0 / kokoromemo / none
-tts_backend = "minimax"      # minimax / cartesia
-
-portrait_overlay_host = "127.0.0.1"
-portrait_overlay_port = 17352
-portrait_decay_seconds = 60.0
-portrait_click_through = false
+llm_model = "qwen2.5:7b"
 ```
 
-`config.json` 示例：
+DeepSeek 示例：
+
+```toml
+llm_model = "deepseek-v4-flash"
+deepseek_api_key = ""
+```
+
+把密钥放在 `config.json`：
 
 ```json
 {
-  "deepseek_api_key": "sk-xxx",
-  "minimax_api_key": "sk-xxx",
-  "cartesia_api_key": "sk-xxx",
-  "vision_api_key": "sk-xxx",
-  "tts_voice_id": "xxx"
+  "deepseek_api_key": "sk-..."
 }
 ```
 
-部分密钥也可使用环境变量，例如 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY`。
+## 3. 运行精简文字模式
 
-## 角色
+用于人格测试和提示词迭代：
 
-角色来自 `characters/` 目录：
-
-```text
-characters/{id}/{id}.json
-characters/{id}/portrait/portrait.json
-characters/{id}/portrait/*.png
+```bash
+python text_cli.py
 ```
 
-当前仓库中已有：
+无记忆、无写入、无认知评估的干净测试：
 
-- `alice`：有角色设定和 96 张立绘
-- `penglai`：有角色设定和 7 张立绘
-- `yuki`：有角色设定，暂无 PNG 立绘
+```bash
+python text_cli.py --no-memory --no-store --no-cognition
+```
 
-根目录的 `characters.json` 是旧版聚合文件，当前主流程不再以它作为角色来源。
+关闭项目文件工具：
 
-## 启动 CLI
+```bash
+python text_cli.py --no-tools
+```
 
-完整语音模式：
+只允许读文件：
+
+```bash
+python text_cli.py --read-only-tools
+```
+
+## 4. 运行完整桌面模式
 
 ```bash
 python cli.py
@@ -92,50 +78,59 @@ python cli.py
 
 常用参数：
 
-| 参数 | 作用 |
-| --- | --- |
-| `--character alice` | 指定角色 ID，默认 `alice` |
-| `-c penglai` | `--character` 的短写 |
-| `--model qwen2.5:7b` | 临时指定对话模型 |
-| `--device 0` | 指定麦克风设备 ID |
-| `--list-devices` | 列出可用麦克风设备 |
-| `--no-tts` | 禁用语音输出 |
-| `--no-portrait` | 禁用立绘覆盖层 |
-| `--no-impulse` | 禁用主动搭话 |
-| `--no-screen-watch` | 禁用屏幕感知 |
-
-示例：
-
 ```bash
-python cli.py --character penglai --no-screen-watch
-python cli.py --character alice --model deepseek-v4-flash
+python cli.py --character alice
+python cli.py --model qwen2.5:7b
+python cli.py --no-tts
+python cli.py --no-portrait
+python cli.py --no-impulse
+python cli.py --no-screen-watch
+python cli.py --list-devices
 ```
 
-## 快速检查
+## 5. Edge 网页缓存
 
-确认 LLM 后端可用：
+先在 `config.toml` 开启：
 
-```bash
-curl http://127.0.0.1:11434/api/tags
+```toml
+[edge_page_cache]
+enabled = true
+interval_seconds = 15.0
 ```
 
-确认角色能被加载：
+用调试端口启动 Edge：
 
-```bash
-python -c "from kokoro import character; print(character.load().keys())"
+```powershell
+Start-Process msedge -ArgumentList "--remote-debugging-port=9222 --user-data-dir=D:\tmp\alice-edge-debug"
 ```
 
-确认立绘说明能对应到文件：
+缓存文件默认写入：
 
-```bash
-python -c "import json,pathlib; r=pathlib.Path('characters/penglai/portrait'); d=json.loads((r/'portrait.json').read_text(encoding='utf-8')); print(len(d), [x['id'] for x in d if not (r/x['id']).exists()])"
+```text
+data/edge_page_cache.json
 ```
 
-输出中的缺失列表应为空。
+## 6. 常见问题
 
-## 常见问题
+LLM 连接失败：
 
-- PowerShell 直接 `Get-Content` 中文文档出现乱码：通常是控制台代码页显示问题，文件本身仍是 UTF-8。
-- `Character 'xxx' not found`：检查是否存在 `characters/xxx/xxx.json`。
-- 立绘窗口没有出现：确认安装了 `PySide6`，并检查 `characters/{id}/portrait/portrait.json` 中的 `id` 是否对应 PNG。
-- 端口 17352 被占用：修改 `portrait_overlay_port`，或关闭已有立绘窗口。
+- 检查 `llm_url`
+- 检查模型服务是否启动
+- DeepSeek 模型需要 API key
+
+工具调用不稳定：
+
+- 小模型可能不稳定
+- 使用 `--no-tools`
+- 或减少 `[tool_calling].tools`
+
+TTS 太大或太小：
+
+```toml
+tts_volume = 0.5
+```
+
+Edge 缓存报 9222 连接失败：
+
+- 当前 Edge 不是用 `--remote-debugging-port=9222` 启动的
+- 关闭 Edge 后用上面的命令启动一个独立调试实例

@@ -1,187 +1,202 @@
-# 配置系统
+# 配置说明
 
-## 双层配置
+配置由两层组成：
 
-框架采用双层配置机制：`config.toml` 作为主配置文件，`config.json` 作为本地密钥覆盖文件（已加入 `.gitignore`）。
+- `config.toml`：主配置，可以提交。
+- `config.json`：本地密钥和私有覆盖，已加入 `.gitignore`。
 
-### 合并规则
+合并规则：`config.toml` 优先；当 TOML 中某项为空、缺失、空数组或空字典时，由 `config.json` 填充。
 
-`kokoro/config.py` 中的 `_merge_fallback(primary=toml, fallback=json)`：
+## LLM
 
-- TOML 中已存在的非空值优先（`None`、`""`、`[]`、`{}` 视为空）
-- JSON 填充 TOML 中缺失或为空的值
-- 嵌套字典递归合并
+```toml
+llm_url = "http://127.0.0.1:11434"
+llm_model = "deepseek-v4-flash"
+deepseek_api_key = ""
+charglm_api_key = ""
+local_model = "Qwen/Qwen2.5-1.5B-Instruct"
+```
 
-### 适用场景
+模型名以 `deepseek` 开头时自动走 DeepSeek API。其他模型默认走 `llm_url` 的 OpenAI 兼容接口。
 
-| 文件 | 内容 | 是否提交 git |
-|------|------|-------------|
-| `config.toml` | 通用配置：模型地址、后端选择、各模块参数 | 是 |
-| `config.json` | 敏感密钥：API Key、Voice ID | 否（已 gitignore） |
+## TTS
 
-## API 密钥
+```toml
+tts_backend = "minimax"
+tts_volume = 1.0
+```
+
+`tts_volume` 是播放音量倍率：
+
+- `0` 静音
+- `0.5` 一半音量
+- `1.0` 原始音量
+- `2.0` 最大倍率，可能削波失真
+
+MiniMax：
+
+```toml
+minimax_api_key = ""
+minimax_model = "speech-2.8-turbo"
+minimax_sample_rate = 32000
+minimax_tts_speed = 1.1
+minimax_tts_buffer_seconds = 0.3
+```
+
+Cartesia：
+
+```toml
+cartesia_api_key = ""
+tts_voice_id = ""
+tts_sample_rate = 24000
+```
+
+## STT
+
+```toml
+stt_model_dir = "models/stt"
+stt_refine_model = "qwen2.5:1.5b"
+stt_refine_mode = "inline"
+stt_refine_stable_seconds = 0.7
+stt_pool_tick_seconds = 0.05
+stt_refine_max_tokens = 128
+stt_skip_short_refine = true
+stt_skip_short_refine_max_chars = 18
+stt_pause_during_tts = true
+```
+
+`stt_refine_mode`：
+
+- `separate`：独立 LLM 精炼，质量较高但延迟更高。
+- `inline`：本地清洗 + 聊天 LLM 隐式纠错，延迟低。
+- `none`：只做本地清洗。
+
+## 人格层
+
+```toml
+cognition_model = ""
+cognition_eval_interval = 5
+emotion_model = ""
+```
+
+- `cognition_model` 为空时使用 `llm_model`。
+- `emotion_model` 为空时使用 `stt_refine_model`。
+- `cognition_eval_interval = 0` 可关闭周期性 cognition 评估。
+
+## 记忆
+
+```toml
+memory_backend = "mem0"
+kokoromo_url = "http://127.0.0.1:14514"
+kokoromo_dir = "D:/program/kokoromemo"
+```
+
+可选后端：
+
+- `none`
+- `mem0`
+- `kokoromemo`
+
+mem0 的 LLM、embedding、生命周期参数在 `[mem0.*]` 段配置。
+
+## 立绘和字幕
+
+```toml
+portrait_overlay_host = "127.0.0.1"
+portrait_overlay_port = 17352
+portrait_decision_interval = 0.0
+portrait_decay_seconds = 60.0
+portrait_click_through = false
+
+[subtitle]
+font_color = "#ffffff"
+font_size = 24
+subtitle_host = "127.0.0.1"
+subtitle_port = 17353
+```
+
+`cli.py --no-portrait` 会同时关闭立绘相关启动；字幕客户端也不会启动。
+
+## 视觉和屏幕监控
+
+```toml
+vision_backend = "dashscope"
+vision_model = "qwen-vl-plus"
+vision_api_key = ""
+vision_max_pixels = 921600
+
+[screen_watch]
+enabled = false
+watch_interval = 3.0
+interest_threshold = 70.0
+vision_timeout = 45
+```
+
+`screen_watch` 会周期性更新屏幕感知缓存。`impulse` 规划读取该缓存，不会额外触发截图。
+
+## Edge 页面缓存
+
+```toml
+[edge_page_cache]
+enabled = false
+interval_seconds = 15.0
+devtools_host = "127.0.0.1"
+devtools_port = 9222
+cache_file = "data/edge_page_cache.json"
+max_chars = 12000
+request_timeout = 3.0
+```
+
+开启后，后台线程通过 Edge DevTools Protocol 读取当前标签页正文，覆盖写入同一个 JSON 文件。`impulse` 规划会读取这个缓存。
+
+## 主动搭话
+
+```toml
+[impulse]
+enabled = true
+max_plans = 5
+min_plans = 1
+planning_model = "deepseek-v4-flash"
+screen_timeout = 45
+empty_plan_retry_seconds = 10.0
+log_plan_table = false
+```
+
+当前实现是计划表式 planner：每次空闲规划会增删改计划表，执行后重新规划。
+
+## Bilibili 直播
+
+```toml
+[bilibili_live]
+enabled = false
+live_mode = true
+room_id = 0
+buffer_max_age = 60.0
+reconnect_delay = 5.0
+```
+
+开启后，直播弹幕进入缓冲区。`impulse` 在空闲时根据弹幕上下文选择是否回复。
+
+## 工具调用
+
+```toml
+[tool_calling]
+enabled = true
+tools = ["look_at_screen", "search_memory", "get_current_time", "get_current_app", "save_to_memory"]
+max_iterations = 5
+tool_timeout = 45.0
+```
+
+完整 CLI 的工具包括屏幕、记忆、时间、前台窗口和保存记忆。`text_cli.py` 使用独立的项目内文件工具，不读取此工具列表。
+
+## 本地密钥示例
 
 ```json
 {
-  "deepseek_api_key": "sk-xxx",
-  "minimax_api_key": "sk-xxx",
-  "cartesia_api_key": "sk-xxx",
-  "vision_api_key": "sk-xxx",
-  "tts_voice_id": "xxx"
+  "deepseek_api_key": "sk-...",
+  "minimax_api_key": "...",
+  "cartesia_api_key": "...",
+  "vision_api_key": "...",
+  "tts_voice_id": "..."
 }
 ```
-
-部分密钥也可通过环境变量设置（`config.py` 优先读取环境变量）：
-- `DEEPSEEK_API_KEY` — DeepSeek API 密钥（环境变量优先级高于 config.json）
-- `DASHSCOPE_API_KEY` — 阿里云 DashScope 视觉 API 密钥
-
-## 配置加载流程
-
-1. `kokoro/config.py.load()` 首次调用时加载，后续返回全局缓存 `_CONFIG`
-2. 清理所有 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量，设置 `NO_PROXY=*`
-3. 读取 `config.toml`（使用 `tomllib`，Python 3.11+ 内置）
-4. 读取 `config.json`（密钥覆盖）
-5. 合并两层配置，存入全局变量
-6. 各辅助函数（`llm_url()`、`tts_backend()` 等）内部调用 `get()` → `load()`
-
-## 配置访问函数
-
-`kokoro/config.py` 提供以下辅助函数，封装了默认值和环境变量读取：
-
-| 函数 | 默认值 | 说明 |
-|------|--------|------|
-| `llm_url()` | `http://127.0.0.1:11434` | LLM 服务地址 |
-| `llm_model()` | `deepseek-v4-flash` | 默认对话模型 |
-| `memory_backend()` | `mem0` | 记忆后端类型 |
-| `tts_backend()` | `minimax` | TTS 后端选择 |
-| `tts_sample_rate()` | `24000` | Cartesia TTS 采样率 |
-| `tts_voice_id()` | `""` | Cartesia 语音 ID |
-| `cartesia_api_key()` | `""` | Cartesia API 密钥 |
-| `minimax_api_key()` | `""` | MiniMax API 密钥 |
-| `minimax_model()` | `speech-2.8-turbo` | MiniMax 语音模型 |
-| `kokoromo_url()` | `""` | KokoroMemo 服务地址 |
-| `deepseek_api_key()` | 环境变量 > config.json | DeepSeek API 密钥 |
-| `charglm_api_key()` | config.json | 智谱 CharGLM API 密钥 |
-| `deepseek_url()` | `https://api.deepseek.com` | DeepSeek API 地址 |
-| `is_deepseek_model(m)` | — | 模型名是否以 `deepseek` 开头 |
-| `vision_max_pixels()` | `921600` | 截图缩放上限像素数，`0` 禁用缩放 |
-| `stt_refine_model()` | `qwen2.5:1.5b` | STT 精炼用模型 |
-| `stt_refine_mode()` | `separate` | 精炼模式 |
-| `stt_refine_stable_seconds()` | `1.5` | 静默判定时间（秒） |
-| `stt_pool_tick_seconds()` | `0.05` | 池轮询间隔（秒） |
-| `stt_refine_max_tokens()` | `128` | 精炼 LLM 最大 token |
-| `stt_skip_short_refine()` | `True` | 是否跳过短文本精炼 |
-| `stt_skip_short_refine_max_chars()` | `18` | 跳过精炼的最大字符数 |
-| `stt_pause_during_tts()` | `False` | TTS 播放时暂停 STT |
-| `api_base()` | 动态计算 | LLM API base URL（含 `/v1`） |
-
-## 配置项总览
-
-所有配置项及详细注释直接写在 `config.toml` 中。以下是各模块包含的主要配置组：
-
-### LLM
-
-`llm_url` `llm_model` `deepseek_api_key` `local_model`
-
-- LLM 地址兼容 OpenAI/Ollama 格式，程序自动补 `/v1`
-- 模型名以 `deepseek` 开头时自动路由到 DeepSeek 云端 API（`api.deepseek.com`）
-- `local_model` 是 HuggingFace 模型 ID，作为 LLM 不可用时的后备（`local_llm.py` 使用）
-
-### TTS
-
-`tts_backend` — `"minimax"` 或 `"cartesia"`，切换后自动加载对应后端模块（`kokoro/tts_{backend}.py`）
-
-#### Cartesia
-
-`cartesia_api_key` `tts_voice_id` `tts_sample_rate`（默认 24000）
-
-#### MiniMax
-
-`minimax_api_key` `minimax_model`（默认 `speech-2.8-turbo`） `minimax_sample_rate`（默认 32000） `minimax_tts_speed` `minimax_tts_buffer_seconds`
-
-#### 流式控制（两个后端共用）
-
-`tts_stream_chunk_chars`（累积字符阈值，默认 28） `tts_stream_sentence_min_chars`（触发刷新的最小字符数，默认 8）
-
-### STT
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `stt_model_dir` | `models/stt` | 模型存放目录 |
-| `stt_refine_model` | `qwen2.5:1.5b` | 精炼用小模型 |
-| `stt_refine_mode` | `separate` | 精炼模式：`separate` / `inline` / `none` |
-| `stt_refine_stable_seconds` | `1.0` | 静默判定时间（秒） |
-| `stt_pool_tick_seconds` | `0.05` | 池轮询间隔（秒） |
-| `stt_refine_max_tokens` | `128` | 精炼 LLM 最大输出 token |
-| `stt_skip_short_refine` | `true` | 是否跳过短文本精炼 |
-| `stt_skip_short_refine_max_chars` | `18` | 跳过精炼的最大字符数 |
-| `stt_pause_during_tts` | `true` | TTS 播放时暂停麦克风 |
-
-`stt_refine_mode` 三种模式：
-
-- **`separate`**（默认）：独立 LLM 调用精炼，质量最高但增加延迟（精炼 LLM 串行阻塞）
-- **`inline`**：本地正则预清洗（`local_clean_stt()`）+ 聊天 LLM 隐式纠错，一次聊天调用完成，延迟最低
-- **`none`**：仅 `local_clean_stt()` 正则清洗，不调用任何 LLM 精炼，零 LLM 开销
-
-### 记忆
-
-`memory_backend` — `"none"`（禁用）`"mem0"`（本地向量库）`"kokoromemo"`（外部服务）
-
-mem0 子配置：
-
-- `[mem0.llm]`：`provider` `base_url` `model` — 记忆提取/摘要用 LLM
-- `[mem0.embedder]`：`provider` `model` `embedding_dims` — 向量嵌入模型
-- `[mem0.lifecycle]`：`importance_mode` `search_threshold` `search_top_k` `compress_interval` `max_memories_per_user` `importance_min_len`
-
-### 立绘
-
-`portrait_overlay_host` `portrait_overlay_port` `portrait_decision_interval` `portrait_decay_seconds` `portrait_debug_overlay` `portrait_click_through`
-
-详见 [portrait.md](portrait.md)。
-
-### 视觉 / 屏幕识别
-
-`vision_backend` — `"dashscope"` 或 `"ollama"`
-`vision_model` — DashScope 默认 `qwen-vl-plus`，Ollama 默认 `qwen2.5vl:3b`
-`vision_api_key`
-
-### 主动搭话调度器
-
-全局 `[impulse]` + 四类行为子配置：`[impulse.idle]` `[impulse.recent]` `[impulse.mem]` `[impulse.screen]`
-
-详见 [impulse.md](impulse.md)。
-
-### 屏幕监控 + 记忆事件
-
-`[screen_watch]` 控制周期性截图分析的参数（`watch_interval` `interest_threshold` `vision_timeout`）。
-
-记忆事件配置位于 `[impulse]` 下：`memory_events_enabled` `memory_check_interval` `memory_cooldown_seconds` `memory_date_score` `memory_lookup_score` `memory_lookup_query` `[[impulse.memory_date_events]]`。
-
-详见 [screen_interest.md](screen_interest.md) 和 [memory.md](memory.md)。
-
-### 工具调用 (Tool Calling)
-
-启用后，LLM 可以调用预定义的工具（查看屏幕、搜索记忆、获取时间等），替代旧版正则命令匹配。
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `enabled` | `true` | 总开关。关闭后使用旧版正则命令匹配 |
-| `tools` | 全部 5 个工具 | 启用的工具列表 |
-| `max_iterations` | `5` | 单次对话中工具调用的最大循环次数，防止死循环 |
-| `tool_timeout` | `45.0` | 单次工具调用的超时时间（秒） |
-
-可用工具：
-- `look_at_screen` — 截取屏幕截图并分析
-- `search_memory` — 搜索长期记忆
-- `get_current_time` — 获取当前日期时间
-- `get_current_app` — 获取前台窗口信息
-- `save_to_memory` — 保存信息到长期记忆
-
-**注意事项：**
-- 工具调用会增加 token 用量：每个请求携带工具 schema（约 500-800 tokens），每次工具调用会额外增加一轮 LLM 请求。`max_iterations` 越大，潜在开销越高。
-- 小模型（≤3B）对 function calling 支持不稳定。`qwen2.5:1.5b` 容易出现误触发或参数格式错误，建议降级为 `--no-tools` 或只启用 `get_current_time`。
-- 可通过 `config.toml` 中的 `[tool_calling]` 块调整，或 CLI 启动时用 `--no-tools` 临时关闭。
-
-### 其他
-
-`kokoromo_url` `kokoromo_dir` — KokoroMemo 外部记忆服务地址和可执行文件路径。仅 `memory_backend = "kokoromemo"` 时使用。
