@@ -63,12 +63,14 @@ class AgentConfig:
         max_tool_iterations: int = 5,
         tool_timeout: float = 45.0,
         on_tool_call: Optional[Callable[[str, dict], None]] = None,
+        subtitle_client=None,
     ):
         self.tools = tools
         self.tool_registry = tool_registry
         self.max_tool_iterations = max_tool_iterations
         self.tool_timeout = tool_timeout
         self.on_tool_call = on_tool_call
+        self.subtitle_client = subtitle_client
 
 
 class AgentResult:
@@ -102,6 +104,7 @@ def agent_chat(
     Returns AgentResult with .reply, .cancelled, .tool_calls_made.
     Also supports tuple unpacking: reply, cancelled = result
     """
+    _subtitle = getattr(agent_config, "subtitle_client", None) if agent_config else None
     if agent_config is None or not agent_config.tools or agent_config.tool_registry is None:
         reply, cancelled = _simple_stream(
             messages, model,
@@ -111,6 +114,7 @@ def agent_chat(
             api_base_url=api_base_url,
             api_key=api_key,
             usage_callback=usage_callback,
+            subtitle_client=_subtitle,
         )
         return AgentResult(reply=reply, cancelled=cancelled, tool_calls_made=0)
 
@@ -127,6 +131,7 @@ def agent_chat(
         api_base_url=api_base_url,
         api_key=api_key,
         usage_callback=usage_callback,
+        subtitle_client=_subtitle,
         **tool_context,
     )
 
@@ -144,6 +149,7 @@ def _agent_chat_impl(
     api_base_url: str | None,
     api_key: str | None,
     usage_callback=None,
+    subtitle_client=None,
     **tool_context,
 ) -> AgentResult:
     """Stream LLM response with agent loop using raw SSE parsing."""
@@ -202,6 +208,8 @@ def _agent_chat_impl(
                     iteration_reply += content
                     if tts_engine:
                         tts_engine.push(content)
+                    if subtitle_client:
+                        subtitle_client.push_text(content, mode="append")
 
                 if chunk.tool_call_deltas:
                     had_tool_calls = True
@@ -272,6 +280,7 @@ def _simple_stream(
     api_base_url: str | None = None,
     api_key: str | None = None,
     usage_callback=None,
+    subtitle_client=None,
 ) -> tuple[str, bool]:
     """Fallback: plain streaming without tools."""
     reply = ""
@@ -292,4 +301,6 @@ def _simple_stream(
         reply += content
         if tts_engine:
             tts_engine.push(content)
+        if subtitle_client:
+            subtitle_client.push_text(content, mode="append")
     return _strip_parens(reply), False

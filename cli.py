@@ -29,10 +29,13 @@ from kokoro import pool as pool_mod
 from kokoro import impulse as impulse_mod
 from kokoro import screen_interest
 from kokoro import state_machine as sm
+from kokoro import subtitle as subtitle_mod
 from kokoro import stt as stt_mod
 from kokoro import tts as tts_mod
 from kokoro import user_commands
 from kokoro import agent_loop
+from kokoro import bilibili_live as bilibili_live_mod
+from kokoro import edge_cache as edge_cache_mod
 from kokoro import token_usage
 from kokoro import tool_registry as tool_registry_mod
 
@@ -111,6 +114,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no-impulse", action="store_true", help="Disable impulse planner")
     parser.add_argument("--no-screen-watch", action="store_true", help="Disable screen context watcher")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
+    parser.add_argument("--bilibili-room", type=int, default=None, help="Bilibili live room ID (overrides config)")
     return parser.parse_args()
 
 
@@ -129,6 +133,7 @@ def chat_stream(
     agent_config: agent_loop.AgentConfig | None = None,
     tool_context: dict | None = None,
     usage_callback=None,
+    subtitle_client=None,
 ) -> tuple[str, bool]:
     """Stream LLM response. Returns (reply_text, was_cancelled)."""
     print(f"\n{char_name}: ", end="", flush=True)
@@ -191,6 +196,8 @@ def chat_stream(
         reply += content
         if tts_engine:
             tts_engine.push(content)
+        if subtitle_client:
+            subtitle_client.push_text(content, mode="append")
 
     if cancel_event and cancel_event.is_set():
         cancelled = True
@@ -268,6 +275,21 @@ def main() -> None:
         except Exception as exc:
             print(f"  [cli] Portrait overlay init failed: {exc}")
 
+    # ── subtitle overlay (tied to portrait on/off) ────────────────────────────
+    _subtitle_client: subtitle_mod.SubtitleOverlayClient | None = None
+    _stt_subtitle_client: subtitle_mod.SubtitleOverlayClient | None = None
+    if not args.no_portrait:
+        _subtitle_host = str(cfg.get("subtitle", {}).get("subtitle_host", "127.0.0.1"))
+        _subtitle_port = int(cfg.get("subtitle", {}).get("subtitle_port", 17353))
+        _subtitle_client = subtitle_mod.SubtitleOverlayClient(host=_subtitle_host, port=_subtitle_port)
+        _subtitle_client.start()
+
+        # STT subtitle overlay (separate instance, dark blue)
+        _stt_host = str(cfg.get("subtitle_stt", {}).get("subtitle_host", "127.0.0.1"))
+        _stt_port = int(cfg.get("subtitle_stt", {}).get("subtitle_port", 17354))
+        _stt_subtitle_client = subtitle_mod.SubtitleOverlayClient(host=_stt_host, port=_stt_port)
+        _stt_subtitle_client.start(config_prefix="subtitle_stt")
+
 
     # ── tool calling ──────────────────────────────────────────────────────────
     _agent_config: agent_loop.AgentConfig | None = None
@@ -287,6 +309,7 @@ def main() -> None:
                 tool_registry=_registry,
                 max_tool_iterations=_max_iter,
                 tool_timeout=_tool_timeout,
+                subtitle_client=_subtitle_client,
             )
             print(f"  [tool] Enabled: {', '.join(s['function']['name'] for s in _tool_schemas)}")
         else:
@@ -302,10 +325,26 @@ def main() -> None:
     screen_watch_interval = max(10.0, float(screen_cfg.get("watch_interval", 45.0)))
     screen_interest_threshold = max(0.0, float(screen_cfg.get("interest_threshold", 70.0)))
     screen_vision_timeout = max(5, int(screen_cfg.get("vision_timeout", 45)))
+    edge_cache_config = edge_cache_mod.config_from_dict(CONFIG)
     memory_detector = memory_events.from_config(CONFIG, memory_backend, session.character_id)
 
     # ── shared cancel token for barge-in ──────────────────────────────────────
     _current_cancel: list[threading.Event | None] = [None]
+
+    # ── Bilibili live manager (connection only, impulse drives replies) ────
+    _bilibili_manager: bilibili_live_mod.BilibiliLiveManager | None = None
+    _bilibili_room_id_raw = args.bilibili_room if args.bilibili_room is not None else cfg.bilibili_live_room_id()
+    _bilibili_enabled = cfg.bilibili_live_enabled() and _bilibili_room_id_raw > 0
+    _bilibili_live_mode = cfg.bilibili_live_live_mode()
+    if _bilibili_enabled:
+        _bilibili_manager = bilibili_live_mod.BilibiliLiveManager(
+            room_id=_bilibili_room_id_raw,
+            buffer_max_age=cfg.bilibili_live_buffer_max_age(),
+        )
+        _bilibili_manager.start()
+    elif args.bilibili_room is not None and _bilibili_room_id_raw > 0:
+        print(f"  [bilibili] Room {_bilibili_room_id_raw} set but bilibili_live.enabled = false in config")
+        _bilibili_enabled = False
 
     # ── impulse planner ─────────────────────────────────────────────────────
     _stt_refine_mode = cfg.stt_refine_mode()
@@ -325,17 +364,22 @@ def main() -> None:
             memory_backend=memory_backend,
             chat_stream_fn=chat_stream,
             stt_refine_inline=_stt_refine_inline,
+            bilibili_manager=_bilibili_manager,
+            live_mode=_bilibili_live_mode,
+            subtitle_client=_subtitle_client,
         )
     else:
         _impulse = None
         machine.set_proactive_state(sm.ProactiveState.DISABLED)
     # ── conversation handler (called by pool when STT text is ready) ───────
     def on_refined(text: str) -> None:
+        if _stt_subtitle_client:
+            _stt_subtitle_client.clear()
+        display_user(text)
         if _impulse is not None:
             _impulse.reset()
-        display_user(text)
 
-        # Emit state transition: LISTENING → THINKING
+        # Emit state transition: → THINKING
         if not machine.emit(sm.SystemEvent.STT_REFINED):
             # 状态机拒绝 — 系统正忙(THINKING/SPEAKING)，barge-in 让路
             if machine.is_busy:
@@ -346,7 +390,11 @@ def main() -> None:
                     tts_engine.interrupt()
                 machine.emit(sm.SystemEvent.USER_SPEECH_START)
                 machine.set_stt_state(sm.STTState.LISTENING)
-            return
+                # 重试：机器已进入 LISTENING，STT_REFINED 应该可以通过了
+                if not machine.emit(sm.SystemEvent.STT_REFINED):
+                    return
+            else:
+                return
 
         # 恢复 TTS 连接（中断后 WS 已死，prepare 内会自动重建）
         if tts_engine:
@@ -417,10 +465,25 @@ def main() -> None:
                             print(f"\n  [screen] command {label}: {result.user_visible_note}")
                             command_context = result.context or result.user_visible_note
 
+            # Live mode: inject co-streaming context so the AI knows user speech
+            # might be directed at viewers, not necessarily at the AI.
+            if _bilibili_enabled and _bilibili_live_mode and command_context:
+                command_context = (
+                    "【双人直播中】我们在同一个直播间直播。"
+                    "我刚才说的话可能是对观众说的、在解说、或者自言自语，不一定是直接问你。"
+                    "你可以自己判断是否要接话。\n\n"
+                ) + command_context
+            elif _bilibili_enabled and _bilibili_live_mode:
+                command_context = (
+                    "【双人直播中】我们在同一个直播间直播。"
+                    "我刚才说的话可能是对观众说的、在解说、或者自言自语，不一定是直接问你。"
+                    "你可以自己判断是否要接话。"
+                )
+
             messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=_stt_refine_inline, inject_memory=not _tool_enabled)
 
             try:
-                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id))
+                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id), subtitle_client=_subtitle_client)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                 machine.emit_error("llm_connection")
@@ -458,6 +521,10 @@ def main() -> None:
             machine.set_tts_state(sm.TTSState.IDLE)
             machine.emit(sm.SystemEvent.TTS_DONE)
             machine.reset_error_count()
+
+            # Clear subtitle
+            if _subtitle_client:
+                _subtitle_client.clear()
 
             # Trigger impulse planning after conversation ends
             if _impulse is not None:
@@ -506,7 +573,10 @@ def main() -> None:
     print(f"  Impulse: {_use_impulse}")
     print(f"  Tool calling: {_tool_enabled}")
     print(f"  Screen watch: {screen_watch_enabled}")
+    print(f"  Edge page cache: {edge_cache_config.enabled}")
     print(f"  Memory events: {memory_detector.config.enabled}")
+    print(f"  Bilibili live: {_bilibili_enabled and _bilibili_manager is not None} (live_mode={_bilibili_live_mode})")
+    print(f"  Subtitle: {_subtitle_client is not None} | STT subtitle: {_stt_subtitle_client is not None}")
     print("  Ctrl+C to stop")
     print("=" * 50)
 
@@ -548,6 +618,8 @@ def main() -> None:
                     tts_was_playing = False
                     stt_stream = recognizer.create_stream()
                     last_partial = ""
+                    if _stt_subtitle_client:
+                        _stt_subtitle_client.clear()
                     continue
 
                 mono = stt_mod.denoise(chunk[:, 0])
@@ -559,6 +631,8 @@ def main() -> None:
                     if text:
                         pool.add_chunk(text)
                         if text != last_partial:
+                            if _stt_subtitle_client:
+                                _stt_subtitle_client.push_text(text, mode="set")
                             sys.stdout.write(f"\r\033[K  [STT] {text}")
                             sys.stdout.flush()
                             last_partial = text
@@ -576,6 +650,8 @@ def main() -> None:
                             # 不清空流，让新文本"爱丽丝"自然延续"晚上好"成为"晚上好爱丽丝"
                             pass
                         else:
+                            if _stt_subtitle_client:
+                                _stt_subtitle_client.clear()
                             recognizer.reset(stt_stream)
                             last_partial = ""
                             machine.emit(sm.SystemEvent.USER_SPEECH_END)
@@ -593,31 +669,80 @@ def main() -> None:
 
     stt_thread = threading.Thread(target=stt_worker, daemon=True)
     stt_thread.start()
-    def screen_watch_worker() -> None:
+    def screen_cache_worker() -> None:
+        """Continuous screen capture -> analyze -> cache loop.
+
+        Runs back-to-back.  watch_interval is the *minimum* delay between
+        captures; if analysis takes longer no extra wait is added.
+        """
+        from kokoro.screen_interest import get_cache
+        sc = get_cache()
         while not machine.is_shutting_down:
-            time.sleep(screen_watch_interval)
             if not screen_watch_enabled:
-                continue
-            if machine.is_busy:
+                time.sleep(1.0)
                 continue
 
+            t0 = time.perf_counter()
             try:
                 result = screen_interest.analyze(timeout=screen_vision_timeout)
             except Exception as exc:
                 print(f"\n[screen watch error] {type(exc).__name__}: {exc}")
+                time.sleep(5.0)
                 continue
 
-            # Discard result if system state changed during the vision call
-            if machine.is_busy or not machine.can_start_conversation:
-                continue
+            # Always update cache (impulse reads from here)
+            sc.put(result)
 
-            if result.score >= screen_interest_threshold:
+            # Add high-interest results to session context
+            if not machine.is_busy and result.score >= screen_interest_threshold:
                 context = result.content or result.reason
                 session.add_screen_context(context)
                 print(f"\n  [screen] interest={result.score:.1f} {context.split(chr(10))[0]}")
 
-    screen_thread = threading.Thread(target=screen_watch_worker, daemon=True)
+            # Head-to-tail: minimum interval between captures
+            elapsed = time.perf_counter() - t0
+            if elapsed < screen_watch_interval:
+                time.sleep(screen_watch_interval - elapsed)
+
+    screen_thread = threading.Thread(target=screen_cache_worker, daemon=True)
     screen_thread.start()
+
+    def edge_page_cache_worker() -> None:
+        last_cache_signature = ""
+        last_error_message = ""
+        while not machine.is_shutting_down:
+            if not edge_cache_config.enabled:
+                time.sleep(1.0)
+                continue
+
+            t0 = time.perf_counter()
+            try:
+                payload = edge_cache_mod.capture_and_save(edge_cache_config)
+                last_error_message = ""
+                title = payload.get("tab", {}).get("title") or "(untitled)"
+                tab = payload.get("tab", {})
+                signature = "|".join([
+                    str(tab.get("url") or ""),
+                    str(tab.get("title") or ""),
+                    str(payload.get("text") or "")[:500],
+                ])
+                if signature != last_cache_signature:
+                    last_cache_signature = signature
+                    print(f"\n  [edge] cached page: {str(title)[:80]}")
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                edge_cache_mod.write_error_cache(edge_cache_config.cache_file, message)
+                if message != last_error_message:
+                    last_error_message = message
+                    last_cache_signature = ""
+                    print(f"\n[edge cache error] {message}")
+
+            elapsed = time.perf_counter() - t0
+            if elapsed < edge_cache_config.interval_seconds:
+                time.sleep(edge_cache_config.interval_seconds - elapsed)
+
+    edge_cache_thread = threading.Thread(target=edge_page_cache_worker, daemon=True)
+    edge_cache_thread.start()
 
     # ── memory event worker ────────────────────────────────────────────────
     def memory_event_worker() -> None:
@@ -652,6 +777,10 @@ def main() -> None:
     error_thread = threading.Thread(target=error_recovery_worker, daemon=True)
     error_thread.start()
 
+    # ── first impulse trigger (system is idle, start planning) ────────────
+    if _use_impulse:
+        _impulse.on_conversation_end()
+
     # ── main loop ──────────────────────────────────────────────────────────
     try:
         while not machine.is_shutting_down:
@@ -661,12 +790,18 @@ def main() -> None:
     finally:
         machine.emit(sm.SystemEvent.SHUTDOWN)
         pool.stop()
+        if _bilibili_manager is not None:
+            _bilibili_manager.stop()
         print()
         print(token_usage.summary())
         if portrait_worker:
             portrait_worker.stop()
         if portrait_client:
             portrait_client.shutdown()
+        if _subtitle_client:
+            _subtitle_client.shutdown()
+        if _stt_subtitle_client:
+            _stt_subtitle_client.shutdown()
         if tts_engine:
             tts_engine.close()
 

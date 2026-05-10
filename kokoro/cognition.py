@@ -1,4 +1,4 @@
-"""Cognition layer — evolving perceptions about people, relationships, and things.
+"""Cognition layer -- evolving perceptions about people, relationships, and things.
 
 Architecture
 ------------
@@ -30,11 +30,7 @@ _PRIORITY_KEYS = {"自己", "自己和"}
 
 
 class CognitionStore:
-    """全量认知数据 + 运行时缓存的管理器。
-
-    - ``_entries``: 全量数据 (keyword → text)，只在 summarization 时更新
-    - ``_cache``:   运行时缓存，每次对话后从全量中筛选当前相关条目
-    """
+    """Full perception data + runtime cache manager."""
 
     def __init__(self, character_id: str, character_data: dict | None = None):
         self.character_id = character_id
@@ -43,28 +39,18 @@ class CognitionStore:
         self._cache: dict[str, str] = {}
         self._load_or_seed(character_data)
 
-    # ── public API ──────────────────────────────────────────────────────────
+    # -- public API ---------------------------------------------------------
 
     def refresh_cache(self, user_text: str, assistant_text: str = "") -> None:
-        """After each conversation turn, select relevant entries by keyword matching.
-
-        No LLM involved — pure substring matching against entry keys.
-        Priority entries (self-perception, relationship anchors) are always kept.
-        """
         combined = user_text + " " + assistant_text
         matched: dict[str, str] = {}
-
         for key, value in self._entries.items():
             if combined and key in combined:
                 matched[key] = value
-
-        # Always carry priority entries
         _ensure(self._entries, matched, _PRIORITY_KEYS)
-        # Everything whose key implies a relationship perception
         _ensure(self._entries, matched, {
             k for k in self._entries if "和" in k or "关系" in k
         })
-
         self._cache = matched
 
     def evaluate(
@@ -75,11 +61,6 @@ class CognitionStore:
         character_name: str,
         character_id: str,
     ) -> None:
-        """Full evaluation during context summarisation.
-
-        Calls an LLM to reconcile existing entries with new conversation,
-        then persists the result and refreshes the cache.
-        """
         from kokoro import config as cfg
         from kokoro import prompts as _prompts
         from kokoro import token_usage
@@ -101,12 +82,16 @@ class CognitionStore:
             "1. 根据新对话修正已有认知，删除已被新信息覆盖的过时条目\n"
             "2. 对新话题建立新条目\n"
             "3. 【最重要】重点关注对人的认知、对自身与他人关系的认知\n"
-            "4. 条目数量不限，有多少写多少，不需要刻意合并或精简\n\n"
-            "输出格式为JSON：\n"
+            '4. 如果对话中有频繁互动的观众，建立对他们的认知——'
+            '他们是什么样的人、有什么兴趣、说话风格如何；'
+            '不要只记录"发了X条弹幕"这类流水账，要提炼他们的性格和特点\n'
+            "5. 对只有一两条弹幕的过客不需要建立条目，避免认知膨胀\n"
+            "6. 条目数量不限，但每条都要有实质内容；宁可少，不要浅\n\n"
+            '输出格式为JSON：\n'
             '{"entries": {"关键词": "认知描述", ...}}'
         )
 
-        model = cfg.cognition_model() or cfg.stt_refine_model()
+        model = cfg.cognition_model() or cfg.llm_model()
         url = cfg.llm_url()
         api_key = ""
         openai_compatible = False
@@ -118,8 +103,8 @@ class CognitionStore:
         headers = {"Content-Type": "application/json"}
         if openai_compatible:
             headers["Authorization"] = f"Bearer {api_key}"
-            base_url = url.rstrip("/")
             import re as _re
+            base_url = url.rstrip("/")
             if not _re.search(r"/v\d+$", base_url):
                 base_url += "/v1"
             api_url = f"{base_url}/chat/completions"
@@ -185,10 +170,6 @@ class CognitionStore:
             logger.warning("cognition evaluation failed: %s", exc)
 
     def get_context(self) -> str:
-        """Format cache entries as a system-context block for prompt injection.
-
-        Returns an empty string when cache is empty.
-        """
         if not self._cache:
             return ""
         lines: list[str] = []
@@ -196,7 +177,7 @@ class CognitionStore:
             lines.append(f"- {key}：{value}")
         return "【认知】\n" + "\n".join(lines)
 
-    # ── persistence ─────────────────────────────────────────────────────────
+    # -- persistence --------------------------------------------------------
 
     def _load_or_seed(self, character_data: dict | None) -> None:
         if os.path.exists(self._path):
@@ -228,13 +209,10 @@ class CognitionStore:
             logger.warning("failed to save cognition: %s", exc)
 
     def _seed(self, data: dict) -> None:
-        """Initial population from character definition (本心层 → 认知层 migration)."""
         seeds: dict[str, str] = {}
-
         rel = data.get("relationship", "")
         if rel and "住在一起" in rel:
             seeds["自己和%s的关系" % data.get("name", "对方")] = rel
-
         bg = data.get("background", "")
         if bg:
             self_parts = []
@@ -243,7 +221,6 @@ class CognitionStore:
                     self_parts.append(phrase)
             if self_parts:
                 seeds["自己"] = "，".join(self_parts) + "。"
-
         pf = data.get("personality", "")
         if pf:
             self_parts = []
@@ -254,17 +231,12 @@ class CognitionStore:
                 existing = seeds.get("自己", "")
                 extra = "，".join(self_parts) + "。"
                 seeds["自己"] = (existing + extra) if existing else extra
-
         self._entries = seeds if seeds else {}
 
     @staticmethod
     def _parse_json_entries(text: str) -> dict[str, str] | None:
-        """Parse LLM JSON output, trying several recovery strategies."""
         import re as _re
-
         stripped = text.strip()
-
-        # Strategy 1: markdown code block
         m = _re.search(r"```(?:json)?\s*\n?(.*?)```", stripped, _re.DOTALL)
         if m:
             try:
@@ -273,18 +245,14 @@ class CognitionStore:
                     return _validate_entries(data["entries"])
             except json.JSONDecodeError:
                 pass
-
-        # Strategy 2: raw JSON
         try:
             data = json.loads(stripped)
             if isinstance(data, dict):
                 if "entries" in data:
                     return _validate_entries(data["entries"])
-                # Maybe the whole object IS entries
                 return _validate_entries(data)
         except json.JSONDecodeError:
             pass
-
         logger.debug("cognition: could not parse LLM response: %s", text[:200])
         return None
 

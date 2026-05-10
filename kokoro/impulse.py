@@ -17,6 +17,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 
+from kokoro import edge_cache
 from kokoro import prompts as _prompts
 from kokoro import screen_interest
 
@@ -47,31 +48,71 @@ class PlanTable:
             return "（空）"
         lines = []
         for i, item in enumerate(self.items):
-            lines.append(f"{i + 1}. {item.delay_seconds:.0f}秒后：{item.action}")
+            lines.append(f"{i}. [{item.delay_seconds:.0f}s] {item.action}")
         return "\n".join(lines)
 
-    @classmethod
-    def from_llm_response(cls, text: str, max_capacity: int = 5, min_capacity: int = 1) -> "PlanTable":
+    def pop_executed(self, index: int = 0) -> PlanItem | None:
+        """Remove and return the executed item (by index in the current list)."""
+        if 0 <= index < len(self.items):
+            return self.items.pop(index)
+        return None
+
+    def apply_diff(self, text: str) -> None:
+        """Apply add/delete/modify diff from the planner LLM.
+
+        Execution order: delete → modify → add  (modify targets indices
+        *after* deletions, add appends after modifications).
+        """
         data = _extract_json_array(text)
-        items: list[PlanItem] = []
+        if not data:
+            return
+
+        deletes: list[int] = []
+        modifies: list[tuple[int, float, str]] = []
+        adds: list[PlanItem] = []
+
         for entry in data:
             if not isinstance(entry, dict):
                 continue
-            action = str(entry.get("action", "")).strip()
-            if not action:
-                continue
+            op = str(entry.get("op", "")).strip()
             try:
-                delay = float(entry.get("delay_seconds", 0))
-            except (TypeError, ValueError):
-                delay = 0.0
-            items.append(PlanItem(
-                id=str(uuid.uuid4())[:8],
-                delay_seconds=max(0.0, delay),
-                action=action,
-            ))
-        items.sort(key=lambda x: x.delay_seconds)
-        items = items[:max_capacity]
-        return cls(items=items, max_capacity=max_capacity, min_capacity=min_capacity)
+                if op == "delete":
+                    deletes.append(int(entry["index"]))
+                elif op == "modify":
+                    idx = int(entry["index"])
+                    action = str(entry.get("action", "")).strip()
+                    if not action:
+                        continue
+                    delay = max(0.0, float(entry.get("delay_seconds", 0)))
+                    modifies.append((idx, delay, action))
+                elif op == "add":
+                    action = str(entry.get("action", "")).strip()
+                    if action:
+                        delay = max(0.0, float(entry.get("delay_seconds", 0)))
+                        adds.append(PlanItem(
+                            id=str(uuid.uuid4())[:8],
+                            delay_seconds=delay,
+                            action=action,
+                        ))
+            except (ValueError, TypeError):
+                continue
+
+        # 1. Delete from highest index to lowest
+        for idx in sorted(deletes, reverse=True):
+            if 0 <= idx < len(self.items):
+                self.items.pop(idx)
+
+        # 2. Modify remaining items
+        for idx, delay, action in modifies:
+            if 0 <= idx < len(self.items):
+                self.items[idx].delay_seconds = delay
+                self.items[idx].action = action
+
+        # 3. Add new items, re-sort, cap
+        if adds:
+            self.items.extend(adds)
+            self.items.sort(key=lambda x: x.delay_seconds)
+            self.items = self.items[:self.max_capacity]
 
 
 def _extract_json_array(text: str) -> list:
@@ -155,6 +196,9 @@ class ImpulsePlanner:
         memory_backend,
         chat_stream_fn,
         stt_refine_inline: bool = False,
+        bilibili_manager=None,  # BilibiliLiveManager
+        live_mode: bool = False,
+        subtitle_client=None,   # SubtitleOverlayClient — cleared on TTS_DONE
     ):
         section = config.get("impulse", {})
         if not isinstance(section, dict):
@@ -165,8 +209,8 @@ class ImpulsePlanner:
         self.planning_model = str(section.get("planning_model", "") or DEFAULT_PLANNING_MODEL)
         self.screen_timeout = max(5, int(section.get("screen_timeout", 45)))
         self.empty_plan_retry_seconds = max(5.0, float(section.get("empty_plan_retry_seconds", 30.0)))
-        self.max_consecutive = max(1, int(section.get("max_consecutive_impulse", 3)))
         self.log_plan_table = bool(section.get("log_plan_table", False))
+        self.edge_cache_config = edge_cache.config_from_dict(config)
 
         self.session = session
         self.model = model
@@ -178,6 +222,9 @@ class ImpulsePlanner:
         self._chat_stream_fn = chat_stream_fn
         self.memory_backend = memory_backend
         self.stt_refine_inline = stt_refine_inline
+        self.bilibili_manager = bilibili_manager
+        self.live_mode = live_mode
+        self.subtitle_client = subtitle_client
 
         self.plan_table = PlanTable(
             max_capacity=self.max_plans,
@@ -187,6 +234,9 @@ class ImpulsePlanner:
         self._cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._consecutive_count = 0
+        # Cached danmaku context for the current planning cycle
+        self._danmaku_context: str = ""
+        self._danmaku_user_list: str = ""
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -232,12 +282,44 @@ class ImpulsePlanner:
                 screen_result = self._capture_screen()
                 if self._cancel_event.is_set():
                     return
+                edge_page_context = self._read_edge_page_cache()
+                if self._cancel_event.is_set():
+                    return
+                cognition_context = self._read_cognition_context()
+                emotion_context = self._read_emotion_context()
+                if self._cancel_event.is_set():
+                    return
                 memories = self._fetch_memories()
                 if self._cancel_event.is_set():
                     return
 
-                with self._lock:
-                    self.plan_table = self._call_planner(screen_result, memories)
+                # Live mode: fetch danmaku context and update cognition
+                danmaku_ctx = ""
+                user_list_text = ""
+                if self.live_mode and self.bilibili_manager is not None:
+                    ctx = self.bilibili_manager.get_danmaku_context(max_entries=40)
+                    if ctx:
+                        danmaku_ctx = ctx
+                        # Build user summary list for the planner
+                        summaries = self.bilibili_manager.get_user_summaries()
+                        if summaries:
+                            user_lines = []
+                            for user, _text, cnt in summaries:
+                                user_lines.append(f"  {user}（{cnt}条）")
+                            user_list_text = "\n".join(user_lines)
+
+                # Call planner OUTSIDE the lock (it does HTTP, ~2s)
+                diff_text = self._call_planner(
+                    screen_result, memories,
+                    edge_page_context=edge_page_context,
+                    cognition_context=cognition_context,
+                    emotion_context=emotion_context,
+                    danmaku_context=danmaku_ctx,
+                    user_list_text=user_list_text,
+                )
+                if diff_text:
+                    with self._lock:
+                        self.plan_table.apply_diff(diff_text)
 
                 if self._cancel_event.is_set():
                     return
@@ -253,7 +335,6 @@ class ImpulsePlanner:
                         print(f"\n  [impulse] plan table: (empty)")
 
                 if not items:
-                    self._consecutive_count = 0
                     if not self._idle_wait(self.empty_plan_retry_seconds):
                         return
                     continue
@@ -263,27 +344,70 @@ class ImpulsePlanner:
                 if item.delay_seconds > 0:
                     if not self._idle_wait(item.delay_seconds):
                         return
+                    # Re-check: item might have been modified/reordered by another
+                    # planning cycle while we waited.  Grab the current first item.
+                    with self._lock:
+                        items = list(self.plan_table.items)
+                    if not items:
+                        continue
+                    item = items[0]
 
                 if self._cancel_event.is_set():
                     return
 
                 self._execute_item(item)
-                return
+                # Remove executed item from plan table
+                with self._lock:
+                    if self.plan_table.items and self.plan_table.items[0].id == item.id:
+                        self.plan_table.pop_executed(0)
 
         except Exception as exc:
             logger.warning("impulse plan+execute failed: %s", exc)
 
     def _capture_screen(self) -> str:
+        """Read latest screen analysis from cache (zero-cost, no API call)."""
         try:
-            result = screen_interest.analyze(timeout=self.screen_timeout)
-            if result.private:
-                return ""
-            if result.score >= 50:
-                return result.content or result.reason
+            cache = screen_interest.get_cache()
+            result = cache.content()
+            if result:
+                return result
             return ""
         except Exception as exc:
-            logger.warning("impulse screen capture failed: %s", exc)
+            logger.warning("impulse screen cache read failed: %s", exc)
             return ""
+
+    def _read_edge_page_cache(self) -> str:
+        """Read the latest Edge page cache for planner context."""
+        if not self.edge_cache_config.enabled:
+            return ""
+        try:
+            return edge_cache.format_for_prompt(
+                self.edge_cache_config.cache_file,
+                max_chars=max(1000, min(self.edge_cache_config.max_chars, 4000)),
+            )
+        except Exception as exc:
+            logger.warning("impulse edge page cache read failed: %s", exc)
+            return ""
+
+    def _read_cognition_context(self) -> str:
+        """Read the local cognition runtime cache for planner context."""
+        try:
+            cognition = getattr(self.session, "cognition", None)
+            if cognition and hasattr(cognition, "get_context"):
+                return cognition.get_context() or ""
+        except Exception as exc:
+            logger.warning("impulse cognition context read failed: %s", exc)
+        return ""
+
+    def _read_emotion_context(self) -> str:
+        """Read the current emotion layer for planner context."""
+        try:
+            emotion = getattr(self.session, "emotion", None)
+            if emotion and hasattr(emotion, "get_context"):
+                return emotion.get_context() or ""
+        except Exception as exc:
+            logger.warning("impulse emotion context read failed: %s", exc)
+        return ""
 
     def _fetch_memories(self) -> str:
         """Fetch related memories using context summary + last 4 rounds."""
@@ -308,7 +432,21 @@ class ImpulsePlanner:
         except Exception:
             return ""
 
-    def _call_planner(self, screen_result: str, memories: str) -> PlanTable:
+    def _call_planner(
+        self,
+        screen_result: str,
+        memories: str,
+        edge_page_context: str = "",
+        cognition_context: str = "",
+        emotion_context: str = "",
+        danmaku_context: str = "",
+        user_list_text: str = "",
+    ) -> str:
+        """Call planning LLM and return raw diff text (not a PlanTable).
+
+        The caller applies ``apply_diff()`` to merge results into the existing
+        plan table.
+        """
         from kokoro import config as cfg
         from kokoro import token_usage
 
@@ -320,17 +458,46 @@ class ImpulsePlanner:
         recent_text = _format_history(recent_history) if recent_history else "（无）"
 
         screen_text = screen_result or "（无屏幕内容）"
+        if edge_page_context:
+            screen_text = f"{screen_text}\n\n【Edge当前网页缓存】\n{edge_page_context}"
         memory_text = memories or "（无相关记忆）"
         existing_text = self.plan_table.to_text()
+        layer_context_parts: list[str] = []
+        if cognition_context:
+            layer_context_parts.append(f"【认知缓存】\n{cognition_context}")
+        if emotion_context:
+            layer_context_parts.append(f"【当前情绪】\n{emotion_context}")
+        layer_context = "\n\n".join(layer_context_parts)
 
-        system_prompt = _prompts.format_prompt(
-            "impulse.planner_system",
-            name=self.session.character_name,
-            min_plans=str(self.min_plans),
-            max_plans=str(self.max_plans),
-            character_context=self.session.system_prompt[:800],
-        )
+        # Build system prompt — add live hint if in live mode
+        if self.live_mode and danmaku_context:
+            live_hint = _prompts.get("bilibili_live.live_system_hint", "")
+            if live_hint:
+                system_prompt = _prompts.format_prompt(
+                    "impulse.planner_system",
+                    name=self.session.character_name,
+                    min_plans=str(self.min_plans),
+                    max_plans=str(self.max_plans),
+                    character_context=f"{self.session.system_prompt[:600]}\n\n{live_hint}",
+                )
+            else:
+                system_prompt = _prompts.format_prompt(
+                    "impulse.planner_system",
+                    name=self.session.character_name,
+                    min_plans=str(self.min_plans),
+                    max_plans=str(self.max_plans),
+                    character_context=self.session.system_prompt[:800],
+                )
+        else:
+            system_prompt = _prompts.format_prompt(
+                "impulse.planner_system",
+                name=self.session.character_name,
+                min_plans=str(self.min_plans),
+                max_plans=str(self.max_plans),
+                character_context=self.session.system_prompt[:800],
+            )
 
+        # Build user prompt — append danmaku context if available
         user_prompt = _prompts.format_prompt(
             "impulse.planner_user",
             timestamp=now,
@@ -340,6 +507,15 @@ class ImpulsePlanner:
             screen_content=screen_text,
             existing_plans=existing_text,
         )
+        if layer_context:
+            user_prompt += f"\n\n{layer_context}"
+        if danmaku_context and user_list_text:
+            live_extra = _prompts.format_prompt(
+                "bilibili_live.planner_live_context",
+                danmaku_text=danmaku_context,
+                user_list=user_list_text,
+            )
+            user_prompt += f"\n\n{live_extra}"
 
         model = self.planning_model
         openai_compatible = False
@@ -383,12 +559,12 @@ class ImpulsePlanner:
                 if resp.status_code >= 400:
                     if self.log_plan_table:
                         print(f"\n  [impulse] planner HTTP {resp.status_code}: {_preview(resp.text)}")
-                    return PlanTable(max_capacity=self.max_plans, min_capacity=self.min_plans)
+                    return ""
                 data = resp.json()
                 if "choices" not in data:
                     if self.log_plan_table:
                         print(f"\n  [impulse] planner response missing choices: {_preview(json.dumps(data, ensure_ascii=False))}")
-                    return PlanTable(max_capacity=self.max_plans, min_capacity=self.min_plans)
+                    return ""
                 usage = data.get("usage", {})
                 pt = int(usage.get("prompt_tokens", 0))
                 ct = int(usage.get("completion_tokens", 0))
@@ -409,7 +585,7 @@ class ImpulsePlanner:
                 if resp.status_code >= 400:
                     if self.log_plan_table:
                         print(f"\n  [impulse] planner HTTP {resp.status_code}: {_preview(resp.text)}")
-                    return PlanTable(max_capacity=self.max_plans, min_capacity=self.min_plans)
+                    return ""
                 data = resp.json()
                 pt = int(data.get("prompt_eval_count", 0))
                 ct = int(data.get("eval_count", 0))
@@ -418,19 +594,12 @@ class ImpulsePlanner:
                 text = data.get("message", {}).get("content", "")
 
             logger.debug("planner response: %s", text[:300])
-            table = PlanTable.from_llm_response(
-                text,
-                max_capacity=self.max_plans,
-                min_capacity=self.min_plans,
-            )
-            if self.log_plan_table and not table.items and text.strip() != "[]":
-                print(f"\n  [impulse] planner returned no parseable plans: {_preview(text)}")
-            return table
+            return text
         except Exception as exc:
             if self.log_plan_table:
                 print(f"\n  [impulse] planner call failed: {type(exc).__name__}: {exc}")
             logger.warning("impulse planner LLM call failed: %s", exc)
-            return PlanTable(max_capacity=self.max_plans, min_capacity=self.min_plans)
+            return ""
 
     def _idle_wait(self, seconds: float) -> bool:
         """Wait for `seconds` of idle time. Pauses countdown when system is busy.
@@ -456,16 +625,13 @@ class ImpulsePlanner:
         from kokoro import state_machine as sm
         from kokoro import token_usage
 
-        # Guard against excessive consecutive impulse speech
-        self._consecutive_count += 1
-        if self._consecutive_count > self.max_consecutive:
-            logger.info("impulse: max consecutive (%d) reached, stopping", self.max_consecutive)
-            return
+        print(f"\n  [impulse] _execute_item: action=\"{item.action[:50]}\"")
 
         # Claim the conversation slot atomically
         if not self.machine.emit(sm.SystemEvent.PROACTIVE_TRIGGERED):
-            self._consecutive_count -= 1
+            print(f"  [impulse] PROACTIVE_TRIGGERED REJECTED (state={self.machine.state})")
             return
+        print(f"  [impulse] PROACTIVE_TRIGGERED OK")
 
         self.machine.set_proactive_state(sm.ProactiveState.EXECUTING)
         impulse_cancel = threading.Event()
@@ -488,6 +654,16 @@ class ImpulsePlanner:
                     screen_text += f"{i}. {ctx}\n"
                 messages.append({"role": "system", "content": screen_text})
 
+            # Live mode: inject danmaku context as extra system context
+            if self.live_mode and self.bilibili_manager is not None:
+                danmaku_ctx = self.bilibili_manager.get_danmaku_context(max_entries=30)
+                if danmaku_ctx:
+                    live_hint = _prompts.get("bilibili_live.live_system_hint", "")
+                    messages.append({
+                        "role": "system",
+                        "content": f"{live_hint}\n{danmaku_ctx}",
+                    })
+
             # Impulse trigger message: tells the LLM what to talk about.
             trigger_content = _prompts.format_prompt(
                 "impulse.trigger_system",
@@ -505,8 +681,7 @@ class ImpulsePlanner:
             # The user message is the trigger instruction (not shown to user)
             user_trigger = _prompts.format_prompt(
                 "impulse.trigger_user",
-                action=item.action,
-            ) or f"Current topic: {item.action}"
+            ) or "请以角色身份直接说出现在要说的话。"
             messages.append({"role": "user", "content": user_trigger})
 
             print(
@@ -568,6 +743,8 @@ class ImpulsePlanner:
             self.machine.set_tts_state(sm.TTSState.IDLE)
             self.machine.emit(sm.SystemEvent.TTS_DONE)
             self.machine.reset_error_count()
+            if self.subtitle_client:
+                self.subtitle_client.clear()
             self.machine.set_proactive_state(sm.ProactiveState.ACCRUING)
 
             # Re-plan after impulse speech.

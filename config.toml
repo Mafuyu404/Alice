@@ -1,4 +1,4 @@
-# Alice Chat 框架配置文件
+﻿# Alice Chat 框架配置文件
 # 真实的 API 密钥不要提交到 git。空密钥会禁用对应的云功能。
 #
 # 本文件所有可配置项均已列出。注释中标注了类型、取值范围、效果说明。
@@ -49,6 +49,12 @@ local_model = "Qwen/Qwen2.5-1.5B-Instruct"
 # 切换后端后会自动加载 kokoro/tts_{后端名}.py。
 tts_backend = "minimax"
 
+# TTS 播放音量倍率。
+# 类型: float
+# 1.0 = 原始音量，0.5 = 一半音量，0 = 静音，最大 2.0。
+# 超过 1.0 可能产生削波失真，建议优先使用 0.3 ~ 1.0。
+tts_volume = 1.6
+
 # ── Cartesia 配置 ──
 # Cartesia 海外 TTS 服务。需要海外网络访问和有效 API Key。
 cartesia_api_key = ""
@@ -73,7 +79,7 @@ minimax_sample_rate = 32000
 # 类型: float
 # 1.0 = 正常语速，>1 加快（最大约 2.0），<1 减慢（最小约 0.5）。
 # 推荐范围: 0.9 ~ 1.2。
-minimax_tts_speed = 1.05
+minimax_tts_speed = 1.1
 # 播放前预缓冲的音频秒数。
 # 类型: float
 # 值越大播放越流畅（减少卡顿），但首音延迟越高。
@@ -109,8 +115,14 @@ stt_refine_model = "qwen2.5:1.5b"
 # 认知层评估用模型。留空则使用 llm_model。
 # 类型: string（模型名）
 # 用于上下文总结时对认知层（cognition.json）的全量评估。
-# 建议用小模型（如 qwen2.5:1.5b）控制成本，每 ~40 轮对话执行一次。
+# 建议用小模型（如 qwen2.5:1.5b）控制成本。
 cognition_model = ""
+
+# 认知层评估频率。每 N 轮对话评估一次。
+# 类型: int
+# 设为 0 禁用周期性评估（仅保留摘要时的评估）。
+# 推荐范围: 3 ~ 10。
+cognition_eval_interval = 5
 
 # 情绪层评估用模型。留空则使用 llm_model。
 # 类型: string（模型名）
@@ -134,7 +146,7 @@ stt_refine_mode = "inline"
 # 太短：用户话没说完就推送，对话不完整。
 # 太长：响应迟钝，需要等待更久。
 # 根据用户说话习惯调整。一般 1.0 ~ 2.0 秒。
-stt_refine_stable_seconds = 1.0
+stt_refine_stable_seconds = 0.7
 
 # 对话池轮询间隔（秒）。
 # 类型: float
@@ -228,6 +240,54 @@ portrait_click_through = false
 portrait_model = "qwen2.5:1.5b"
 
 # ===========================================================================
+# 字幕覆盖层 — 流式显示 LLM 输出
+# ===========================================================================
+# 由 overlay_subtitle.py 实现。独立窗口，透明背景，白描深红字体，
+# 可拖拽/缩放/折叠。开关与立绘绑定。
+
+[subtitle]
+# 字体颜色（CSS 颜色值）。
+# 类型: string
+# 例如 "#8b0000"（深红）、"#ffffff"（白色）、"#ff4444"（红色）
+font_color = "#8b0000"
+
+# 字体描边颜色（CSS 颜色值）。
+# 类型: string
+# 描边围绕字体边缘一圈，使文字更清晰易读。
+stroke_color = "#ffffff"
+
+# 字号（像素）。
+# 类型: int
+# 推荐范围: 18 ~ 48。
+font_size = 30
+
+# HTTP 控制服务地址和端口（与立绘独立）。
+# 类型: string / int
+# 确保端口不被其他程序占用。
+subtitle_host = "127.0.0.1"
+subtitle_port = 17353
+
+# STT 字幕单独配置（独立端口，深蓝色描边）。
+# 与 chat 字幕共用同一窗口程序，不同端口实现多实例。
+[subtitle_stt]
+# 字体颜色（CSS 颜色值）。
+font_color = "#00008b"
+
+# 字体描边颜色。
+stroke_color = "#ffffff"
+
+# 字号（像素）。
+font_size = 30
+
+# 折叠按钮颜色。
+btn_color = "#4444ff"
+
+# HTTP 控制服务端口（与 chat 字幕不同端口）。
+subtitle_host = "127.0.0.1"
+subtitle_port = 17354
+
+
+# ===========================================================================
 # 视觉 / 屏幕识别
 # ===========================================================================
 
@@ -257,22 +317,54 @@ vision_max_pixels = 921600
 
 
 # ===========================================================================
+# Edge 网页缓存 — 周期性读取当前 Edge 标签页正文
+# ===========================================================================
+# 由 cli.py 启动的后台线程，通过 Microsoft Edge DevTools Protocol
+# 读取当前前台 Edge 网页的 document.body.innerText，并覆盖写入同一个缓存文件。
+#
+# 使用前需要用远程调试端口启动 Edge，例如：
+# msedge.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\alice-edge-debug"
+
+[edge_page_cache]
+# 是否开启 Edge 网页正文缓存。
+enabled = true
+
+# 抓取间隔（秒）。
+interval_seconds = 3.0
+
+# Edge DevTools 地址。
+devtools_host = "127.0.0.1"
+devtools_port = 9222
+
+# 缓存文件路径。相对路径基于项目根目录。
+cache_file = "data/edge_page_cache.json"
+
+# 最大保存字符数，防止超长网页撑爆上下文。
+max_chars = 12000
+
+# DevTools 请求超时（秒）。
+request_timeout = 3.0
+
+
+# ===========================================================================
 # 屏幕监控 — 周期性截图 + 视觉分析
 # ===========================================================================
 # 由 cli.py 启动的后台线程，定时截图并通过视觉 API 分析内容，
 # 判断是否有趣、是否隐私。结果用于 SCREEN 主动搭话和对话历史注入。
 
 [screen_watch]
-# 是否开启周期性屏幕截图分析。
+# 是否开启持续屏幕截图分析。
 enabled = false
 
-# 截图/分析周期（秒）。
+# 截图分析的最小间隔（秒）。
 # 类型: float
-# 每 watch_interval 秒截图一次并调用视觉 API 分析。
-# 太短：视觉 API 调用频繁（可能产生费用或负载），且内容变化不大。
-# 太长：可能错过用户的活动变化。
+# 截图分析头尾相连不断执行：完成一次后立即开始下一次。
+# watch_interval 是最小间隔：如果一次分析耗时少于这个值，则等待差值后再开始下一次。
+# 如果分析耗时超过这个值，则不等待立即开始下一次。
+# 太短：视觉 API 调用频繁（可能产生费用或负载）。
+# 太长：缓存更新慢，AI 看到的屏幕内容可能过时。
 # 推荐范围: 30 ~ 120。
-watch_interval = 45.0
+watch_interval = 3.0
 
 # 内容兴趣度最低分数（0-100）。
 # 类型: float
@@ -327,13 +419,7 @@ screen_timeout = 45
 # 计划表为空时，等待多少秒后重新读取屏幕并再次规划。
 # 类型: float
 # 设得太低会增加视觉和规划模型调用频率。推荐 30 ~ 120。
-empty_plan_retry_seconds = 30.0
-
-# 最大连续主动搭话次数。
-# 类型: int
-# 一次对话结束后，连续主动搭话的最大次数。超过后自动停止，等用户回应。
-# 防止 LLM 无限循环自言自语。推荐 2 ~ 5。
-max_consecutive_impulse = 3
+empty_plan_retry_seconds = 10.0
 
 # 是否在控制台输出计划表内容（调试用）。
 # 类型: bool
@@ -380,6 +466,38 @@ memory_check_interval = 300.0
 # date = "05-04"
 # label = "Alice project anniversary"
 # note = "Mention it only if the user seems idle and the mood is relaxed."
+
+# ===========================================================================
+# Bilibili 直播间弹幕 — 读取弹幕并回复
+# ===========================================================================
+# 由 bilibili_live.py 实现。后台线程维护 WebSocket 连接，
+# 在空闲时根据弹幕内容触发角色主动搭话。
+
+[bilibili_live]
+# 总开关。设为 false 时完全不连接 Bilibili。
+# 类型: bool (true/false)
+enabled = true
+
+# 直播模式。启用后，AI 会通过 impulse 规划器在空闲时选择性回复弹幕，
+# 并将弹幕观众视为具体的人在认知层留下词条。
+# 类型: bool (true/false)
+live_mode = true
+
+# Bilibili 直播间房间号（URL 中的数字）。
+# 例如 https://live.bilibili.com/7777 的房间号为 7777。
+# 类型: int。设为 0 时禁用。
+room_id = 1796292397
+
+# 弹幕在缓冲区中的最长保留时间（秒）。
+# 类型: float
+# 超过此时间的弹幕会被自动丢弃，避免回复过时的弹幕。
+# 推荐范围: 60 ~ 300。
+buffer_max_age = 60.0
+
+# WebSocket 连接失败后的重连等待时间（秒）。
+# 类型: float
+reconnect_delay = 5.0
+
 
 # ===========================================================================
 # mem0 — 内部记忆服务配置

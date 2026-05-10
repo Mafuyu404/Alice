@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 MINIMAX_API_KEY = cfg.minimax_api_key()
 MINIMAX_MODEL = cfg.minimax_model()
 SAMPLE_RATE = int(cfg.get("minimax_sample_rate", 32000))
+TTS_VOLUME = cfg.tts_volume()
 WS_URL = "wss://api.minimax.io/ws/v1/t2a_v2"
 WS_OPEN_TIMEOUT = 10
 WS_CLOSE_TIMEOUT = 1
@@ -155,10 +156,16 @@ def _play_audio_chunks(chunks: list[np.ndarray]) -> None:
     stream = sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=2048)
     stream.start()
     try:
-        stream.write(np.concatenate(chunks))
+        stream.write(_apply_volume(np.concatenate(chunks)))
     finally:
         stream.stop()
         stream.close()
+
+
+def _apply_volume(audio: np.ndarray) -> np.ndarray:
+    if TTS_VOLUME == 1.0:
+        return audio
+    return np.clip(audio * TTS_VOLUME, -1.0, 1.0).astype(np.float32, copy=False)
 
 
 def play_tts(text: str, voice: str = None, speed: float = 1.0, blocking: bool = True):
@@ -215,7 +222,8 @@ class StreamingTTS:
         self._is_playing = False
         self._should_stop = False
         self._state_lock = threading.Lock()
-        self._first_audio_logged = False
+        self._llm_text_started_at = 0.0
+        self._llm_to_tts_logged = False
         self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
         self._play_thread: threading.Thread | None = None
         self._stream: sd.OutputStream | None = None
@@ -261,6 +269,8 @@ class StreamingTTS:
 
         self._all_done.set()
         self._session_done = False
+        self._llm_text_started_at = 0.0
+        self._llm_to_tts_logged = False
         with self._pending_lock:
             self._pending_count = 0
         self._ws_recv_thread = threading.Thread(target=self._ws_recv_worker, daemon=True)
@@ -294,6 +304,8 @@ class StreamingTTS:
 
     def push(self, text: str) -> None:
         """Accumulate text; send complete sentences when WS is available."""
+        if text and not self._llm_text_started_at:
+            self._llm_text_started_at = time.perf_counter()
         self._buf.append(text)
         while True:
             combined = "".join(self._buf)
@@ -382,7 +394,8 @@ class StreamingTTS:
             self._is_playing = False
         self._should_stop = False
         self._session_done = False  # recv 线程自动重连 WS，供下一轮 TTS 使用
-        self._first_audio_logged = False
+        self._llm_text_started_at = 0.0
+        self._llm_to_tts_logged = False
 
     def _ws_recv_worker(self) -> None:
         """Receiver loop. Reconnects automatically on unexpected drops."""
@@ -399,7 +412,6 @@ class StreamingTTS:
                 time.sleep(0.5)
                 continue
 
-            t0 = time.perf_counter()
             try:
                 while not self._should_stop:
                     try:
@@ -419,9 +431,6 @@ class StreamingTTS:
                     if event == "task_started":
                         self._ws_started.set()
                     elif event == "task_continued":
-                        if not self._first_audio_logged:
-                            self._first_audio_logged = True
-                            print(f"\n  [latency] tts_first_audio {time.perf_counter() - t0:.2f}s")
                         audio = _decode_audio_chunk(data.get("data", {}))
                         if audio is not None and len(audio) > 0:
                             self._audio_queue.put(audio)
@@ -474,7 +483,7 @@ class StreamingTTS:
                 if audio is None:
                     if prebuf:
                         for chunk in prebuf:
-                            stream.write(chunk)
+                            stream.write(_apply_volume(chunk))
                         prebuf = []
                     started = False
                     prebuf_samples = 0
@@ -485,16 +494,19 @@ class StreamingTTS:
                     prebuf.append(audio)
                     prebuf_samples += len(audio)
                     if prebuf_samples >= self._buffer_samples:
+                        if not self._llm_to_tts_logged and self._llm_text_started_at:
+                            self._llm_to_tts_logged = True
+                            print(f"\n  [latency] llm_to_tts {time.perf_counter() - self._llm_text_started_at:.2f}s")
                         with self._state_lock:
                             self._is_playing = True
                         started = True
                         for chunk in prebuf:
-                            stream.write(chunk)
+                            stream.write(_apply_volume(chunk))
                         prebuf = []
                     continue
                 with self._state_lock:
                     self._is_playing = True
-                stream.write(audio)
+                stream.write(_apply_volume(audio))
         finally:
             with self._state_lock:
                 self._is_playing = False

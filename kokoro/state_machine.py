@@ -469,6 +469,7 @@ class SystemStateMachine:
         # SCREEN_WATCHING transitions
         self._transitions[SystemState.SCREEN_WATCHING] = {
             SystemEvent.SCREEN_WATCH_DONE: (SystemState.IDLE, None),
+            SystemEvent.STT_REFINED: (SystemState.THINKING, None),
             SystemEvent.USER_SPEECH_START: (SystemState.LISTENING, None),
             SystemEvent.SHUTDOWN: (SystemState.SHUTTING_DOWN, None),
             SystemEvent.ERROR: (SystemState.ERROR, None),

@@ -25,8 +25,11 @@ def _clean_proxy() -> None:
 def _load_toml() -> dict:
     if not _CONFIG_TOML_PATH.exists():
         return {}
-    with _CONFIG_TOML_PATH.open("rb") as file:
-        return tomllib.load(file)
+    raw = _CONFIG_TOML_PATH.read_bytes()
+    # Strip UTF-8 BOM if present (Python 3.12 tomllib doesn't handle it)
+    if raw[:3] == b"\xef\xbb\xbf":
+        raw = raw[3:]
+    return tomllib.loads(raw.decode("utf-8"))
 
 
 def _load_json() -> dict:
@@ -79,6 +82,10 @@ def tts_voice_id() -> str:
 
 def tts_sample_rate() -> int:
     return int(get("tts_sample_rate", 24000))
+
+
+def tts_volume() -> float:
+    return max(0.0, min(2.0, float(get("tts_volume", 1.0))))
 
 
 def tts_backend() -> str:
@@ -152,6 +159,11 @@ def cognition_model() -> str:
     return get("cognition_model", "")
 
 
+def cognition_eval_interval() -> int:
+    """认知层评估频率。每 N 轮对话评估一次。0 = 禁用。"""
+    return int(get("cognition_eval_interval", 5))
+
+
 def emotion_model() -> str:
     """情绪层评估用模型。留空则使用 stt_refine_model。"""
     return get("emotion_model", "")
@@ -213,3 +225,31 @@ def impulse_enabled() -> bool:
     if not isinstance(section, dict):
         return False
     return bool(section.get("enabled", False))
+
+
+# ── bilibili_live ────────────────────────────────────────────────────────────
+
+def bilibili_live_enabled() -> bool:
+    section = get("bilibili_live", {})
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
+
+
+def bilibili_live_live_mode() -> bool:
+    section = get("bilibili_live", {})
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("live_mode", False))
+
+
+def bilibili_live_room_id() -> int:
+    section = get("bilibili_live", {})
+    if not isinstance(section, dict):
+        return 0
+    return int(section.get("room_id", 0))
+
+
+def bilibili_live_buffer_max_age() -> float:
+    section = get("bilibili_live", {})
+    return float(section.get("buffer_max_age", 120.0))

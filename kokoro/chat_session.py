@@ -35,6 +35,9 @@ class ChatSession:
     # Three-layer personality system
     cognition: object = field(default=None)   # CognitionStore instance
     emotion: object = field(default=None)      # EmotionState instance
+    # Periodic cognition evaluation (every N conversation turns)
+    cognition_eval_interval: int = 5
+    _cognition_turn_counter: int = 0
 
     def __post_init__(self) -> None:
         from kokoro.cognition import CognitionStore
@@ -178,6 +181,16 @@ class ChatSession:
             daemon=True,
         ).start()
 
+        # Periodic cognition evaluation (every N turns, independent of summary)
+        self._cognition_turn_counter += 1
+        if self.cognition_eval_interval > 0 and self._cognition_turn_counter >= self.cognition_eval_interval:
+            self._cognition_turn_counter = 0
+            threading.Thread(
+                target=self._eval_cognition_async,
+                args=(user_text, assistant_text),
+                daemon=True,
+            ).start()
+
     def _summarize_async(self, batch: list[dict]) -> None:
         try:
             conv_lines = []
@@ -213,6 +226,23 @@ class ChatSession:
             logger.warning("conversation summarization failed: %s", exc)
         finally:
             self._summarize_in_progress = False
+
+    def _eval_cognition_async(self, user_text: str, assistant_text: str) -> None:
+        """Periodic lightweight cognition evaluation (no summary needed)."""
+        try:
+            conv_text = f"用户：{user_text}\n{self.character_name}：{assistant_text}"
+            memories = self.memory_backend.get_context(
+                conv_text[:500], user_id=self.character_id,
+            )
+            self.cognition.evaluate(
+                conversation=conv_text,
+                summary=self.summary or "",
+                memories=memories or "",
+                character_name=self.character_name,
+                character_id=self.character_id,
+            )
+        except Exception as exc:
+            logger.warning("periodic cognition evaluation failed: %s", exc)
 
     def _call_summary_llm(self, existing_summary: str, conversation: str) -> str | None:
         prompt = prompts.format_prompt(
@@ -288,15 +318,20 @@ def load_session(
     character_id: str,
     memory_backend: object,
     max_history: int = 20,
+    cognition_eval_interval: int | None = None,
 ) -> ChatSession:
     characters = character.load()
     if character_id not in characters:
         raise KeyError(character_id)
+    if cognition_eval_interval is None:
+        from kokoro import config as cfg
+        cognition_eval_interval = cfg.cognition_eval_interval()
     return ChatSession(
         character_id=character_id,
         character_data=characters[character_id],
         memory_backend=memory_backend,
         max_history=max_history,
+        cognition_eval_interval=cognition_eval_interval,
     )
 
 

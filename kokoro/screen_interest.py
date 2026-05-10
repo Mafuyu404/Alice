@@ -4,6 +4,8 @@ Instead of a generic "is this interesting?" check, this module analyzes the
 foreground window content — extracting readable text and describing the visual
 context — so the companion can naturally comment, ask, correct, or react to
 what the user is actually doing.
+
+A module-level ScreenCache holds the latest analysis result for zero-cost reads.
 """
 
 from __future__ import annotations
@@ -11,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
 from dataclasses import dataclass
 
 from kokoro import prompts
@@ -178,3 +182,41 @@ def _clean_json(text: str) -> str:
 
 def _clamp(value: float, low: float, high: float) -> float:
     return min(high, max(low, value))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ScreenCache — thread-safe cache for continuous screen analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ScreenCache:
+    """Thread-safe cache holding the latest screen analysis result."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._latest: ScreenInterest | None = None
+        self._timestamp: float = 0.0
+
+    def put(self, result: ScreenInterest) -> None:
+        with self._lock:
+            self._latest = result
+            self._timestamp = time.time()
+
+    def get(self) -> tuple[ScreenInterest | None, float]:
+        with self._lock:
+            return self._latest, self._timestamp
+
+    def content(self) -> str:
+        with self._lock:
+            return (self._latest.content or "") if self._latest else ""
+
+    def score(self) -> float:
+        with self._lock:
+            return self._latest.score if self._latest else 0.0
+
+
+# Module-level singleton
+_SCREEN_CACHE = ScreenCache()
+
+
+def get_cache() -> ScreenCache:
+    return _SCREEN_CACHE

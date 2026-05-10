@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 CARTESIA_API_KEY = cfg.cartesia_api_key()
 DEFAULT_VOICE_ID = cfg.tts_voice_id() or "79eb36e0-0b79-4eac-8cb8-bb4922eb51c5"
 SAMPLE_RATE = cfg.tts_sample_rate()
+TTS_VOLUME = cfg.tts_volume()
 
 VOICE_PRESETS = {
     "default": DEFAULT_VOICE_ID,
@@ -84,10 +85,16 @@ def _play_audio_chunks(chunks: list[np.ndarray]) -> None:
     stream = sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", blocksize=2048)
     stream.start()
     try:
-        stream.write(np.concatenate(chunks))
+        stream.write(_apply_volume(np.concatenate(chunks)))
     finally:
         stream.stop()
         stream.close()
+
+
+def _apply_volume(audio: np.ndarray) -> np.ndarray:
+    if TTS_VOLUME == 1.0:
+        return audio
+    return np.clip(audio * TTS_VOLUME, -1.0, 1.0).astype(np.float32, copy=False)
 
 
 def play_tts(text: str, voice: str = None, speed: float = 1.0, blocking: bool = True):
