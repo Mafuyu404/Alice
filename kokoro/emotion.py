@@ -1,4 +1,4 @@
-"""Emotion layer — shallow emotional tone and mid-term motivation.
+"""Emotion layer: shallow emotional tone and mid-term motivation.
 
 ``EmotionState`` is optional.  If the LLM finds no emotional colouring or
 motivation after a conversation the fields stay empty, and nothing is injected
@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Optional
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,8 @@ class EmotionState:
 
     def __init__(self, character_id: str):
         self.character_id = character_id
-        self._path = os.path.join(_CHARACTERS_DIR, character_id, "emotion.json")
+        self._path = os.path.join(_CHARACTERS_DIR, character_id, "emotion.txt")
+        self._legacy_json_path = os.path.join(_CHARACTERS_DIR, character_id, "emotion.json")
         self.tone: str = ""
         self.motivation: str = ""
         self._load()
@@ -39,7 +40,7 @@ class EmotionState:
         user_text: str,
         assistant_text: str,
         character_name: str,
-    ) -> None:
+    ) -> dict:
         """Evaluate current emotion after a conversation turn (async).
 
         The LLM decides whether tone / motivation should be updated.
@@ -48,16 +49,27 @@ class EmotionState:
         from kokoro import config as cfg
         from kokoro import token_usage
 
+        debug = {
+            "system_prompt": "",
+            "user_prompt": "",
+            "raw_response": "",
+            "tone_before": self.tone,
+            "motivation_before": self.motivation,
+            "tone_after": self.tone,
+            "motivation_after": self.motivation,
+            "error": "",
+        }
+
         if not user_text and not assistant_text:
-            return
+            return debug
 
         system_prompt = (
-            f"你是{character_name}的情绪系统。根据最近的对话，评估"
-            f"{character_name}当前的情绪状态和短期动机。"
+            f"你是{character_name}的情绪层维护器。你的任务是根据每次对话后的结果，"
+            "维护浅层情绪基调和中期动机。"
         )
 
         tone_line = f"情绪基调：{self.tone}" if self.tone else "情绪基调：（无）"
-        moti_line = f"近期动机：{self.motivation}" if self.motivation else "近期动机：（无）"
+        moti_line = f"中期动机：{self.motivation}" if self.motivation else "中期动机：（无）"
         current = f"{tone_line}\n{moti_line}"
 
         user_prompt = (
@@ -66,13 +78,29 @@ class EmotionState:
             f"用户：{user_text}\n"
             f"{character_name}：{assistant_text}\n\n"
             "请输出更新后的情绪状态。\n\n"
-            "情绪基调是浅层的：比如因为对方敷衍而不开心，被夸奖了所以开心。\n"
-            "近期动机是接下来想做的事：比如发现对方沮丧所以想让他振作起来。\n\n"
-            "如果没有明显情绪或动机，对应项留空即可。\n\n"
+            "定义：\n"
+            "- 情绪基调是浅层、当前可感知的情绪色彩，例如因为对方持续敷衍而不太开心，或被认真夸奖后轻微开心。\n"
+            "- 中期动机是一小段时间内想做的事，例如发现对方心情沮丧后想让他振作，或发现对方在认真测试后想配合完成测试。\n\n"
+            "稳定性规则：\n"
+            "1. 情绪基调可以随对话变化，但不要因为一句普通话就剧烈翻转。\n"
+            "2. 中期动机应比情绪更稳定，通常持续数轮；只有目标完成、明显失败或出现更强动机时才改写。\n"
+            "3. 如果上一轮情绪/动机仍然合理，应保留并轻微修正，不要每轮清空。\n"
+            "4. 如果对方明显敷衍、低落、夸奖、求助、焦虑或认真测试，应反映在情绪或动机里。\n"
+            "5. 情绪和动机要能影响下一轮回复方式，但不能覆盖用户的明确问题。\n"
+            "6. 不要写长期人格、长期记忆、具体事实档案；这些不属于 emotion。\n\n"
+            "基调清空规则：\n"
+            "- “稳定”“收束”“普通提问”不等于没有情绪；活跃对话中通常仍有平稳、专注、轻微愉悦、轻微受挫等浅层基调。\n"
+            "- 只有对话确实完全没有可感知情绪色彩，且上一轮基调也不再适用时，才可以把情绪基调留空。\n"
+            "- 如果仍在测试、协助、安抚、收束或被评价，就不要输出“无”，应写出低强度但具体的基调。\n\n"
+            "文本要求：\n"
+            "- 每项最多一句，短而具体。\n"
+            "- 没有明显内容时可留空，但不要偷懒；如果对话有情绪信号或可行动目标，就必须写。\n\n"
             "输出格式（只输出两行，不要多余文字）：\n"
             "情绪基调：\n"
-            "近期动机："
+            "中期动机："
         )
+        debug["system_prompt"] = system_prompt
+        debug["user_prompt"] = user_prompt
 
         model = cfg.emotion_model() or cfg.stt_refine_model()
         url = cfg.llm_url()
@@ -143,9 +171,14 @@ class EmotionState:
                 text = result.get("message", {}).get("content", "").strip()
 
             if text:
+                debug["raw_response"] = text
                 self._parse(text)
+                debug["tone_after"] = self.tone
+                debug["motivation_after"] = self.motivation
         except Exception as exc:
+            debug["error"] = str(exc)
             logger.debug("emotion evaluation failed: %s", exc)
+        return debug
 
     def get_context(self) -> str:
         """Format for prompt injection.  Returns ``""`` if both fields are empty."""
@@ -155,23 +188,36 @@ class EmotionState:
         if self.tone:
             lines.append(f"情绪基调：{self.tone}")
         if self.motivation:
-            lines.append(f"近期动机：{self.motivation}")
+            lines.append(f"中期动机：{self.motivation}")
         return "【当前情绪】\n" + "\n".join(lines)
 
     # ── persistence ─────────────────────────────────────────────────────────
 
     def _load(self) -> None:
         if not os.path.exists(self._path):
-            self.tone = ""
-            self.motivation = ""
+            if os.path.exists(self._legacy_json_path):
+                self._load_legacy_json()
+            else:
+                self.tone = ""
+                self.motivation = ""
             return
         try:
             with open(self._path, "r", encoding="utf-8") as f:
+                text = f.read()
+            self.tone, self.motivation = _parse_emotion_text(text)
+        except Exception as exc:
+            logger.warning("failed to load emotion: %s", exc)
+            self.tone = ""
+            self.motivation = ""
+
+    def _load_legacy_json(self) -> None:
+        try:
+            with open(self._legacy_json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.tone = str(data.get("tone", "") or "")
             self.motivation = str(data.get("motivation", "") or "")
         except Exception as exc:
-            logger.warning("failed to load emotion: %s", exc)
+            logger.warning("failed to load legacy emotion json: %s", exc)
             self.tone = ""
             self.motivation = ""
 
@@ -179,12 +225,8 @@ class EmotionState:
         try:
             os.makedirs(os.path.dirname(self._path), exist_ok=True)
             with open(self._path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"tone": self.tone, "motivation": self.motivation},
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                f.write(f"情绪基调：{self.tone}\n")
+                f.write(f"中期动机：{self.motivation}\n")
         except Exception as exc:
             logger.warning("failed to save emotion: %s", exc)
 
@@ -192,7 +234,7 @@ class EmotionState:
         """Parse two-line LLM output::
 
             情绪基调：<value>
-            近期动机：<value>
+            中期动机：<value>
         """
         tone = ""
         motivation = ""
@@ -202,7 +244,7 @@ class EmotionState:
                 val = line.split("：", 1)[-1].split(":", 1)[-1].strip()
                 if val and val not in ("（无）", "无"):
                     tone = val
-            elif line.startswith("近期动机"):
+            elif line.startswith("中期动机") or line.startswith("近期动机"):
                 val = line.split("：", 1)[-1].split(":", 1)[-1].strip()
                 if val and val not in ("（无）", "无"):
                     motivation = val
@@ -216,3 +258,23 @@ class EmotionState:
             updated = True
         if updated:
             self._save()
+
+
+def _parse_emotion_text(text: str) -> tuple[str, str]:
+    tone = ""
+    motivation = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("情绪基调"):
+            tone = _line_value(line)
+        elif line.startswith("中期动机") or line.startswith("近期动机"):
+            motivation = _line_value(line)
+    return tone, motivation
+
+
+def _line_value(line: str) -> str:
+    parts = re.split(r"[：:]", line, maxsplit=1)
+    if len(parts) < 2:
+        return ""
+    val = parts[1].strip()
+    return "" if val in ("（无）", "无") else val

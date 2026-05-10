@@ -93,7 +93,7 @@ planner 输出计划表增删改操作，执行器按计划等待并触发一次
 | TTS | `kokoro/tts.py` | TTS 后端分发 |
 | 记忆 | `kokoro/memory.py` | none / mem0 / KokoroMemo |
 | 认知 | `kokoro/cognition.py` | 长期认知条目和 runtime cache |
-| 情绪 | `kokoro/emotion.py` | 当前情绪基调和近期动机 |
+| 情绪 | `kokoro/emotion.py` | 当前情绪基调和中期动机 |
 | 主动搭话 | `kokoro/impulse.py` | 空闲规划和主动发言 |
 | 屏幕感知 | `kokoro/screen_interest.py` | 截图分析和缓存 |
 | Edge 缓存 | `kokoro/edge_cache.py` | 当前 Edge 标签页正文缓存 |

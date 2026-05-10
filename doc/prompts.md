@@ -32,7 +32,7 @@ prompts.format_prompt("conversation_summary.user_template", conversation="...")
 - `characters/{id}/config.toml`
 - `prompts.json`
 - `characters/{id}/cognition.json`
-- `characters/{id}/emotion.json`
+- `characters/{id}/emotion.txt`
 
 使用 `text_cli.py` 做回归测试：
 

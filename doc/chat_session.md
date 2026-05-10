@@ -64,12 +64,12 @@ runtime cache 的刷新是轻量规则：
 `kokoro/emotion.py` 维护：
 
 - `tone`：当前情绪基调
-- `motivation`：近期动机
+- `motivation`：中期动机
 
 保存位置：
 
 ```text
-characters/{id}/emotion.json
+characters/{id}/emotion.txt
 ```
 
 普通聊天和 impulse 规划都会注入 emotion context。为空时不注入。

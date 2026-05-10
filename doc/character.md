@@ -7,7 +7,7 @@ characters/{character_id}/
   {character_id}.json
   config.toml
   cognition.json
-  emotion.json
+  emotion.txt
   portrait/
     portrait.json
     *.png
@@ -61,7 +61,7 @@ llm_url = "http://127.0.0.1:8000/v1"
 
 ## Emotion
 
-`emotion.json` 存当前情绪：
+`emotion.txt` 存当前情绪：
 
 ```json
 {
@@ -92,7 +92,7 @@ llm_url = "http://127.0.0.1:8000/v1"
 1. 创建目录 `characters/my_character/`
 2. 创建 `characters/my_character/my_character.json`
 3. 可选添加 `config.toml`
-4. 可选添加 `cognition.json` 和 `emotion.json`
+4. 可选添加 `cognition.json` 和 `emotion.txt`
 5. 可选添加 `portrait/`
 6. 启动：
 
