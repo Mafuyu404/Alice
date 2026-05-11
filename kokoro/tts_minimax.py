@@ -486,9 +486,10 @@ class StreamingTTS:
                 if audio is None:
                     if prebuf:
                         for chunk in prebuf:
+                            chunk = _apply_volume(chunk)
                             if self.on_audio_frame:
                                 self.on_audio_frame(chunk)
-                            stream.write(_apply_volume(chunk))
+                            stream.write(chunk)
                         prebuf = []
                     started = False
                     prebuf_samples = 0
@@ -507,16 +508,18 @@ class StreamingTTS:
                             self._is_playing = True
                         started = True
                         for chunk in prebuf:
+                            chunk = _apply_volume(chunk)
                             if self.on_audio_frame:
                                 self.on_audio_frame(chunk)
-                            stream.write(_apply_volume(chunk))
+                            stream.write(chunk)
                         prebuf = []
                     continue
                 with self._state_lock:
                     self._is_playing = True
+                audio = _apply_volume(audio)
                 if self.on_audio_frame:
                     self.on_audio_frame(audio)
-                stream.write(_apply_volume(audio))
+                stream.write(audio)
         finally:
             with self._state_lock:
                 self._is_playing = False

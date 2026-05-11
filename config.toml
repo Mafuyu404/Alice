@@ -113,7 +113,7 @@ tts_stream_sentence_min_chars = 8
 # 类型: bool (true/false)
 # true: STT 和 TTS 可同时运行，外放无回声
 # false: 使用传统方式（戴耳机或 stt_pause_during_tts）
-enabled = false
+enabled = true
 
 # 麦克风采集到扬声器播放之间的预估延迟（毫秒）。
 # 类型: int
@@ -215,7 +215,7 @@ stt_skip_short_refine_max_chars = 18
 # true: TTS 播放时关闭麦克风输入，防止扬声器声音被麦克风捕获造成回声/混乱。
 # false: 不暂停，TTS 和 STT 同时运行（需要物理回声消除或用下方的 [aec] 配置）。
 # 注：若 [aec].enabled = true，此配置无效（由 AEC 替代）。
-stt_pause_during_tts = true
+stt_pause_during_tts = false
 
 # ===========================================================================
 # 记忆后端
@@ -273,9 +273,9 @@ portrait_click_through = false
 
 # 立绘表情选择使用的模型。留空则使用对话 LLM。
 # 类型: string
-# 设为小模型（如 "qwen2.5:1.5b"）可减少 API 调用次数和费用。
-# 因为立绘选择只需理解情绪，不需要很强的模型。
-portrait_model = "qwen2.5:1.5b"
+# 注意：如果有角色配置覆盖了 llm_model（如蓬莱用 charglm-4），
+# 此处必须显式指定，避免回退到角色专用的对话模型。
+portrait_model = "deepseek-v4-flash"
 
 # ===========================================================================
 # 字幕覆盖层 — 流式显示 LLM 输出

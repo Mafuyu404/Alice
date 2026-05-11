@@ -197,7 +197,7 @@ class StreamingTTS:
                         print(f"\n  [latency] tts_first_audio {time.perf_counter() - t0:.2f}s")
                     chunks.append(audio)
                     if self.on_audio_frame:
-                        self.on_audio_frame(audio)
+                        self.on_audio_frame(_apply_volume(audio))
                 _play_audio_chunks(chunks)
         finally:
             with self._state_lock:

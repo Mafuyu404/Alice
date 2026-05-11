@@ -517,6 +517,11 @@ def main() -> None:
 
             # LLM done → transition to SPEAKING
             machine.emit(sm.SystemEvent.LLM_DONE)
+
+            # Trigger impulse planning immediately after LLM output (don't wait for TTS)
+            if _impulse is not None:
+                _impulse.on_conversation_end()
+
             if tts_engine:
                 machine.set_tts_state(sm.TTSState.STREAMING)
 
@@ -540,10 +545,6 @@ def main() -> None:
             # Clear subtitle
             if _subtitle_client:
                 _subtitle_client.clear()
-
-            # Trigger impulse planning after conversation ends
-            if _impulse is not None:
-                _impulse.on_conversation_end()
 
         except Exception as exc:
             print(f"\n[error] on_refined: {type(exc).__name__}: {exc}")

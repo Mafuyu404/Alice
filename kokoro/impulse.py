@@ -730,6 +730,10 @@ class ImpulsePlanner:
 
             # LLM done → SPEAKING
             self.machine.emit(sm.SystemEvent.LLM_DONE)
+
+            # Re-plan immediately after LLM output (don't wait for TTS)
+            self.on_conversation_end()
+
             if self.tts_engine:
                 self.machine.set_tts_state(sm.TTSState.STREAMING)
 
@@ -750,9 +754,6 @@ class ImpulsePlanner:
             if self.subtitle_client:
                 self.subtitle_client.clear()
             self.machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-
-            # Re-plan after impulse speech.
-            self.on_conversation_end()
 
         except Exception as exc:
             print(f"\n[impulse error] {type(exc).__name__}: {exc}")
