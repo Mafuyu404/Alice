@@ -43,7 +43,7 @@ def load() -> dict[str, dict[str, str]]:
     return characters
 
 
-def build_system_prompt(char: dict[str, str]) -> str:
+def build_system_prompt(char: dict[str, str], user_name: str = "你") -> str:
     name = char.get("name", "助手")
     background = char.get("background", "")
     example_dialogue = char.get("example_dialogue", "")
@@ -59,6 +59,7 @@ def build_system_prompt(char: dict[str, str]) -> str:
 
     base_prompt = template.format(
         name=name,
+        user_name=user_name,
         description=char.get("description", ""),
         personality=char.get("personality", ""),
         background=background,

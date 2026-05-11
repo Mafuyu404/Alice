@@ -13,6 +13,7 @@ from kokoro import prompts
 from kokoro import screen_interest
 from kokoro import token_usage
 from kokoro import vision
+from kokoro import config as cfg
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,7 @@ def build_waiting_reply(
                 character_text=character_text,
                 recent_text=recent_text,
                 user_text=user_text,
+                user_name=cfg_mod.user_name(),
             ),
         },
     ]

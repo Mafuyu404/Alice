@@ -21,6 +21,7 @@ class ChatSession:
     character_id: str
     character_data: dict
     memory_backend: object
+    user_name: str = "你"
     max_history: int = 20
     history: list[dict] = field(default_factory=list)
     screen_contexts: list[str] = field(default_factory=list)
@@ -38,14 +39,19 @@ class ChatSession:
     # Periodic cognition evaluation (every N conversation turns)
     cognition_eval_interval: int = 5
     _cognition_turn_counter: int = 0
+    # Memory event store (structured event extraction)
+    memory_events: object = field(default=None)  # MemoryEventStore
 
     def __post_init__(self) -> None:
         from kokoro.cognition import CognitionStore
         from kokoro.emotion import EmotionState
+        from kokoro.memory_events import MemoryEventStore
         if self.cognition is None:
             self.cognition = CognitionStore(self.character_id, self.character_data)
         if self.emotion is None:
             self.emotion = EmotionState(self.character_id)
+        if self.memory_events is None:
+            self.memory_events = MemoryEventStore(self.memory_backend, self.character_id)
 
     @property
     def character_name(self) -> str:
@@ -53,7 +59,7 @@ class ChatSession:
 
     @property
     def system_prompt(self) -> str:
-        return character.build_system_prompt(self.character_data)
+        return character.build_system_prompt(self.character_data, user_name=self.user_name)
 
     @property
     def character_config(self) -> dict:
@@ -162,14 +168,15 @@ class ChatSession:
                 daemon=True,
             ).start()
 
-        if async_store:
+        # Memory event extraction (replaces raw conversation-pair storage)
+        if self.memory_events is not None:
+            with self._summarize_lock:
+                summary = self.summary
             threading.Thread(
-                target=self.memory_backend.store,
-                args=(user_text, assistant_text, self.character_id),
+                target=self.memory_events.on_conversation_turn,
+                args=(user_text, assistant_text, self.user_name, self.character_name, summary),
                 daemon=True,
             ).start()
-        else:
-            self.memory_backend.store(user_text, assistant_text, user_id=self.character_id)
 
         # Refresh cognition cache — keyword match against current turn, no LLM
         self.cognition.refresh_cache(user_text, assistant_text)
@@ -177,7 +184,7 @@ class ChatSession:
         # Async emotion evaluation — LLM-based, non-blocking
         threading.Thread(
             target=self.emotion.evaluate,
-            args=(user_text, assistant_text, self.character_name),
+            args=(user_text, assistant_text, self.character_name, self.user_name),
             daemon=True,
         ).start()
 
@@ -195,7 +202,7 @@ class ChatSession:
         try:
             conv_lines = []
             for msg in batch:
-                role = "User" if msg["role"] == "user" else self.character_name
+                role = self.user_name if msg["role"] == "user" else self.character_name
                 conv_lines.append(f"{role}: {msg['content']}")
             conv_text = "\n".join(conv_lines)
 
@@ -219,6 +226,7 @@ class ChatSession:
                         memories=memories or "",
                         character_name=self.character_name,
                         character_id=self.character_id,
+                        user_name=self.user_name,
                     )
                 except Exception as cexc:
                     logger.warning("cognition evaluation failed: %s", cexc)
@@ -230,7 +238,7 @@ class ChatSession:
     def _eval_cognition_async(self, user_text: str, assistant_text: str) -> None:
         """Periodic lightweight cognition evaluation (no summary needed)."""
         try:
-            conv_text = f"用户：{user_text}\n{self.character_name}：{assistant_text}"
+            conv_text = f"{self.user_name}：{user_text}\n{self.character_name}：{assistant_text}"
             memories = self.memory_backend.get_context(
                 conv_text[:500], user_id=self.character_id,
             )
@@ -240,6 +248,7 @@ class ChatSession:
                 memories=memories or "",
                 character_name=self.character_name,
                 character_id=self.character_id,
+                user_name=self.user_name,
             )
         except Exception as exc:
             logger.warning("periodic cognition evaluation failed: %s", exc)
@@ -320,16 +329,17 @@ def load_session(
     max_history: int = 20,
     cognition_eval_interval: int | None = None,
 ) -> ChatSession:
+    from kokoro import config as cfg
     characters = character.load()
     if character_id not in characters:
         raise KeyError(character_id)
     if cognition_eval_interval is None:
-        from kokoro import config as cfg
         cognition_eval_interval = cfg.cognition_eval_interval()
     return ChatSession(
         character_id=character_id,
         character_data=characters[character_id],
         memory_backend=memory_backend,
+        user_name=cfg.user_name(),
         max_history=max_history,
         cognition_eval_interval=cognition_eval_interval,
     )

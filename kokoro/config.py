@@ -120,6 +120,11 @@ def is_deepseek_model(model: str) -> bool:
     return model.startswith("deepseek")
 
 
+def user_name() -> str:
+    """当前与 AI 对话的用户名称。用于提示词和认知/情绪/记忆层。"""
+    return get("user_name", "真冬")
+
+
 def stt_refine_model() -> str:
     return get("stt_refine_model", "qwen2.5:1.5b")
 

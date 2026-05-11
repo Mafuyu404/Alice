@@ -54,6 +54,7 @@ class CognitionStore:
         memories: str,
         character_name: str,
         character_id: str,
+        user_name: str = "你",
     ) -> None:
         from kokoro import config as cfg
         from kokoro import prompts
@@ -68,13 +69,15 @@ class CognitionStore:
             "saved": False,
             "error": "",
         }
-        system_prompt = prompts.format_prompt("cognition.evaluate_system", name=character_name)
+        system_prompt = prompts.format_prompt("cognition.evaluate_system", name=character_name, user_name=user_name)
         user_prompt = prompts.format_prompt(
             "cognition.evaluate_user",
             existing=existing,
             conversation=conversation,
             summary=summary,
             memories=memories,
+            name=character_name,
+            user_name=user_name,
         )
         debug["system_prompt"] = system_prompt
         debug["user_prompt"] = user_prompt

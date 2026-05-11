@@ -40,6 +40,7 @@ class EmotionState:
         user_text: str,
         assistant_text: str,
         character_name: str,
+        user_name: str = "你",
     ) -> dict:
         """Evaluate current emotion after a conversation turn (async).
 
@@ -64,7 +65,7 @@ class EmotionState:
         if not user_text and not assistant_text:
             return debug
 
-        system_prompt = prompts.format_prompt("emotion.evaluate_system", name=character_name)
+        system_prompt = prompts.format_prompt("emotion.evaluate_system", name=character_name, user_name=user_name)
 
         tone_line = f"情绪基调：{self.tone}" if self.tone else "情绪基调：（无）"
         moti_line = f"中期动机：{self.motivation}" if self.motivation else "中期动机：（无）"
@@ -73,6 +74,7 @@ class EmotionState:
         user_prompt = prompts.format_prompt(
             "emotion.evaluate_user",
             name=character_name,
+            user_name=user_name,
             current=current,
             user_text=user_text,
             assistant_text=assistant_text,

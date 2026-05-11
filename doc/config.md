@@ -7,6 +7,23 @@
 
 合并规则：`config.toml` 优先；当 TOML 中某项为空、缺失、空数组或空字典时，由 `config.json` 填充。
 
+## 用户身份
+
+```toml
+user_name = "真冬"
+```
+
+设定当前与 AI 对话的用户名称。AI 会以这个名字称呼、记忆对方。
+
+影响范围：
+- 系统提示词（AI 知道在和谁对话）
+- 认知层（cognition）条目索引
+- 情绪层（emotion）评估
+- 记忆事件提取和总结
+- 对话摘要
+
+更换名字后，认知条目和长期记忆会以新名字重新建立。
+
 ## LLM
 
 ```toml
@@ -98,6 +115,23 @@ kokoromo_dir = "D:/program/kokoromemo"
 - `kokoromemo`
 
 mem0 的 LLM、embedding、生命周期参数在 `[mem0.*]` 段配置。
+
+## 记忆事件
+
+```toml
+[memory_events]
+enabled = true
+eval_interval = 3
+eval_model = ""
+```
+
+代替原始对话对存储，每轮对话由 LLM 提取为结构化事件（desc + tags）。
+
+- `enabled`：总开关。
+- `eval_interval`：事件总结周期（每 N 轮一次）。提取的事件先缓存在内存，积累到周期后由 LLM 统一去重合并。
+- `eval_model`：提取和总结使用的模型。留空使用 `llm_model`。
+
+事件生命周期：提取 → pending → 定期总结（stable → mem0，cache → 继续缓存）→ 进程关闭时全部刷入 mem0。
 
 ## 立绘和字幕
 

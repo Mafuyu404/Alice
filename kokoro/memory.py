@@ -172,7 +172,16 @@ class Mem0Backend(MemoryBackend):
                 if not text:
                     continue
                 tag = self._format_time(item.get("created_at"))
-                lines.append(f"- [{tag}] {text}" if tag else f"- {text}")
+                # Show tags from metadata if available (event-style memories)
+                meta_tags = []
+                metadata = item.get("metadata") or {}
+                raw_tags = metadata.get("tags") if isinstance(metadata, dict) else None
+                if raw_tags and isinstance(raw_tags, list):
+                    meta_tags = [str(t) for t in raw_tags if t]
+                tag_str = f"[{tag}]" if tag else ""
+                tags_str = f" #{' #'.join(meta_tags)}" if meta_tags else ""
+                line = f"- {tag_str}{tags_str} {text}" if (tag_str or tags_str) else f"- {text}"
+                lines.append(line)
             return "\n\n【记忆】\n" + "\n".join(lines) if lines else ""
         except Exception as exc:
             logger.warning("mem0 search failed: %s", exc)
@@ -191,6 +200,7 @@ class Mem0Backend(MemoryBackend):
             "memory_importance.user_template",
             user_msg=user_msg,
             assistant_msg=assistant_msg,
+            user_name=cfg_mod.user_name(),
         )
         try:
             import requests

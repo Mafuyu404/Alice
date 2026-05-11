@@ -827,6 +827,13 @@ def main() -> None:
             _stt_subtitle_client.shutdown()
         if tts_engine:
             tts_engine.close()
+        # Flush cached memory events to vector store
+        if session is not None and hasattr(session, 'memory_events') and session.memory_events is not None:
+            session.memory_events.flush_all(
+                user_name=session.user_name,
+                character_name=session.character_name,
+                summary=session.summary or "",
+            )
 
 
 if __name__ == "__main__":
