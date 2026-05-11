@@ -88,6 +88,14 @@ stt_pause_during_tts = true
 - `inline`：本地清洗 + 聊天 LLM 隐式纠错，延迟低。
 - `none`：只做本地清洗。
 
+### 重叠分类模型
+
+```toml
+overlap_model = "qwen2.5:0.5b"
+```
+
+用户插话时判断打断级别的模型。0.5B 级小模型即可，输出 continue / soft_break / hard_break。所有决策由模型驱动，无硬编码规则。
+
 ## 人格层
 
 ```toml

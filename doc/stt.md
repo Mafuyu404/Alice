@@ -16,21 +16,38 @@ stt_skip_short_refine_max_chars = 18
 stt_pause_during_tts = true
 ```
 
-## 流程
+## 流程（新架构）
 
 1. `cli.py` 打开麦克风。
 2. `kokoro/stt.py` 用 sherpa-onnx 做流式识别。
-3. `kokoro/pool.py` 聚合识别片段。
-4. 文本稳定后进入精炼流程。
-5. 精炼后的文本进入 ChatSession。
+3. `kokoro/conversation.py`（ConversationManager）接管 STT 流，实时输出 partial 结果。
+4. 如果用户说话时 AI 也在说（重叠），调用 `kokoro/overlap.py`（0.5B 模型）判断打断级别。
+5. 用户说完（endpoint）或模型判定需要打断时，文本进入 ChatSession。
+
+旧 `kokoro/pool.py`（ConversationPool）已被 ConversationManager 取代。
+
+## 重叠说话
+
+当用户和 AI 同时说话时，系统不再简单地硬打断。而是通过 `overlap_model`（默认 qwen2.5:0.5b）判断：
+
+- **continue** — 用户在附和（嗯/对/啊），AI 继续说。
+- **soft_break** — 用户开始说实质性内容，AI 播完当前音频块后让出话轮。
+- **hard_break** — 用户紧急打断，AI 立即停止。
+
+所有决策由模型驱动，没有硬编码阈值。
+
+配置：
+
+```toml
+overlap_model = "qwen2.5:0.5b"
+```
 
 ## 精炼模式
 
 `separate`：
 
-- 独立调用小模型修正 STT 文本。
-- 质量较高。
-- 延迟较高。
+- （旧模式）独立调用小模型修正 STT 文本。
+- 在新 ConversationManager 中不再使用，保留兼容。
 
 `inline`：
 
@@ -59,10 +76,8 @@ python cli.py --device 1
 
 ## TTS 播放期间暂停麦克风
 
-推荐开启：
+不再推荐。配合 AEC + ConversationManager，STT 和 TTS 可以同时运行：
 
 ```toml
-stt_pause_during_tts = true
+stt_pause_during_tts = false
 ```
-
-这样能避免扬声器声音被麦克风重新识别。

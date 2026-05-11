@@ -221,6 +221,7 @@ class StreamingTTS:
         self._buf: list[str] = []
         self._is_playing = False
         self._should_stop = False
+        self._soft_stop = False  # Finish current sentence/phrase then stop gracefully
         self._state_lock = threading.Lock()
         # Optional callback: called with each audio chunk before playback.
         # Used by AEC to capture the far-end reference signal.
@@ -297,7 +298,7 @@ class StreamingTTS:
             self._ws.send(json.dumps(_task_continue(text)))
             return True
         except Exception as exc:
-            logger.warning("TTS send failed: %s", exc)
+            logger.debug("TTS send failed: %s", exc)
             with self._pending_lock:
                 self._pending_count = max(0, self._pending_count - 1)
                 if self._pending_count == 0:
@@ -370,9 +371,21 @@ class StreamingTTS:
                 pass
             self._stream = None
 
+    def soft_interrupt(self) -> None:
+        """Graceful stop — finish the current audio chunk then yield the floor.
+
+        Unlike hard_interrupt, this does NOT drain the pending queue or close
+        the WebSocket.  The play worker will stop after writing the current
+        chunk, keeping the connection alive for the next utterance.
+        """
+        self._soft_stop = True
+        # Allow the recv worker to reconnect if the server closes the connection
+        self._session_done = False
+
     def interrupt(self) -> None:
         """Stop playback immediately and reset state for a new session."""
         self._should_stop = True
+        self._soft_stop = False
         self._session_done = True
         self._buf = []
         with self._pending_lock:
@@ -475,6 +488,16 @@ class StreamingTTS:
             prebuf_samples = 0
             started = False
             while not self._should_stop:
+                # Check for graceful stop request
+                if self._soft_stop:
+                    self._soft_stop = False
+                    prebuf = []
+                    prebuf_samples = 0
+                    started = False
+                    with self._state_lock:
+                        self._is_playing = False
+                    # Don't drain the audio queue — keep connection alive
+
                 try:
                     audio = self._audio_queue.get(timeout=0.15)
                 except queue.Empty:
@@ -486,6 +509,9 @@ class StreamingTTS:
                 if audio is None:
                     if prebuf:
                         for chunk in prebuf:
+                            if self._soft_stop:
+                                self._soft_stop = False
+                                break
                             chunk = _apply_volume(chunk)
                             if self.on_audio_frame:
                                 self.on_audio_frame(chunk)
@@ -498,6 +524,9 @@ class StreamingTTS:
                     continue
 
                 if not started:
+                    if self._soft_stop:
+                        self._soft_stop = False
+                        continue
                     prebuf.append(audio)
                     prebuf_samples += len(audio)
                     if prebuf_samples >= self._buffer_samples:
@@ -508,18 +537,31 @@ class StreamingTTS:
                             self._is_playing = True
                         started = True
                         for chunk in prebuf:
+                            if self._soft_stop:
+                                self._soft_stop = False
+                                started = False
+                                break
                             chunk = _apply_volume(chunk)
                             if self.on_audio_frame:
                                 self.on_audio_frame(chunk)
                             stream.write(chunk)
                         prebuf = []
                     continue
+
+                # -- started is True, play individual chunks --
                 with self._state_lock:
                     self._is_playing = True
                 audio = _apply_volume(audio)
                 if self.on_audio_frame:
                     self.on_audio_frame(audio)
                 stream.write(audio)
+                if self._soft_stop:
+                    self._soft_stop = False
+                    with self._state_lock:
+                        self._is_playing = False
+                    started = False
+                    prebuf = []
+                    prebuf_samples = 0
         finally:
             with self._state_lock:
                 self._is_playing = False

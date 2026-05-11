@@ -48,3 +48,23 @@
 - 是否正确发出 `TTS_DONE`
 
 状态机的目标是让完整模式可控；精简文字模式绕过它以减少测试变量。
+
+## ConversationPhase（新增）
+
+引入 `ConversationalPhase` 枚举作为对话层面的状态描述，与 `SystemState` 并行：
+
+| Phase | 含义 |
+|-------|------|
+| IDLE | 无人说话，无待处理输出 |
+| USER_SPEAKING | 用户持有话轮（STT 产出 partial） |
+| USER_PAUSED | 用户暂停但未结束话轮 |
+| AI_THINKING | LLM 生成中 |
+| AI_SPEAKING | AI 持有话轮（TTS 播放中） |
+| OVERLAP | 用户和 AI 同时说话 |
+| WAITING | AI 等待响应当中 |
+
+与 `SystemState` 的区别：
+- SystemState = **系统忙不忙**（IDLE / THINKING / SPEAKING / ERROR）
+- ConversationalPhase = **谁在说话、话轮到哪了**
+
+`set_conversation_phase()` 通过 `subscribe_phase` 通知观察者。

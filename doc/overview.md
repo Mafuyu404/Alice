@@ -8,8 +8,8 @@ Alice Chat 由入口层、会话层、模型层、工具层、感知层、输出
 
 完整桌面入口。启动后会按配置初始化：
 
-- 麦克风 STT
-- 对话池和 STT 精炼
+- 麦克风 STT（AEC 回声消除）
+- 对话池（ConversationManager + 重叠分类器）
 - ChatSession
 - LLM streaming 或 agent tool loop
 - TTS
@@ -90,6 +90,9 @@ planner 输出计划表增删改操作，执行器按计划等待并触发一次
 | 工具 | `kokoro/tool_registry.py` | 内置工具注册与执行 |
 | 文字工具 | `kokoro/text_cli_tools.py` | 项目内文件读写工具 |
 | STT | `kokoro/stt.py` | 麦克风语音识别 |
+| AEC | `kokoro/aec.py` | WebRTC 声学回声消除 |
+| 对话调度 | `kokoro/conversation.py` | 自然对话事件驱动调度 |
+| 重叠分类 | `kokoro/overlap.py` | 0.5B 模型判定插话打断级别 |
 | TTS | `kokoro/tts.py` | TTS 后端分发 |
 | 记忆 | `kokoro/memory.py` | none / mem0 / KokoroMemo |
 | 认知 | `kokoro/cognition.py` | 长期认知条目和 runtime cache |

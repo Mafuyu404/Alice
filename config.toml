@@ -196,6 +196,12 @@ stt_refine_mode = "inline"
 # 根据用户说话习惯调整。一般 1.0 ~ 2.0 秒。
 stt_refine_stable_seconds = 0.7
 
+# 重叠（同时说话）分类模型。
+# 类型: string（Ollama 模型名）
+# 用户插话时，用此模型判断AI应继续说话、软打断还是硬打断。
+# 推荐 qwen2.5:0.5b 等小模型，延迟是关键。
+overlap_model = "qwen2.5:0.5b"
+
 # 对话池轮询间隔（秒）。
 # 类型: float
 # 后台线程检查是否有稳定文本的频率。越小越及时，但 CPU 开销略高。

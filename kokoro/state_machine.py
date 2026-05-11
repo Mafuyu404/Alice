@@ -61,6 +61,28 @@ class PortraitState(StrEnum):
     NEUTRAL = "NEUTRAL"
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Conversational phase — new parallel state track for natural dialogue
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ConversationalPhase(StrEnum):
+    """Who holds the floor and what's happening in the conversation.
+
+    Unlike the legacy SystemState, this is NOT a strict state machine with
+    pre-defined transitions.  It's a descriptor that components (especially
+    ConversationManager) update to reflect the current conversational reality.
+    Multiple phases are possible — e.g. OVERLAP means both user and AI have
+    audio active simultaneously.
+    """
+    IDLE = "IDLE"                        # No one speaking, no pending thought
+    USER_SPEAKING = "USER_SPEAKING"      # User has the floor (STT producing partials)
+    USER_PAUSED = "USER_PAUSED"          # User stopped but utterance not finalized yet
+    AI_THINKING = "AI_THINKING"          # LLM generating (user silent)
+    AI_SPEAKING = "AI_SPEAKING"          # AI has the floor (TTS active)
+    OVERLAP = "OVERLAP"                  # User and AI both speaking simultaneously
+    WAITING = "WAITING"                  # AI waiting to respond (user has final text, LLM pending)
+
+
 class ProactiveState(StrEnum):
     DISABLED = "DISABLED"
     ACCRUING = "ACCRUING"
@@ -180,6 +202,10 @@ class SystemStateMachine:
 
         # System state
         self._system_state = SystemState.INITIALIZING
+
+        # Conversational phase (new parallel track)
+        self._conversation_phase = ConversationalPhase.IDLE
+        self._phase_observers: list[Callable[[ConversationalPhase, ConversationalPhase], None]] = []
 
         # Component states
         self._stt_state = STTState.INACTIVE
@@ -308,6 +334,35 @@ class SystemStateMachine:
     def set_proactive_state(self, state: ProactiveState) -> None:
         with self._lock:
             self._proactive_state = state
+
+    # ── conversational phase API ───────────────────────────────────────────
+
+    @property
+    def conversation_phase(self) -> ConversationalPhase:
+        with self._lock:
+            return self._conversation_phase
+
+    def set_conversation_phase(self, new_phase: ConversationalPhase) -> None:
+        """Update the conversation phase and notify observers."""
+        with self._lock:
+            old = self._conversation_phase
+            if old == new_phase:
+                return
+            self._conversation_phase = new_phase
+            for observer in self._phase_observers:
+                try:
+                    observer(old, new_phase)
+                except Exception:
+                    pass
+
+    def subscribe_phase(self, callback: Callable[[ConversationalPhase, ConversationalPhase], None]) -> None:
+        """Subscribe to conversation phase changes: callback(old_phase, new_phase)."""
+        with self._lock:
+            self._phase_observers.append(callback)
+
+    def unsubscribe_phase(self, callback: Callable) -> None:
+        with self._lock:
+            self._phase_observers = [cb for cb in self._phase_observers if cb is not callback]
 
     # ── observers ──────────────────────────────────────────────────────────
 

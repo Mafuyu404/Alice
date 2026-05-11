@@ -21,12 +21,12 @@ import requests
 
 from kokoro import chat_session
 from kokoro import config as cfg
+from kokoro import conversation as conversation_mod
 from kokoro import llm_client
 from kokoro import prompts
 from kokoro import memory_events
 from kokoro import memory as mem_mod
 from kokoro import portrait_controller
-from kokoro import pool as pool_mod
 from kokoro import impulse as impulse_mod
 from kokoro import screen_interest
 from kokoro import state_machine as sm
@@ -391,34 +391,48 @@ def main() -> None:
     else:
         _impulse = None
         machine.set_proactive_state(sm.ProactiveState.DISABLED)
-    # ── conversation handler (called by pool when STT text is ready) ───────
-    def on_refined(text: str) -> None:
+    # ── conversation handler (fast path: in STT thread, must not block) ─────
+    def on_user_utterance(text: str) -> None:
         if _stt_subtitle_client:
             _stt_subtitle_client.clear()
         display_user(text)
         if _impulse is not None:
             _impulse.reset()
 
-        # Emit state transition: → THINKING
-        if not machine.emit(sm.SystemEvent.STT_REFINED):
-            # 状态机拒绝 — 系统正忙(THINKING/SPEAKING)，barge-in 让路
-            if machine.is_busy:
-                cancel = _current_cancel[0]
-                if cancel:
-                    cancel.set()
-                if tts_engine:
-                    tts_engine.interrupt()
-                if _aec_processor is not None:
-                    _aec_processor.reset()
-                machine.emit(sm.SystemEvent.USER_SPEECH_START)
-                machine.set_stt_state(sm.STTState.LISTENING)
-                # 重试：机器已进入 LISTENING，STT_REFINED 应该可以通过了
-                if not machine.emit(sm.SystemEvent.STT_REFINED):
-                    return
-            else:
-                return
+        reason = getattr(conversation, 'last_reason', 'endpoint')
+        is_overlap = machine.tts_state in (sm.TTSState.STREAMING, sm.TTSState.DRAINING)
 
-        # 恢复 TTS 连接（中断后 WS 已死，prepare 内会自动重建）
+        # Handle barge-in quickly — just signal, don't block
+        if machine.is_busy:
+            cancel = _current_cancel[0]
+            if cancel:
+                cancel.set()
+            if tts_engine:
+                if is_overlap and "hard_break" in reason:
+                    tts_engine.interrupt()
+                elif is_overlap:
+                    tts_engine.soft_interrupt()
+                else:
+                    tts_engine.interrupt()
+            if _aec_processor is not None:
+                _aec_processor.reset()
+            machine.emit(sm.SystemEvent.USER_SPEECH_START)
+            machine.set_stt_state(sm.STTState.LISTENING)
+
+        if not machine.emit(sm.SystemEvent.STT_REFINED):
+            return
+
+        conversation.reset_stream()
+
+        # Spawn a worker for the heavy work (LLM, TTS) so STT thread stays free
+        threading.Thread(
+            target=_handle_conversation,
+            args=(text,),
+            daemon=True,
+        ).start()
+
+    # ── conversation worker (runs in its own thread, may block) ────────────
+    def _handle_conversation(text: str) -> None:
         if tts_engine:
             try:
                 tts_engine.prepare()
@@ -434,8 +448,6 @@ def main() -> None:
                 command = user_commands.detect(text)
                 if command:
                     print(f"\n  [command] {command.type} confidence={command.confidence:.2f}")
-
-                    # Start vision immediately, parallel with waiting-reply LLM + TTS
                     vision_result: list[user_commands.CommandResult | Exception | None] = [None]
                     vision_ready = threading.Event()
 
@@ -487,8 +499,6 @@ def main() -> None:
                             print(f"\n  [screen] command {label}: {result.user_visible_note}")
                             command_context = result.context or result.user_visible_note
 
-            # Live mode: inject co-streaming context so the AI knows user speech
-            # might be directed at viewers, not necessarily at the AI.
             bilibili_ctx = prompts.get("cli.bilibili_live_context", "")
             if _bilibili_enabled and _bilibili_live_mode and command_context:
                 command_context = f"{bilibili_ctx}\n\n{command_context}"
@@ -511,14 +521,11 @@ def main() -> None:
                 return
 
             if cancelled:
-                # User interrupted — STT worker already transitioned to LISTENING
                 _current_cancel[0] = None
                 return
 
-            # LLM done → transition to SPEAKING
             machine.emit(sm.SystemEvent.LLM_DONE)
 
-            # Trigger impulse planning immediately after LLM output (don't wait for TTS)
             if _impulse is not None:
                 _impulse.on_conversation_end()
 
@@ -537,37 +544,27 @@ def main() -> None:
                     return
                 tts_engine.prepare()
 
-            # TTS done → back to IDLE
             machine.set_tts_state(sm.TTSState.IDLE)
             machine.emit(sm.SystemEvent.TTS_DONE)
             machine.reset_error_count()
 
-            # Clear subtitle
             if _subtitle_client:
                 _subtitle_client.clear()
 
         except Exception as exc:
-            print(f"\n[error] on_refined: {type(exc).__name__}: {exc}")
+            print(f"\n[error] _handle_conversation: {type(exc).__name__}: {exc}")
             traceback.print_exc()
-            machine.emit_error("on_refined")
+            machine.emit_error("_handle_conversation")
         finally:
             _current_cancel[0] = None
 
-    # ── STT pool ───────────────────────────────────────────────────────────
+    # ── STT + ConversationManager ──────────────────────────────────────────
     refine_url, refine_model, refine_key = refine_endpoint()
-    pool = pool_mod.ConversationPool(
-        llm_url=refine_url,
-        llm_model=refine_model,
-        on_refined=on_refined,
-        api_key=refine_key,
-        mode=_stt_refine_mode,
-    )
 
     device = args.device if args.device is not None else stt_mod.find_input_device()
     if device is None:
         print("\n[error] No microphone device found.")
         print("Run `python cli.py --list-devices` to inspect available devices.\n")
-        pool.stop()
         return
 
     model_path = stt_mod.download_model(CONFIG.get("stt_model_dir", "models/stt"))
@@ -576,7 +573,24 @@ def main() -> None:
         model_path,
         argparse.Namespace(num_threads=4, hotwords="", hotwords_score=1.5, verbose=False),
     )
-    stt_stream = recognizer.create_stream()
+
+    # ── ConversationManager (replaces old ConversationPool + manual STT loop) ──
+    def _on_stt_partial(text: str) -> None:
+        if _stt_subtitle_client:
+            _stt_subtitle_client.push_text(text, mode="set")
+        sys.stdout.write(f"\r\033[K  [STT] {text}")
+        sys.stdout.flush()
+        if machine.is_idle or machine.state == sm.SystemState.SCREEN_WATCHING:
+            machine.emit(sm.SystemEvent.USER_SPEECH_START)
+            machine.set_stt_state(sm.STTState.LISTENING)
+
+    conversation = conversation_mod.ConversationManager(
+        recognizer=recognizer,
+        machine=machine,
+        on_user_utterance=on_user_utterance,
+        on_partial=_on_stt_partial,
+        sample_rate=stt_mod.SAMPLE_RATE,
+    )
 
     print()
     print("=" * 50)
@@ -605,17 +619,14 @@ def main() -> None:
     # ── system ready ───────────────────────────────────────────────────────
     machine.emit(sm.SystemEvent.INIT_DONE)
 
-    # ── STT worker ─────────────────────────────────────────────────────────
-    last_partial = ""
+    # ── STT worker — feeds AEC-cleaned audio into ConversationManager ──────
     pause_during_tts = cfg.stt_pause_during_tts()
     if _aec_processor is not None:
-        pause_during_tts = False  # AEC 处理回声，不需要暂停 STT
+        pause_during_tts = False
 
     def stt_worker() -> None:
-        nonlocal last_partial, stt_stream
         import sounddevice as sd
 
-        tts_was_playing = False
         audio_stream = None
         try:
             audio_stream = sd.InputStream(
@@ -631,53 +642,14 @@ def main() -> None:
                 chunk, _ = audio_stream.read(1600)
 
                 if pause_during_tts and tts_engine and tts_engine.is_playing:
-                    tts_was_playing = True
-                    continue
-
-                if tts_was_playing:
-                    tts_was_playing = False
-                    stt_stream = recognizer.create_stream()
-                    last_partial = ""
-                    if _stt_subtitle_client:
-                        _stt_subtitle_client.clear()
                     continue
 
                 if _aec_processor is not None:
                     mono = _aec_processor.process(chunk[:, 0])
                 else:
                     mono = stt_mod.denoise(chunk[:, 0])
-                stt_stream.accept_waveform(stt_mod.SAMPLE_RATE, mono)
 
-                if recognizer.is_ready(stt_stream):
-                    recognizer.decode_stream(stt_stream)
-                    text = recognizer.get_result(stt_stream)
-                    if text:
-                        pool.add_chunk(text)
-                        if text != last_partial:
-                            if _stt_subtitle_client:
-                                _stt_subtitle_client.push_text(text, mode="set")
-                            sys.stdout.write(f"\r\033[K  [STT] {text}")
-                            sys.stdout.flush()
-                            last_partial = text
-                            # Signal that user is speaking
-                            if machine.is_idle or machine.state == sm.SystemState.SCREEN_WATCHING:
-                                machine.emit(sm.SystemEvent.USER_SPEECH_START)
-                                machine.set_stt_state(sm.STTState.LISTENING)
-                            elif machine.is_thinking or machine.is_speaking:
-                                # 不立即 barge-in — 等 endpoint 拿到完整文本后再处理
-                                # 避免"爱"这种不完整片段提前取消 LLM
-                                pass
-                    if recognizer.is_endpoint(stt_stream):
-                        if machine.is_busy:
-                            # 系统忙时不 reset 识别器 — 用户可能继续说
-                            # 不清空流，让新文本"爱丽丝"自然延续"晚上好"成为"晚上好爱丽丝"
-                            pass
-                        else:
-                            if _stt_subtitle_client:
-                                _stt_subtitle_client.clear()
-                            recognizer.reset(stt_stream)
-                            last_partial = ""
-                            machine.emit(sm.SystemEvent.USER_SPEECH_END)
+                conversation.feed_audio(mono)
         except Exception as exc:
             print(f"\n[STT error] {exc}")
             traceback.print_exc()
@@ -812,7 +784,6 @@ def main() -> None:
         print("\n\n[cli] Stopping...")
     finally:
         machine.emit(sm.SystemEvent.SHUTDOWN)
-        pool.stop()
         if _bilibili_manager is not None:
             _bilibili_manager.stop()
         print()

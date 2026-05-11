@@ -157,6 +157,13 @@ def stt_skip_short_refine_max_chars() -> int:
     return int(get("stt_skip_short_refine_max_chars", 18))
 
 
+# ── Overlap classifier ────────────────────────────────────────────────────────
+
+def overlap_model() -> str:
+    """重叠分类用模型。小模型（0.5B）即可，负责判断用户插话时的打断级别。"""
+    return get("overlap_model", "qwen2.5:0.5b")
+
+
 # ── AEC (Acoustic Echo Cancellation) ──────────────────────────────────────────
 
 def aec_enabled() -> bool:
