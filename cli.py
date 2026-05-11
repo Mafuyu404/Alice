@@ -22,6 +22,7 @@ import requests
 from kokoro import chat_session
 from kokoro import config as cfg
 from kokoro import llm_client
+from kokoro import prompts
 from kokoro import memory_events
 from kokoro import memory as mem_mod
 from kokoro import portrait_controller
@@ -266,6 +267,25 @@ def main() -> None:
 
     model = args.model or session.character_config.get("llm_model") or cfg.llm_model()
     tts_engine = create_tts_engine(not args.no_tts, session.character_data.get("tts_voice_id"))
+
+    # ── AEC (Acoustic Echo Cancellation) ────────────────────────────────────────
+    _aec_processor = None
+    if cfg.aec_enabled() and tts_engine is not None:
+        try:
+            from kokoro.aec import AECProcessor
+
+            tts_sr = tts_mod.SAMPLE_RATE
+            _aec_processor = AECProcessor(
+                mic_sample_rate=stt_mod.SAMPLE_RATE,
+                tts_sample_rate=tts_sr,
+                ns_level=cfg.aec_ns_level(),
+            )
+            _aec_processor.set_delay(cfg.aec_delay_ms())
+            tts_engine.on_audio_frame = _aec_processor.push_reference
+            print(f"  [aec] enabled (playback_sr={tts_sr}, mic_sr={stt_mod.SAMPLE_RATE}, delay={cfg.aec_delay_ms()}ms)")
+        except Exception as exc:
+            print(f"  [aec] init failed: {exc}")
+            _aec_processor = None
     portrait_client = None
     portrait_worker = None
     if not args.no_portrait:
@@ -388,6 +408,8 @@ def main() -> None:
                     cancel.set()
                 if tts_engine:
                     tts_engine.interrupt()
+                if _aec_processor is not None:
+                    _aec_processor.reset()
                 machine.emit(sm.SystemEvent.USER_SPEECH_START)
                 machine.set_stt_state(sm.STTState.LISTENING)
                 # 重试：机器已进入 LISTENING，STT_REFINED 应该可以通过了
@@ -438,7 +460,7 @@ def main() -> None:
                             api_key=refine_key,
                         )
                     except Exception:
-                        waiting_reply = "好，我看一下。"
+                        waiting_reply = prompts.get("cli.waiting_reply_fallback", "好，我看一下。")
 
                     print(f"\n{session.character_name}: {waiting_reply}")
                     if tts_engine:
@@ -467,18 +489,11 @@ def main() -> None:
 
             # Live mode: inject co-streaming context so the AI knows user speech
             # might be directed at viewers, not necessarily at the AI.
+            bilibili_ctx = prompts.get("cli.bilibili_live_context", "")
             if _bilibili_enabled and _bilibili_live_mode and command_context:
-                command_context = (
-                    "【双人直播中】我们在同一个直播间直播。"
-                    "我刚才说的话可能是对观众说的、在解说、或者自言自语，不一定是直接问你。"
-                    "你可以自己判断是否要接话。\n\n"
-                ) + command_context
+                command_context = f"{bilibili_ctx}\n\n{command_context}"
             elif _bilibili_enabled and _bilibili_live_mode:
-                command_context = (
-                    "【双人直播中】我们在同一个直播间直播。"
-                    "我刚才说的话可能是对观众说的、在解说、或者自言自语，不一定是直接问你。"
-                    "你可以自己判断是否要接话。"
-                )
+                command_context = bilibili_ctx
 
             messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=_stt_refine_inline, inject_memory=not _tool_enabled)
 
@@ -577,6 +592,8 @@ def main() -> None:
     print(f"  Memory events: {memory_detector.config.enabled}")
     print(f"  Bilibili live: {_bilibili_enabled and _bilibili_manager is not None} (live_mode={_bilibili_live_mode})")
     print(f"  Subtitle: {_subtitle_client is not None} | STT subtitle: {_stt_subtitle_client is not None}")
+    aec_enabled_str = "enabled" if _aec_processor is not None else "disabled"
+    print(f"  AEC: {aec_enabled_str}")
     print("  Ctrl+C to stop")
     print("=" * 50)
 
@@ -590,6 +607,8 @@ def main() -> None:
     # ── STT worker ─────────────────────────────────────────────────────────
     last_partial = ""
     pause_during_tts = cfg.stt_pause_during_tts()
+    if _aec_processor is not None:
+        pause_during_tts = False  # AEC 处理回声，不需要暂停 STT
 
     def stt_worker() -> None:
         nonlocal last_partial, stt_stream
@@ -622,7 +641,10 @@ def main() -> None:
                         _stt_subtitle_client.clear()
                     continue
 
-                mono = stt_mod.denoise(chunk[:, 0])
+                if _aec_processor is not None:
+                    mono = _aec_processor.process(chunk[:, 0])
+                else:
+                    mono = stt_mod.denoise(chunk[:, 0])
                 stt_stream.accept_waveform(stt_mod.SAMPLE_RATE, mono)
 
                 if recognizer.is_ready(stt_stream):

@@ -14,6 +14,7 @@ from typing import Any
 import requests
 import websockets
 
+from kokoro import prompts
 from kokoro import vision
 
 
@@ -212,7 +213,7 @@ def format_for_prompt(path_value: str, max_chars: int = 4000) -> str:
     if not data:
         return ""
     if data.get("error"):
-        return f"Edge页面缓存不可用：{data.get('error')}"
+        return prompts.format_prompt("edge_cache.error_format", error=data.get('error', ''))
 
     tab = data.get("tab") if isinstance(data.get("tab"), dict) else {}
     title = str(tab.get("title") or "（无标题）")
@@ -223,7 +224,7 @@ def format_for_prompt(path_value: str, max_chars: int = 4000) -> str:
         return ""
 
     if len(text) > max_chars:
-        text = text[:max_chars] + "\n...（已截断）"
+        text = text[:max_chars] + prompts.get("edge_cache.truncated_suffix", "\n...（已截断）")
 
     lines = [
         f"标题：{title}",

@@ -56,6 +56,7 @@ class CognitionStore:
         character_id: str,
     ) -> None:
         from kokoro import config as cfg
+        from kokoro import prompts
         from kokoro import token_usage
 
         existing = json.dumps(self._entries, ensure_ascii=False, indent=2)
@@ -67,47 +68,13 @@ class CognitionStore:
             "saved": False,
             "error": "",
         }
-        system_prompt = (
-            f"你是{character_name}的认知层维护器。你的任务是维护长期、稳定、可复用的认知条目，"
-            "而不是记录临时页面、一次性计划或对话流水账。"
-        )
-        user_prompt = (
-            f"现有认知条目（JSON）：\n{existing}\n\n"
-            f"最近对话内容：\n{conversation}\n\n"
-            f"对话摘要：\n{summary}\n\n"
-            f"相关长期记忆：\n{memories}\n\n"
-            "请结合以上信息输出更新后的完整认知 JSON。\n\n"
-            "认知层定义：\n"
-            "- 记录 Alice 对确定存在的人、关系、自我、长期事物、游戏、作品、项目的稳定认知。\n"
-            "- 它会长期影响之后的态度、措辞和解释方式。\n"
-            "- 它不是长期记忆流水账，也不是当前页面缓存。\n\n"
-            "最重要规则：\n"
-            "1. 对任何确定存在的人，尽量建立单独条目。key 直接用姓名或昵称，例如“真冬”“某观众昵称”。\n"
-            "2. 关系也单独建条目，例如“真冬和自己的关系”。\n"
-            "3. 直播观众如果有稳定昵称和可归纳特征，也应单独建条目，不要合并成笼统的“观众”。\n"
-            "4. 如果同一批对话介绍了多个不同的人或多个不同游戏/作品/项目，必须尽量分别保留独立 key，不要只总结成一个泛化条目。\n"
-            "5. 已有有效条目默认保留。只有明确被新信息纠正、过期、短期污染或 key 不合格时才删除；不要因为本轮没提到就删除。\n"
-            "6. key 必须简单可匹配。禁止括号、冒号、方括号、长句、日期、临时限定词。\n"
-            "7. 禁止写入当前页面、当前网页、今天计划、今晚安排、刚才的弹幕、一次性任务、临时屏幕内容。\n"
-            "8. Edge 页面和屏幕内容只能作为判断材料；只有反复出现、具有长期意义的事物才能沉淀，例如“我的世界”“Minecraft模组”“自动化”。\n"
-            "9. value 要短而密，1 到 3 句，描述稳定偏好、印象、关系、说话风格或未来对话态度。\n"
-            "10. 删除或改写已过期、短期、无法匹配、带括号的旧条目。\n"
-            "11. 宁可少写，也不要把临时上下文写进 cognition。\n\n"
-            "批量实体要求：\n"
-            "- 人物：如果出现“某人叫X / X经常 / X喜欢 / X总是 / X是观众”等确定描述，应建立 key“X”。\n"
-            "- 游戏/作品/项目：如果出现“游戏X / X是一款 / X的核心是 / X适合”等确定描述，应建立 key“X”。\n"
-            "- 不要把十个人压缩成“观众”，不要把十个游戏压缩成“游戏”。\n\n"
-            "硬性自检：\n"
-            "- 输出前先在心里列出最近对话中所有确定存在的人名/昵称，逐一检查是否都有独立 key。\n"
-            "- 输出前先在心里列出最近对话中所有确定存在的游戏/作品/项目名，逐一检查是否都有独立 key。\n"
-            "- 如果对话明确介绍了 5 个不同的人，完整 JSON 中至少应包含这 5 个具体人名 key。\n"
-            "- 如果对话明确介绍了 5 个不同游戏/作品/项目，完整 JSON 中至少应包含这 5 个具体对象名 key。\n"
-            "- 泛化条目可以作为补充，但不能替代具体人名、昵称、游戏名、作品名。\n"
-            "- 不要输出自检过程，只输出最终 JSON。\n\n"
-            "好 key 示例：真冬、真冬和自己的关系、Alice、我的世界、Minecraft模组、自动化、某观众昵称。\n"
-            "坏 key 示例：真冬（当前互动对象）、观众：历史互动、当前页面、今天的计划、FTB NeoTech页面。\n\n"
-            "只输出 JSON，不要解释。格式：\n"
-            "{\"entries\": {\"简单key\": \"长期认知文本\"}}\n"
+        system_prompt = prompts.format_prompt("cognition.evaluate_system", name=character_name)
+        user_prompt = prompts.format_prompt(
+            "cognition.evaluate_user",
+            existing=existing,
+            conversation=conversation,
+            summary=summary,
+            memories=memories,
         )
         debug["system_prompt"] = system_prompt
         debug["user_prompt"] = user_prompt

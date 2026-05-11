@@ -47,6 +47,7 @@ class EmotionState:
         If both are unchanged or absent, they stay empty.
         """
         from kokoro import config as cfg
+        from kokoro import prompts
         from kokoro import token_usage
 
         debug = {
@@ -63,41 +64,18 @@ class EmotionState:
         if not user_text and not assistant_text:
             return debug
 
-        system_prompt = (
-            f"你是{character_name}的情绪层维护器。你的任务是根据每次对话后的结果，"
-            "维护浅层情绪基调和中期动机。"
-        )
+        system_prompt = prompts.format_prompt("emotion.evaluate_system", name=character_name)
 
         tone_line = f"情绪基调：{self.tone}" if self.tone else "情绪基调：（无）"
         moti_line = f"中期动机：{self.motivation}" if self.motivation else "中期动机：（无）"
         current = f"{tone_line}\n{moti_line}"
 
-        user_prompt = (
-            f"当前情绪：\n{current}\n\n"
-            f"最近的对话：\n"
-            f"用户：{user_text}\n"
-            f"{character_name}：{assistant_text}\n\n"
-            "请输出更新后的情绪状态。\n\n"
-            "定义：\n"
-            "- 情绪基调是浅层、当前可感知的情绪色彩，例如因为对方持续敷衍而不太开心，或被认真夸奖后轻微开心。\n"
-            "- 中期动机是一小段时间内想做的事，例如发现对方心情沮丧后想让他振作，或发现对方在认真测试后想配合完成测试。\n\n"
-            "稳定性规则：\n"
-            "1. 情绪基调可以随对话变化，但不要因为一句普通话就剧烈翻转。\n"
-            "2. 中期动机应比情绪更稳定，通常持续数轮；只有目标完成、明显失败或出现更强动机时才改写。\n"
-            "3. 如果上一轮情绪/动机仍然合理，应保留并轻微修正，不要每轮清空。\n"
-            "4. 如果对方明显敷衍、低落、夸奖、求助、焦虑或认真测试，应反映在情绪或动机里。\n"
-            "5. 情绪和动机要能影响下一轮回复方式，但不能覆盖用户的明确问题。\n"
-            "6. 不要写长期人格、长期记忆、具体事实档案；这些不属于 emotion。\n\n"
-            "基调清空规则：\n"
-            "- “稳定”“收束”“普通提问”不等于没有情绪；活跃对话中通常仍有平稳、专注、轻微愉悦、轻微受挫等浅层基调。\n"
-            "- 只有对话确实完全没有可感知情绪色彩，且上一轮基调也不再适用时，才可以把情绪基调留空。\n"
-            "- 如果仍在测试、协助、安抚、收束或被评价，就不要输出“无”，应写出低强度但具体的基调。\n\n"
-            "文本要求：\n"
-            "- 每项最多一句，短而具体。\n"
-            "- 没有明显内容时可留空，但不要偷懒；如果对话有情绪信号或可行动目标，就必须写。\n\n"
-            "输出格式（只输出两行，不要多余文字）：\n"
-            "情绪基调：\n"
-            "中期动机："
+        user_prompt = prompts.format_prompt(
+            "emotion.evaluate_user",
+            name=character_name,
+            current=current,
+            user_text=user_text,
+            assistant_text=assistant_text,
         )
         debug["system_prompt"] = system_prompt
         debug["user_prompt"] = user_prompt

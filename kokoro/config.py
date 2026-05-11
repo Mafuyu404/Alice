@@ -152,6 +152,29 @@ def stt_skip_short_refine_max_chars() -> int:
     return int(get("stt_skip_short_refine_max_chars", 18))
 
 
+# ── AEC (Acoustic Echo Cancellation) ──────────────────────────────────────────
+
+def aec_enabled() -> bool:
+    section = get("aec", {})
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
+
+
+def aec_delay_ms() -> int:
+    section = get("aec", {})
+    if not isinstance(section, dict):
+        return 50
+    return int(section.get("delay_ms", 50))
+
+
+def aec_ns_level() -> int:
+    section = get("aec", {})
+    if not isinstance(section, dict):
+        return 2
+    return int(section.get("ns_level", 2))
+
+
 # ── cognition / emotion ─────────────────────────────────────────────────────────
 
 def cognition_model() -> str:

@@ -65,7 +65,7 @@ def handle_look_at_screen(arguments: dict, **context) -> str:
         return prompts.get("tool_calling.privacy_blocked", "当前窗口可能包含隐私内容，已跳过屏幕识别。")
 
     focus = arguments.get("focus", "").strip()
-    prompt_text = focus or "请详细描述当前桌面截图的内容，包括前台窗口的标题、正文、按钮和关键信息。"
+    prompt_text = focus or prompts.get("tool_handlers.look_at_screen_default", "请详细描述当前桌面截图的内容，包括前台窗口的标题、正文、按钮和关键信息。")
     try:
         result = vision.detect_desktop(prompt=prompt_text, timeout=timeout)
     except Exception as exc:

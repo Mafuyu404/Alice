@@ -9,7 +9,7 @@ import queue
 import re
 import threading
 import time
-from typing import Generator, Optional, Tuple
+from typing import Callable, Generator, Optional, Tuple
 
 import numpy as np
 import sounddevice as sd
@@ -222,6 +222,9 @@ class StreamingTTS:
         self._is_playing = False
         self._should_stop = False
         self._state_lock = threading.Lock()
+        # Optional callback: called with each audio chunk before playback.
+        # Used by AEC to capture the far-end reference signal.
+        self.on_audio_frame: "Optional[Callable[[np.ndarray], None]]" = None
         self._llm_text_started_at = 0.0
         self._llm_to_tts_logged = False
         self._audio_queue: queue.Queue[np.ndarray | None] = queue.Queue()
@@ -483,6 +486,8 @@ class StreamingTTS:
                 if audio is None:
                     if prebuf:
                         for chunk in prebuf:
+                            if self.on_audio_frame:
+                                self.on_audio_frame(chunk)
                             stream.write(_apply_volume(chunk))
                         prebuf = []
                     started = False
@@ -490,6 +495,7 @@ class StreamingTTS:
                     with self._state_lock:
                         self._is_playing = False
                     continue
+
                 if not started:
                     prebuf.append(audio)
                     prebuf_samples += len(audio)
@@ -501,11 +507,15 @@ class StreamingTTS:
                             self._is_playing = True
                         started = True
                         for chunk in prebuf:
+                            if self.on_audio_frame:
+                                self.on_audio_frame(chunk)
                             stream.write(_apply_volume(chunk))
                         prebuf = []
                     continue
                 with self._state_lock:
                     self._is_playing = True
+                if self.on_audio_frame:
+                    self.on_audio_frame(audio)
                 stream.write(_apply_volume(audio))
         finally:
             with self._state_lock:

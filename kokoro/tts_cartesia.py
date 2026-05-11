@@ -7,7 +7,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Generator, Optional, Tuple
+from typing import Callable, Generator, Optional, Tuple
 
 import numpy as np
 
@@ -142,6 +142,9 @@ class StreamingTTS:
         self._pending_plays = 0
         self._state_lock = threading.Lock()
         self._should_stop = False
+        # Optional callback: called with each audio chunk before playback.
+        # Used by AEC to capture the far-end reference signal.
+        self.on_audio_frame: "Optional[Callable[[np.ndarray], None]]" = None
 
     @property
     def is_playing(self) -> bool:
@@ -193,6 +196,8 @@ class StreamingTTS:
                         first_audio_logged = True
                         print(f"\n  [latency] tts_first_audio {time.perf_counter() - t0:.2f}s")
                     chunks.append(audio)
+                    if self.on_audio_frame:
+                        self.on_audio_frame(audio)
                 _play_audio_chunks(chunks)
         finally:
             with self._state_lock:
