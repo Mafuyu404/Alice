@@ -455,7 +455,7 @@ class ImpulsePlanner:
 
         # Recent 4 rounds of conversation
         recent_history = self.session.history[-8:] if len(self.session.history) >= 8 else list(self.session.history)
-        recent_text = _format_history(recent_history, user_name=getattr(self.session, 'user_name', '你')) if recent_history else "（无）"
+        recent_text = _format_history(recent_history, user_name=getattr(self.session, 'user_name', '你'), character_name=self.session.character_name) if recent_history else "（无）"
 
         screen_text = screen_result or "（无屏幕内容）"
         if edge_page_context:
@@ -768,12 +768,12 @@ class ImpulsePlanner:
 # Utilities
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _format_history(messages: list[dict], user_name: str = "你") -> str:
+def _format_history(messages: list[dict], user_name: str = "你", character_name: str = "角色") -> str:
     lines: list[str] = []
     for msg in messages:
-        role = user_name if msg.get("role") == "user" else "角色"
+        role = user_name if msg.get("role") == "user" else character_name
         content = str(msg.get("content", ""))[:300]
-        lines.append(f"{role}: {content}")
+        lines.append(f"{role}：{content}")
     return "\n".join(lines)
 
 

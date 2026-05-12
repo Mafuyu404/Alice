@@ -15,6 +15,21 @@
 user_name = "真冬"
 
 # ===========================================================================
+# 场景模式 — 决定 LLM 的信息输入源布局
+# ===========================================================================
+
+# 当前对话场景。决定 AI 如何理解说话人和信息来源。
+# 类型: string
+# 可选值:
+#   "single_chat"  — 单人普通对话，仅你和 AI 一对一聊天
+#   "single_live"  — 单人直播，你说话 + 观众弹幕（自动由 bilibili_live.live_mode 开启）
+#   "multi_chat"   — 多人普通对话，多个人轮流发言（预留，尚未完整实现）
+#   "multi_live"   — 多人直播，多人 + 弹幕（预留，尚未完整实现）
+# 注意: 当 bilibili_live.live_mode = true 时，scene 自动升级为 *_live 变体。
+[scene]
+mode = "single_chat"
+
+# ===========================================================================
 # LLM 路由
 # ===========================================================================
 
@@ -267,7 +282,7 @@ enabled = true
 # 提取的事件先在 pending_events 中积累，每 N 轮进行去重合并、
 # 判断哪些事件已过时（写入 mem0）、哪些仍需缓存。
 # 推荐范围: 2 ~ 5。
-eval_interval = 3
+eval_interval = 2
 
 # 事件提取和总结使用的模型。留空则使用 llm_model。
 # 类型: string
@@ -522,7 +537,7 @@ memory_lookup_score = 70.0
 # 类型: string（英文，传给记忆后端的搜索查询）
 # 预设查询会传入记忆后端进行语义搜索。
 # 可修改为关注特定类型记忆，如 "user's hobbies, recent plans"
-memory_lookup_query = "recent important user preferences, plans, dates, anniversaries, goals"
+memory_lookup_query = "user's detailed preferences, specific life events, past conversations topics, hobbies, plans, opinions, personal experiences, goals, and important dates"
 # 是否开启周期性记忆事件轮询。
 # 类型: bool
 # 独立于屏幕监控，另外开一个线程轮询记忆事件（纪念日匹配、定期记忆查询）。
@@ -559,6 +574,7 @@ enabled = true
 # 并将弹幕观众视为具体的人在认知层留下词条。
 # 类型: bool (true/false)
 live_mode = true
+	# å¼å¯åèªå¨å° [scene] åçº§ä¸º *_live åä½ï¼å½±åå¯¹è¯å¼å¯¼è¯ã
 
 # Bilibili 直播间房间号（URL 中的数字）。
 # 例如 https://live.bilibili.com/7777 的房间号为 7777。
@@ -614,12 +630,12 @@ importance_mode = "auto"
 # 越高：召回的记忆越精准但可能漏掉相关记忆。
 # 越低：召回更多但可能包含不相关的噪音。
 # 推荐范围: 0.2 ~ 0.5。
-search_threshold = 0.3
+search_threshold = 0.2
 # 每次召回返回的最大记忆条数。
 # 类型: int
 # 召回的记忆会注入到对话上下文中，太多会让 LLM 分心。
 # 推荐范围: 3 ~ 12。
-search_top_k = 8
+search_top_k = 12
 
 # ===========================================================================
 # 工具调用 (Tool Calling / Function Calling)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
 import warnings
 from typing import Any
 
@@ -26,7 +27,7 @@ class MemoryBackend:
     def get_context(self, query: str, user_id: str = "default") -> str:
         return ""
 
-    def store(self, user_msg: str, assistant_msg: str, user_id: str = "default") -> None:
+    def store(self, user_msg: str, assistant_msg: str, user_id: str = "default", name: str = "助手") -> None:
         pass
 
     def list_memories(self, user_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
@@ -166,13 +167,26 @@ class Mem0Backend(MemoryBackend):
             items = result.get("results") or []
             items.sort(key=lambda item: item.get("score", 0) or 0, reverse=True)
 
+            # Dedup: skip items too similar to earlier (higher-scored) ones
+            seen: list[str] = []
             lines = []
             for item in items:
                 text = item.get("memory", "")
                 if not text:
                     continue
+                # Simple dedup by normalized text overlap
+                norm = re.sub(r"[^一-鿟\w]", "", text).lower()[:80]
+                if norm and len(norm) >= 4:
+                    is_dup = False
+                    for existing in seen:
+                        if norm in existing or existing in norm:
+                            is_dup = True
+                            break
+                    if is_dup:
+                        continue
+                    seen.append(norm)
+
                 tag = self._format_time(item.get("created_at"))
-                # Show tags from metadata if available (event-style memories)
                 meta_tags = []
                 metadata = item.get("metadata") or {}
                 raw_tags = metadata.get("tags") if isinstance(metadata, dict) else None
@@ -193,7 +207,7 @@ class Mem0Backend(MemoryBackend):
             return True
         return stripped.lower() in {"嗯", "好", "ok", "好的", "是的", "对", "是", "?", "？", "。", "..."}
 
-    def _check_importance_llm(self, user_msg: str, assistant_msg: str) -> bool:
+    def _check_importance_llm(self, user_msg: str, assistant_msg: str, name: str = "助手") -> bool:
         model = self._lc["importance_llm"] or "qwen2.5:1.5b"
         base_url = self._lc["importance_llm_url"] or cfg_mod.llm_url()
         prompt = prompts.format_prompt(
@@ -201,6 +215,7 @@ class Mem0Backend(MemoryBackend):
             user_msg=user_msg,
             assistant_msg=assistant_msg,
             user_name=cfg_mod.user_name(),
+            name=name,
         )
         try:
             import requests
@@ -229,16 +244,16 @@ class Mem0Backend(MemoryBackend):
             logger.warning("[mem0] importance LLM call failed: %s", exc)
         return self._is_trivial(user_msg) and self._is_trivial(assistant_msg)
 
-    def _is_conversation_trivial(self, user_msg: str, assistant_msg: str) -> bool:
+    def _is_conversation_trivial(self, user_msg: str, assistant_msg: str, name: str = "助手") -> bool:
         if self._lc["importance_mode"] == "auto":
-            return self._check_importance_llm(user_msg, assistant_msg)
+            return self._check_importance_llm(user_msg, assistant_msg, name=name)
         return self._is_trivial(user_msg) and self._is_trivial(assistant_msg)
 
-    def store(self, user_msg: str, assistant_msg: str, user_id: str = "default") -> None:
+    def store(self, user_msg: str, assistant_msg: str, user_id: str = "default", name: str = "助手") -> None:
         if not self._ok:
             return
         try:
-            if self._is_conversation_trivial(user_msg, assistant_msg):
+            if self._is_conversation_trivial(user_msg, assistant_msg, name=name):
                 logger.debug("[mem0] skipped trivial conversation")
                 return
 

@@ -171,6 +171,7 @@ class MemoryEventStore:
         self._pending: list[StoredEvent] = []
         self._cache: list[StoredEvent] = []
         self._counter = 0
+        self._seen_descs: set[str] = set()  # cross-cycle dedup: normalized descs already written
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -199,9 +200,8 @@ class MemoryEventStore:
         if not all_events:
             return
 
-        dedup: list[str] = []
         for event in all_events:
-            self._write_event(event, _dedup_bucket=dedup)
+            self._write_event(event)
         self._pending.clear()
         self._cache.clear()
         _logger.info("memory event flush: %d events written", len(all_events))
@@ -259,9 +259,8 @@ class MemoryEventStore:
 
         stable, keep_cache = result
 
-        dedup: list[str] = []
         for event in stable:
-            self._write_event(event, _dedup_bucket=dedup)
+            self._write_event(event)
 
         self._pending = []
         self._cache = keep_cache
@@ -271,20 +270,23 @@ class MemoryEventStore:
             len(stable), len(keep_cache),
         )
 
-    def _write_event(self, event: StoredEvent, _dedup_bucket: list[str] | None = None) -> None:
-        """Store a single event to the mem0 backend with simple dedup."""
+    def _write_event(self, event: StoredEvent) -> None:
+        """Store a single event to the mem0 backend with session-level dedup."""
         if not self._memory_backend or not event.desc:
             return
         _mem = getattr(self._memory_backend, '_mem', None)
         if _mem is None:
             return
 
-        # Simple dedup: skip if a similar desc exists in the current batch
-        if _dedup_bucket is not None:
-            if _is_duplicate(event.desc, _dedup_bucket):
-                _logger.debug("dedup skipped: %s", event.desc[:60])
-                return
-            _dedup_bucket.append(_normalize_desc(event.desc))
+        # Session-level dedup: skip if a similar desc was already written this session
+        norm = _normalize_desc(event.desc)
+        if norm and len(norm) >= 4:
+            # Check against all previously written events in this session
+            for existing_norm in self._seen_descs:
+                if norm in existing_norm or existing_norm in norm:
+                    _logger.debug("dedup skipped (cross-cycle): %s", event.desc[:60])
+                    return
+            self._seen_descs.add(norm)
 
         try:
             _mem.add(

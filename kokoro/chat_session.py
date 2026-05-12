@@ -12,6 +12,7 @@ from typing import Callable, Optional
 
 from kokoro import character
 from kokoro import prompts
+from kokoro import scene as scene_mod
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ class ChatSession:
     _cognition_turn_counter: int = 0
     # Memory event store (structured event extraction)
     memory_events: object = field(default=None)  # MemoryEventStore
+    # Scene type — determines information source layout and guidance prompt
+    _scene: object = field(default=None)  # scene_mod.SceneType | None
 
     def __post_init__(self) -> None:
         from kokoro.cognition import CognitionStore
@@ -52,6 +55,9 @@ class ChatSession:
             self.emotion = EmotionState(self.character_id)
         if self.memory_events is None:
             self.memory_events = MemoryEventStore(self.memory_backend, self.character_id)
+        if self._scene is None:
+            from kokoro import config as _cfg
+            self._scene = scene_mod.resolve(_cfg.load())
 
     @property
     def character_name(self) -> str:
@@ -60,6 +66,16 @@ class ChatSession:
     @property
     def system_prompt(self) -> str:
         return character.build_system_prompt(self.character_data, user_name=self.user_name)
+
+    @property
+    def scene_name(self) -> str:
+        """Human-readable scene name for the guidance prefix."""
+        return scene_mod.scene_name(self._scene)
+
+    @property
+    def scene_guidance(self) -> str:
+        """Scene guidance block describing information sources."""
+        return scene_mod.guidance_text(self._scene, self.user_name, self.character_name)
 
     @property
     def character_config(self) -> dict:
@@ -109,6 +125,12 @@ class ChatSession:
         with self._summarize_lock:
             if self.summary:
                 messages.append({"role": "system", "content": f"【对话摘要】\n{self.summary}"})
+        # Scene guidance — describes the information source layout
+        guidance = self.scene_guidance
+        if guidance:
+            prefix = prompts.get("scene.prefix", "【当前场景：{scene_name}】")
+            scene_label = prefix.format(scene_name=self.scene_name)
+            messages.append({"role": "system", "content": f"{scene_label}\n{guidance}"})
         if include_screen and self.screen_contexts:
             screen_text = prompts.get("chat_session.screen_context_prefix", "")
             for i, ctx in enumerate(self.screen_contexts, 1):
@@ -203,7 +225,7 @@ class ChatSession:
             conv_lines = []
             for msg in batch:
                 role = self.user_name if msg["role"] == "user" else self.character_name
-                conv_lines.append(f"{role}: {msg['content']}")
+                conv_lines.append(f"{role}：{msg['content']}")
             conv_text = "\n".join(conv_lines)
 
             with self._summarize_lock:
@@ -258,6 +280,7 @@ class ChatSession:
             "conversation_summary.user_template",
             existing_summary=existing_summary or "无",
             conversation=conversation,
+            user_name=self.user_name,
         )
         system = prompts.get("conversation_summary.system", "")
 
