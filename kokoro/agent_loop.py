@@ -105,6 +105,7 @@ def agent_chat(
     Also supports tuple unpacking: reply, cancelled = result
     """
     _subtitle = getattr(agent_config, "subtitle_client", None) if agent_config else None
+    capture = tool_context.pop("capture", False) if isinstance(tool_context, dict) else False
     if agent_config is None or not agent_config.tools or agent_config.tool_registry is None:
         reply, cancelled = _simple_stream(
             messages, model,
@@ -115,6 +116,7 @@ def agent_chat(
             api_key=api_key,
             usage_callback=usage_callback,
             subtitle_client=_subtitle,
+            capture=capture,
         )
         return AgentResult(reply=reply, cancelled=cancelled, tool_calls_made=0)
 
@@ -281,8 +283,10 @@ def _simple_stream(
     api_key: str | None = None,
     usage_callback=None,
     subtitle_client=None,
+    capture: bool = False,
 ) -> tuple[str, bool]:
-    """Fallback: plain streaming without tools."""
+    """Fallback: plain streaming without tools.
+    If capture=True, suppress printing and TTS (caller handles both)."""
     reply = ""
     paren_filter = _ParenFilter()
     for content in llm_client.stream_chat(
@@ -297,9 +301,10 @@ def _simple_stream(
         content = paren_filter.filter(content)
         if not content:
             continue
-        print(content, end="", flush=True)
+        if not capture:
+            print(content, end="", flush=True)
         reply += content
-        if tts_engine:
+        if tts_engine and not capture:
             tts_engine.push(content)
         if subtitle_client:
             subtitle_client.push_text(content, mode="append")

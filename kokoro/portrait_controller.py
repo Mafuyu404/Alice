@@ -246,6 +246,17 @@ class PortraitDecisionWorker:
 
         catalog = "\n".join(f"- {item['id']}: {item.get('notes', '')}" for item in self.notes)
 
+        char_name = self.character_id.capitalize()
+        try:
+            from kokoro import character as _char_mod
+            chars = _char_mod.load()
+            char_data = chars.get(self.character_id, {})
+            if isinstance(char_data, dict):
+                char_name = char_data.get("name", char_name)
+        except Exception:
+            pass
+        user_name = cfg.user_name()
+
         messages = [
             {
                 "role": "system",
@@ -260,6 +271,8 @@ class PortraitDecisionWorker:
                     assistant_text=assistant_text,
                     time_info=time_info,
                     catalog=catalog,
+                    user_name=user_name,
+                    name=char_name,
                 ),
             },
         ]

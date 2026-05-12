@@ -26,6 +26,7 @@ from kokoro import llm_client
 from kokoro import prompts
 from kokoro import memory_events
 from kokoro import memory as mem_mod
+from kokoro import multi_chat as multi_chat_mod
 from kokoro import portrait_controller
 from kokoro import impulse as impulse_mod
 from kokoro import screen_interest
@@ -116,6 +117,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no-screen-watch", action="store_true", help="Disable screen context watcher")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
     parser.add_argument("--bilibili-room", type=int, default=None, help="Bilibili live room ID (overrides config)")
+    parser.add_argument("--multi", default=None, help="Multi-character mode: comma-separated IDs, e.g. 'alice,penglai'")
+    parser.add_argument("--auto", type=int, default=5, help="Auto rounds before interactive in --multi mode")
     return parser.parse_args()
 
 
@@ -238,6 +241,10 @@ def main() -> None:
 
     if args.list_devices:
         stt_mod.list_devices()
+        return
+
+    if args.multi:
+        _run_multi_cli(args)
         return
 
     # ── state machine ──────────────────────────────────────────────────────
@@ -805,6 +812,130 @@ def main() -> None:
                 character_name=session.character_name,
                 summary=session.summary or "",
             )
+
+
+
+# ── multi-character chat ───────────────────────────────────────────────────
+
+
+_tts_lock = threading.Lock()
+
+
+def _tts_say(engine, text):
+    """Push text to TTS engine and wait for playback. Uses global lock."""
+    if engine is None:
+        return
+    with _tts_lock:
+        try:
+            engine.prepare()
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    engine.push(line)
+            engine.end_sentence()
+        except Exception as exc:
+            print("  [tts] error: " + str(exc))
+
+
+def _run_multi_cli(args):
+    """Multi-character chat with TTS + portrait."""
+    cids = [c.strip() for c in args.multi.split(",") if c.strip()]
+    if len(cids) < 2:
+        print("[error] --multi needs at least 2 character IDs")
+        return
+
+    from kokoro import character as char_mod
+    from kokoro import config as cfg
+    from kokoro import memory as mem_mod
+
+    runtime_cfg = cfg.load()
+    user_name = cfg.user_name()
+    default_model = cfg.llm_model()
+
+    tts_map = {}
+    all_chars = char_mod.load()
+    for cid in cids:
+        char_data = all_chars.get(cid, {})
+        voice_id = char_data.get("tts_voice_id")
+        if not args.no_tts:
+            try:
+                tts_mod.warmup()
+                eng = tts_mod.StreamingTTS(voice=voice_id)
+                eng.prepare()
+                tts_map[cid] = eng
+            except Exception as exc:
+                print("  [tts] init failed for " + cid + ": " + str(exc))
+
+    model = args.model or default_model
+    if "charglm" in model:
+        model = default_model
+
+    cfg_inst = multi_chat_mod.MultiChatConfig(character_ids=cids, model=model)
+    orch = multi_chat_mod.MultiChatOrchestrator(cfg_inst)
+    names = orch.character_names
+
+    _portrait_worker = None
+    if not args.no_portrait:
+        try:
+            _, _portrait_worker = portrait_controller.create_controller(cids[0], model)
+        except Exception as exc:
+            print("  [portrait] init failed: " + str(exc))
+
+    print("=" * 50)
+    print("  Multi-Character Chat")
+    for cid, cname in names.items():
+        tts_on = "on" if tts_map.get(cid) else "off"
+        print("  " + cid + " -> " + cname + "  [tts:" + tts_on + "]")
+    print("  User: " + user_name)
+    print("  Commands: /exit, /auto N")
+    print("  Empty input = auto next turn")
+    print("=" * 50)
+
+    def do_turn(cid, cname, reply):
+        if not reply:
+            return
+        print()
+        print(cname + "> " + reply)
+        engine = tts_map.get(cid)
+        if engine:
+            _tts_say(engine, reply)
+
+    if args.auto > 0:
+        print()
+        print("--- Auto " + str(args.auto) + " rounds ---")
+        for cid, cname, reply in orch.auto_cycle(rounds=args.auto):
+            do_turn(cid, cname, reply)
+
+    while True:
+        try:
+            raw = input(chr(10) + "[" + user_name + "] (enter=auto) > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not raw:
+            cid, cname, reply = orch.auto_turn()
+            do_turn(cid, cname, reply)
+            continue
+        if raw in ("/exit", "/quit"):
+            break
+        if raw.startswith("/auto "):
+            try:
+                n = int(raw.split("/auto ", 1)[1])
+            except (ValueError, IndexError):
+                n = 3
+            print()
+            print("--- Auto " + str(n) + " rounds ---")
+            for cid, cname, reply in orch.auto_cycle(rounds=n):
+                do_turn(cid, cname, reply)
+            continue
+        cid, cname, reply = orch.user_turn(raw)
+        do_turn(cid, cname, reply)
+
+    for engine in tts_map.values():
+        try:
+            engine.close()
+        except Exception:
+            pass
+
 
 
 if __name__ == "__main__":

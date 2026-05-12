@@ -44,6 +44,15 @@ class ChatSession:
     memory_events: object = field(default=None)  # MemoryEventStore
     # Scene type — determines information source layout and guidance prompt
     _scene: object = field(default=None)  # scene_mod.SceneType | None
+    # Config overrides — applied on top of the per-character config.toml
+    # Used by relay mode to force different model/URL without touching disk
+    _config_overrides: dict = field(default_factory=dict)
+
+    def _character_config(self) -> dict:
+        """Disk config merged with overrides."""
+        cfg = character.load_config(self.character_id)
+        cfg.update(self._config_overrides)
+        return cfg
 
     def __post_init__(self) -> None:
         from kokoro.cognition import CognitionStore
@@ -79,9 +88,8 @@ class ChatSession:
 
     @property
     def character_config(self) -> dict:
-        """Per-character config from characters/{id}/config.toml.
-        Re-reads from disk on every access for hot-reload during debugging."""
-        return character.load_config(self.character_id)
+        """Per-character config from characters/{id}/config.toml + overrides."""
+        return self._character_config()
 
     def add_screen_context(self, content: str) -> None:
         self.screen_contexts.append(content)
