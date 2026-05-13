@@ -14,6 +14,7 @@ import requests
 from kokoro import agent_loop
 from kokoro import chat_session
 from kokoro import config as cfg
+from kokoro import dialogue_orchestrator as dialogue_mod
 from kokoro import llm_client
 from kokoro import memory as mem_mod
 from kokoro import multi_chat
@@ -22,6 +23,17 @@ from kokoro import token_usage
 
 
 CONFIG = cfg.load()
+
+
+class _NullLayer:
+    def get_context(self) -> str:
+        return ""
+
+    def refresh_cache(self, *args, **kwargs) -> None:
+        return
+
+    def evaluate(self, *args, **kwargs) -> None:
+        return
 
 
 def get_args() -> argparse.Namespace:
@@ -66,7 +78,18 @@ def main() -> None:
         return
 
     session.load_summary()
+    if args.no_memory:
+        session.summary = ""
+        session.cognition = _NullLayer()
+        session.emotion = _NullLayer()
+        session.memory_events = None
     model = args.model or session.character_config.get("llm_model") or cfg.llm_model()
+    dialogue = dialogue_mod.DialogueOrchestrator(
+        config=runtime_config,
+        session=session,
+        model=model,
+        memory_backend=memory_backend,
+    )
 
     agent_config = None
     registry = None
@@ -142,10 +165,32 @@ def main() -> None:
                 transcript.write(f"```text\n{usage}\n```\n\n")
                 continue
 
-            messages = session.build_messages(
-                user_text,
-                include_screen=False,
-                inject_memory=not args.no_memory,
+            decision = dialogue.decide(dialogue_mod.DialogueEvent(
+                type="user_utterance",
+                text=user_text,
+                source="user",
+            ))
+
+            if decision.action in ("silence", "observe", "cancel_plan"):
+                if decision.action == "cancel_plan":
+                    dialogue.cancel_plans()
+                dialogue.record_user_observation(user_text, decision)
+                print(f"\n{session.character_name}> [no reply]")
+                transcript.write(f"{session.character_name}: [no reply]\n\n")
+                continue
+
+            if decision.action == "schedule":
+                dialogue.record_user_observation(user_text, decision)
+                dialogue.add_plan(decision, created_from=user_text)
+                print(f"\n{session.character_name}> [scheduled]")
+                transcript.write(f"{session.character_name}: [scheduled]\n\n")
+                continue
+
+            history_window = 30 if ("总结" in user_text or "summary" in user_text.lower()) else None
+            messages = dialogue.build_reply_messages(
+                user_text=user_text,
+                decision=decision,
+                max_history_messages=history_window,
             )
 
             print(f"\n{session.character_name}> ", end="", flush=True)

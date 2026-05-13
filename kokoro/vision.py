@@ -382,7 +382,7 @@ def batch_analyze_images(
 
 
 def describe(
-    prompt: str = "请详细描述这张图片中的内容",
+    prompt: str = "",
     model: str | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
@@ -410,6 +410,8 @@ def describe(
     timeout : int
         HTTP request timeout in seconds.
     """
+    if not prompt:
+        prompt = prompts.get("vision.describe_default", "请详细描述这张图片中的内容")
     conf = cfg.load()
     if backend is None:
         backend = conf.get(KEY_BACKEND, "") or "dashscope"
@@ -477,7 +479,7 @@ def detect_desktop(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Screen capture + vision recognition")
-    parser.add_argument("--prompt", "-p", default="请详细描述这张图片中的内容")
+    parser.add_argument("--prompt", "-p", default=prompts.get("vision.describe_default", "请详细描述这张图片中的内容"))
     parser.add_argument("--model", "-m", default=None)
     parser.add_argument("--backend", "-b", default=None, choices=["ollama", "dashscope"])
     parser.add_argument("--base-url", default=None)

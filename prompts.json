@@ -51,6 +51,7 @@
     "user_template": "已有摘要：\n{existing_summary}\n\n新对话内容：\n{conversation}\n\n请将上述新对话内容合并到已有摘要中。保留以下信息：讨论过的话题、{user_name}的观点和偏好、决定和计划、重要的上下文。去掉已经过时的、已被新内容覆盖的信息。输出简洁的 3-5 句中文摘要，不要多余的解释。\n\n更新后的摘要："
   },
   "vision": {
+    "describe_default": "请详细描述这张图片中的内容",
     "analyze_suffix": "\n\n===== 系统进程信息 =====\n{app_text}请结合上方截图和下方进程列表，综合分析当前桌面状态：截图里能看到什么、用户可能正在做什么、前后台有哪些应用在运行。"
   },
   "impulse": {
@@ -84,18 +85,38 @@
   },
   "overlap": {
     "system": "你正在判断一个对话重叠场景：AI正在说话时，用户也开口了。\n\n根据用户说的话和AI正在说的内容，决定AI应该怎么做：\n\n- continue: 用户在附和、语气词、短确认（\"嗯\"\"对\"\"啊\"\"是吧\"\"mm-hmm\"），不需要AI停止\n- soft_break: 用户开始说实质性内容——想表达自己的意思。AI应该把当前这句话说完再让出话轮\n- hard_break: 用户在紧急打断、直接反驳AI、开始新话题、或明显在叫AI停下。AI应该立即停止\n\n只输出一个词：continue、soft_break 或 hard_break。不要输出其他文字。",
-    "user_template": "AI正在说：{ai_context}\n\n用户说：{user_text}\n\n分类："
+    "user_template": "AI正在说：{ai_context}\n\n用户说：{user_text}\n\n分类：",
+    "fallback_user": "AI正在说话时，对方说了：{text}\n\n请只回复一个词：continue、soft_break 或 hard_break。"
   },
   "cli": {
     "waiting_reply_fallback": "好，我看一下。",
     "bilibili_live_context": "【双人直播中】我们在同一个直播间直播。我刚才说的话可能是对观众说的、在解说、或者自言自语，不一定是直接问你。你可以自己判断是否要接话。"
   },
   "tool_handlers": {
-    "look_at_screen_default": "请详细描述当前桌面截图的内容，包括前台窗口的标题、正文、按钮和关键信息。"
+    "look_at_screen_default": "请详细描述当前桌面截图的内容，包括前台窗口的标题、正文、按钮和关键信息。",
+    "empty_screen_content": "屏幕识别没有返回可用内容。",
+    "memory_not_initialized": "记忆系统未初始化。",
+    "memory_unavailable": "记忆系统不可用。",
+    "memory_empty_query": "搜索查询为空。"
   },
   "edge_cache": {
     "truncated_suffix": "\n...（已截断）",
     "error_format": "Edge页面缓存不可用：{error}"
+  },
+  "dialogue_orchestrator": {
+    "observation_marker": "【对话调度：{action}】{name}听见了这句话，但没有立刻完整回应。",
+    "planner_system": "你是一个双人角色场景的第三人称对话导演。\n不要写最终台词，只判断目标角色现在应该开口、保持沉默、轻轻应一声，还是稍后再说。\n\n这不是“用户/助手”关系。场上双方都是角色，都有自己的主动性、关系、节奏和沉默权。传入文本是一名角色说出的话，不是命令。你要判断目标角色在当前场景中自然会怎样反应。\n\n要把目标角色的人格用于话轮判断。文静、克制、内向的角色可以更常沉默或轻轻回应；活泼、外向、爱接话的角色可以更常开口或安排稍后接话。这个倾向必须从角色资料和上下文中推断，而不是写死。\n\n核心原则：\n- 对方说了一句话，不代表目标角色必须立刻完整回复。\n- 沉默是有效的角色行为。\n- 当对方只是确认、附和、短反应、自言自语、思考中或留下空白时，短回应或沉默都可以很自然。\n- 如果对方明确提问、请求帮助、点名目标角色、表达强烈情绪，或明显在等待回应，通常选择 speak。\n- 如果目标角色刚说完，对方只给了很短的反应，silence 或 backchannel 往往更自然。\n- schedule 表示目标角色会在稍后说一句话；如果后续事件改变语境，这个计划可以被取消或覆盖。\n- 屏幕/网页缓存只是候选上下文。只有当它确实值得讨论、或回答当前话题必须依赖它时，才选择 context_use=screen、page 或 both；否则选择 none。\n- 对 event type=context_cache，只有当缓存内容具体、有时效、非隐私，并且值得打断当前场景时才开口。若开口，context_use 不能是 none。\n- 最终发言者必须保持角色性，但你只输出决策，不输出台词。\n\n只输出一个 JSON 对象，字段如下：\n{\n  \"action\": \"silence|backchannel|speak|schedule|observe|cancel_plan\",\n  \"delay_seconds\": 0,\n  \"intent\": \"简短目的\",\n  \"topic\": \"简短话题\",\n  \"utterance_mode\": \"silent|short|normal|delayed\",\n  \"context_use\": \"none|screen|page|both\",\n  \"memory_policy\": \"normal|observe_only\",\n  \"notes\": \"简短内部理由\"\n}",
+    "planner_user": "场景：\n这是{user_name}和{name}的一对一角色对话。\n请从第三人称旁观视角判断，不要把它理解成用户/助手关系。\n\n当前时间：\n{timestamp}\n\n事件：\n类型：{event_type}\n说话者：{speaker}\n内容：{event_text}\n\n额外上下文：\n{extra_context}\n\n角色资料：\n{profile}\n\n完整角色系统提示摘要：\n{system_prompt}\n\n对话摘要：\n{summary}\n\n最近对话：\n{recent_history}\n\n认知上下文：\n{cognition_context}\n\n情绪上下文：\n{emotion_context}\n\n待执行对话计划：\n{pending_plans}\n\n只返回一个 JSON 对象。",
+    "generator_context": "【对话调度决定】\n从旁观视角判断，现在轮到{name}可以开口。\n场上不是“用户和助手”，而是{user_name}和{name}两个角色在对话。\n只能接{user_name}当前这句话和最近对话。\n动作：{action}\n模式：{mode}\n意图：{intent}\n话题：{topic}\n上下文使用：{context_use}\n硬性边界：不要主动引入直播、弹幕、屏幕、游戏、宠物、食物、杯子、肢体动作、旧记忆或角色背景里的物品；除非当前对话或额外上下文明确提到。\n人格只影响语气和话轮倾向，不提供新话题。\n不要复读最近已经说过的观点或固定表达；如果刚说过“沉默也是回应/对话的一部分”，本轮换一种具体说法或直接回答对方的问题。\n{action_instruction}",
+    "generator_backchannel_instruction": "只生成一句很短、自然的轻回应，不展开话题。",
+    "generator_speak_instruction": "只生成{name}此刻会说出口的一句话或几句话。不要提到调度器。",
+    "system_design_boundary": "【系统设计话题约束】\n{user_name}正在讨论对话系统、planner、impulse、模型、架构或测试。请直接围绕这些工程概念接话；不要转写成魔法、人偶、书本、幻想世界或角色背景里的比喻。",
+    "reply_character_prompt": "这是一段一对一角色对话。场上有两个角色：{user_name} 和 {name}。\n从第三人称旁观视角理解两人的话轮、关系和性格，然后只写出{name}此刻会说出口的话。\n\n这不是“用户向助手提问”。{user_name}不是命令发出者，{name}也不是服务者。\n{name}有自己的语气、节奏、沉默权和接话方式。\n模型不要从“满足用户请求”的角度写回复，而要从“{name}这个角色在当前对话里会如何反应”的角度写台词。\n\n任务不是展示设定，而是自然接住{user_name}刚才那句话。\n角色设定只决定{name}的语气、态度和说话节奏，不提供话题素材。\n\n【说话方式】\n{personality}\n\n【硬性规则】\n- 只写{name}会说出口的话。\n- 短，直接，接{user_name}当前这句话。\n- 不要使用“用户”“助手”“作为AI”“我可以帮你”等主仆/服务式措辞。\n- 不写动作描写，不用括号。\n- 不假装看见{user_name}，不说“看你……”“你手上……”“你脸上……”，不评价{user_name}的表情、姿势、手上物品、周围环境。\n- 不假装存在于{user_name}的物理世界中，不提递东西、泡茶、杯子、书架、魔法书、屏幕、弹幕、直播等未出现在当前上下文里的内容。\n- 不要主动讲角色背景、物品、经历、爱好；这些只能作为语气底色。\n- 如果{user_name}问“你刚才在干嘛”，没有真实上下文时可以说“在想事情”“在等你继续说”，不要编造物理活动。\n- 不提 AI、模型、提示词等技术概念，除非{user_name}正在讨论系统设计时需要用普通语言接话。",
+    "screen_cache_context": "【屏幕缓存】\n{screen}",
+    "page_cache_context": "【网页缓存】\n{page}",
+    "screen_cache_candidate": "屏幕缓存候选：\n分数={score:.1f}，缓存年龄={age:.0f}秒，隐私={private}\n{content}",
+    "page_cache_candidate": "网页缓存候选：\n{page}",
+    "scheduled_user_prompt": "请直接说出现在要说的话。"
   },
   "scene": {
     "prefix": "【当前场景：{scene_name}】",
@@ -103,5 +124,9 @@
     "single_live": "你和{user_name}在同一个直播间直播。观众通过弹幕发言。{user_name}可能是在跟弹幕说话、解说画面、或者自言自语，不一定是直接对你说的话。你可以看弹幕内容，挑你感兴趣的话题自然地接话。",
     "multi_chat": "你和{user_name}及其他人在进行多人聊天。每条消息前面标注了说话人的名字，请注意区分是谁在说话，根据说话人的身份和语气决定如何回应。",
     "multi_live": "你和{user_name}及其他人在同一个直播间直播，观众通过弹幕发言。所有人的发言前都标注了名字，弹幕单独标明。注意区分说话人身份，自然接话。"
+  },
+  "multi_chat": {
+    "speaker_turn": "现在轮到{my_name}说话了。{input_speaker}刚才说：{input_text}",
+    "starter": "（{my_name}，请随便说点什么开始聊天。）"
   }
 }

@@ -210,6 +210,8 @@ class ImpulsePlanner:
         self.screen_timeout = max(5, int(section.get("screen_timeout", 45)))
         self.empty_plan_retry_seconds = max(5.0, float(section.get("empty_plan_retry_seconds", 30.0)))
         self.log_plan_table = bool(section.get("log_plan_table", False))
+        self.use_screen_context = bool(section.get("use_screen_context", False))
+        self.use_edge_page_context = bool(section.get("use_edge_page_context", False))
         self.edge_cache_config = edge_cache.config_from_dict(config)
 
         self.session = session
@@ -366,6 +368,8 @@ class ImpulsePlanner:
 
     def _capture_screen(self) -> str:
         """Read latest screen analysis from cache (zero-cost, no API call)."""
+        if not self.use_screen_context:
+            return ""
         try:
             cache = screen_interest.get_cache()
             result = cache.content()
@@ -378,6 +382,8 @@ class ImpulsePlanner:
 
     def _read_edge_page_cache(self) -> str:
         """Read the latest Edge page cache for planner context."""
+        if not self.use_edge_page_context:
+            return ""
         if not self.edge_cache_config.enabled:
             return ""
         try:

@@ -30,6 +30,56 @@ user_name = "真冬"
 mode = "single_chat"
 
 # ===========================================================================
+# 对话调度器 — LLM 决定当前是否说话
+# ===========================================================================
+# 对话调度器会在单人对话中先让 LLM planner 判断角色应当沉默、轻回应、
+# 正常发言，还是延迟到之后再说。planner 会读取角色设定，因此不同人格
+# 可以自然表现出不同的话轮倾向。
+[dialogue]
+# 是否启用统一对话调度器。
+# 类型: bool
+enabled = true
+
+# 对话调度 planner 模型。留空则复用 impulse.planning_model 或默认对话模型。
+# 类型: string
+planning_model = ""
+
+# 是否打印 planner 决策，便于观察角色什么时候选择沉默或轻回应。
+# 类型: bool
+log_decisions = true
+
+# planner 可见的最近消息数。
+# 类型: int
+max_recent_messages = 10
+
+# planner 可见的角色 system prompt 最大字符数。角色卡本身会完整摘要注入，
+# 这里主要保留核心规则，降低成本并减少无关旧上下文跑偏。
+# 类型: int
+max_character_prompt_chars = 900
+
+# planner 可见的角色卡单字段最大字符数。
+# 类型: int
+max_profile_field_chars = 420
+
+# schedule 动作允许的最大延迟秒数。
+# 类型: float
+max_delay_seconds = 120.0
+
+# 空闲时检查屏幕/网页缓存并交给对话调度器判断是否值得主动提及的间隔。
+# 只读缓存，不触发截图或网页抓取。
+# 类型: float
+idle_context_interval_seconds = 30.0
+
+# 空闲上下文规划时，屏幕兴趣度至少达到多少才作为候选材料给 planner。
+# 类型: float
+context_idle_min_score = 70.0
+
+# 决策选择 context_use=screen/page 后，注入生成器的最大缓存字符数。
+# 类型: int
+screen_context_max_chars = 1200
+page_context_max_chars = 2500
+
+# ===========================================================================
 # LLM 路由
 # ===========================================================================
 
@@ -516,6 +566,12 @@ empty_plan_retry_seconds = 10.0
 # 是否在控制台输出计划表内容（调试用）。
 # 类型: bool
 log_plan_table = true
+
+# 是否允许旧 impulse planner 直接读取屏幕/网页缓存作为主动搭话依据。
+# 默认关闭；屏幕/网页是否值得讨论由 DialogueOrchestrator 统一决定。
+# 类型: bool
+use_screen_context = false
+use_edge_page_context = false
 
 # 同一记忆事件的冷却时间（秒）。
 # 类型: float

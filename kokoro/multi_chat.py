@@ -172,7 +172,12 @@ class MultiChatOrchestrator:
         if input_speaker:
             messages.append({
                 "role": "user",
-                "content": f"现在轮到{my_name}说话了。{input_speaker}刚才说：{input_text}",
+                "content": _prompts.format_prompt(
+                    "multi_chat.speaker_turn",
+                    my_name=my_name,
+                    input_speaker=input_speaker,
+                    input_text=input_text,
+                ),
             })
         elif input_text:
             messages.append({"role": "user", "content": input_text})
@@ -180,7 +185,7 @@ class MultiChatOrchestrator:
             # Starter: no input yet
             messages.append({
                 "role": "user",
-                "content": f"（{my_name}，请随便说点什么开始聊天。）",
+                "content": _prompts.format_prompt("multi_chat.starter", my_name=my_name),
             })
 
         return messages

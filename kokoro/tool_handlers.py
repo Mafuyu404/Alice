@@ -33,13 +33,13 @@ def handle_get_current_app(arguments: dict, **context) -> str:
 def handle_search_memory(arguments: dict, **context) -> str:
     memory_backend = context.get("memory_backend")
     if memory_backend is None:
-        return "记忆系统未初始化。"
+        return prompts.get("tool_handlers.memory_not_initialized", "记忆系统未初始化。")
     if not getattr(memory_backend, "ready", False):
-        return "记忆系统不可用。"
+        return prompts.get("tool_handlers.memory_unavailable", "记忆系统不可用。")
 
     query = arguments.get("query", "").strip()
     if not query:
-        return "搜索查询为空。"
+        return prompts.get("tool_handlers.memory_empty_query", "搜索查询为空。")
 
     character_id = context.get("character_id", "default")
     try:
@@ -73,7 +73,7 @@ def handle_look_at_screen(arguments: dict, **context) -> str:
         return prompts.format_prompt("tool_calling.tool_error", error=f"{type(exc).__name__}: {exc}")
 
     if not result or not result.strip():
-        return "屏幕识别没有返回可用内容。"
+        return prompts.get("tool_handlers.empty_screen_content", "屏幕识别没有返回可用内容。")
 
     # Store screen context in session for future reference
     session = context.get("session")
@@ -87,7 +87,7 @@ def handle_look_at_screen(arguments: dict, **context) -> str:
 def handle_save_to_memory(arguments: dict, **context) -> str:
     memory_backend = context.get("memory_backend")
     if memory_backend is None:
-        return "记忆系统未初始化。"
+        return prompts.get("tool_handlers.memory_not_initialized", "记忆系统未初始化。")
     if not getattr(memory_backend, "ready", False):
         return "记忆系统不可用。"
 

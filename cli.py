@@ -22,6 +22,7 @@ import requests
 from kokoro import chat_session
 from kokoro import config as cfg
 from kokoro import conversation as conversation_mod
+from kokoro import dialogue_orchestrator as dialogue_mod
 from kokoro import llm_client
 from kokoro import prompts
 from kokoro import memory_events
@@ -376,6 +377,12 @@ def main() -> None:
     # ── impulse planner ─────────────────────────────────────────────────────
     _stt_refine_mode = cfg.stt_refine_mode()
     _stt_refine_inline = _stt_refine_mode == "inline"
+    _dialogue = dialogue_mod.DialogueOrchestrator(
+        config=CONFIG,
+        session=session,
+        model=model,
+        memory_backend=memory_backend,
+    )
     _use_impulse = cfg.impulse_enabled() and not args.no_impulse
     if _use_impulse:
         machine.set_proactive_state(sm.ProactiveState.ACCRUING)
@@ -403,6 +410,7 @@ def main() -> None:
         if _stt_subtitle_client:
             _stt_subtitle_client.clear()
         display_user(text)
+        _dialogue.cancel_plans()
         if _impulse is not None:
             _impulse.reset()
 
@@ -512,7 +520,47 @@ def main() -> None:
             elif _bilibili_enabled and _bilibili_live_mode:
                 command_context = bilibili_ctx
 
-            messages = session.build_messages(text, extra_context=command_context, stt_refine_inline=_stt_refine_inline, inject_memory=not _tool_enabled)
+            event = dialogue_mod.DialogueEvent(
+                type="user_utterance",
+                text=text,
+                source="user",
+                extra_context=command_context or "",
+            )
+            decision = _dialogue.decide(event)
+
+            if decision.action in ("silence", "observe", "cancel_plan"):
+                if decision.action == "cancel_plan":
+                    _dialogue.cancel_plans()
+                _dialogue.record_user_observation(text, decision)
+                machine.emit(sm.SystemEvent.LLM_DONE)
+                machine.set_tts_state(sm.TTSState.IDLE)
+                machine.emit(sm.SystemEvent.TTS_DONE)
+                machine.reset_error_count()
+                if _impulse is not None:
+                    _impulse.on_conversation_end()
+                return
+
+            if decision.action == "schedule":
+                _dialogue.record_user_observation(text, decision)
+                _dialogue.add_plan(decision, created_from=text)
+                machine.emit(sm.SystemEvent.LLM_DONE)
+                machine.set_tts_state(sm.TTSState.IDLE)
+                machine.emit(sm.SystemEvent.TTS_DONE)
+                machine.reset_error_count()
+                if _impulse is not None:
+                    _impulse.on_conversation_end()
+                return
+
+            messages = _dialogue.build_reply_messages(
+                user_text=text,
+                decision=decision,
+                extra_context=command_context or None,
+                max_history_messages=30 if ("总结" in text or "summary" in text.lower()) else None,
+            )
+            if _stt_refine_inline:
+                inline_prompt = prompts.get("stt_refine_inline.system", "")
+                if inline_prompt:
+                    messages.insert(-1, {"role": "system", "content": inline_prompt})
 
             try:
                 reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id), subtitle_client=_subtitle_client)
@@ -566,6 +614,123 @@ def main() -> None:
             _current_cancel[0] = None
 
     # ── STT + ConversationManager ──────────────────────────────────────────
+    def _execute_dialogue_plan(decision: dialogue_mod.DialogueDecision) -> None:
+        if not machine.can_start_conversation:
+            _dialogue.add_plan(decision, created_from="deferred_busy")
+            return
+        if not machine.emit(sm.SystemEvent.PROACTIVE_TRIGGERED):
+            _dialogue.add_plan(decision, created_from="deferred_rejected")
+            return
+
+        machine.set_proactive_state(sm.ProactiveState.EXECUTING)
+        cancel_event = threading.Event()
+        _current_cancel[0] = cancel_event
+
+        try:
+            if tts_engine:
+                try:
+                    tts_engine.prepare()
+                except Exception as exc:
+                    print(f"\n  [tts] prepare failed: {exc}")
+
+            context = ""
+            memory_query = " ".join(part for part in (decision.topic, decision.intent) if part)
+            if memory_query:
+                try:
+                    memory_ctx = memory_backend.get_context(memory_query, user_id=session.character_id)
+                except Exception:
+                    memory_ctx = ""
+                if memory_ctx:
+                    context = memory_ctx
+            messages = _dialogue.build_reply_messages(
+                user_text=prompts.get("dialogue_orchestrator.scheduled_user_prompt", "请直接说出现在要说的话。"),
+                decision=decision,
+                extra_context=context or None,
+            )
+
+            try:
+                reply, cancelled = chat_stream(
+                    messages,
+                    session.character_name,
+                    model,
+                    tts_engine,
+                    cancel_event=cancel_event,
+                    character_config=session.character_config,
+                    agent_config=_agent_config,
+                    usage_callback=token_usage.make_callback(model, "dialogue_scheduled"),
+                    tool_context=dict(
+                        session=session,
+                        memory_backend=memory_backend,
+                        character_id=session.character_id,
+                    ),
+                    subtitle_client=_subtitle_client,
+                )
+            except requests.exceptions.ConnectionError:
+                print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
+                machine.emit_error("dialogue_scheduled_connection")
+                return
+            except Exception as exc:
+                print(f"\n[error] scheduled dialogue: {type(exc).__name__}: {exc}")
+                machine.emit_error("dialogue_scheduled")
+                return
+
+            if cancelled:
+                return
+
+            if reply:
+                with session._summarize_lock:
+                    session.history.append({"role": "assistant", "content": reply})
+                    if len(session.history) > session.max_history * 2:
+                        session.history[:] = session.history[-session.max_history * 2:]
+                if portrait_worker:
+                    portrait_worker.submit("", reply)
+
+            machine.emit(sm.SystemEvent.LLM_DONE)
+            if _impulse is not None:
+                _impulse.on_conversation_end()
+
+            if tts_engine:
+                machine.set_tts_state(sm.TTSState.STREAMING)
+                while tts_engine.is_playing and not cancel_event.is_set():
+                    time.sleep(0.1)
+                if cancel_event.is_set():
+                    return
+                tts_engine.prepare()
+
+            machine.set_tts_state(sm.TTSState.IDLE)
+            machine.emit(sm.SystemEvent.TTS_DONE)
+            machine.reset_error_count()
+            if _subtitle_client:
+                _subtitle_client.clear()
+        finally:
+            _current_cancel[0] = None
+            machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_impulse else sm.ProactiveState.DISABLED)
+
+    _dialogue_executor_stop = threading.Event()
+    _dialogue.start_plan_executor(
+        execute_fn=_execute_dialogue_plan,
+        cancel_event=_dialogue_executor_stop,
+    )
+
+    def _dialogue_context_worker() -> None:
+        while not machine.is_shutting_down:
+            time.sleep(_dialogue.idle_context_interval_seconds)
+            if not machine.can_start_conversation:
+                continue
+            event = _dialogue.build_context_event(reason="idle_context")
+            if not event.extra_context:
+                continue
+            decision = _dialogue.decide(event)
+            if decision.action in ("speak", "backchannel", "schedule"):
+                if decision.context_use == "none":
+                    continue
+                if decision.action == "schedule":
+                    _dialogue.add_plan(decision, created_from="idle_context")
+                else:
+                    _dialogue.add_plan(decision, created_from="idle_context_now")
+
+    threading.Thread(target=_dialogue_context_worker, daemon=True).start()
+
     refine_url, refine_model, refine_key = refine_endpoint()
 
     device = args.device if args.device is not None else stt_mod.find_input_device()
@@ -695,11 +860,11 @@ def main() -> None:
             # Always update cache (impulse reads from here)
             sc.put(result)
 
-            # Add high-interest results to session context
+            # Keep this as cache only. DialogueOrchestrator decides whether
+            # cached screen content is worth discussing.
             if not machine.is_busy and result.score >= screen_interest_threshold:
                 context = result.content or result.reason
-                session.add_screen_context(context)
-                print(f"\n  [screen] interest={result.score:.1f} {context.split(chr(10))[0]}")
+                print(f"\n  [screen] cached interest={result.score:.1f} {context.split(chr(10))[0]}")
 
             # Head-to-tail: minimum interval between captures
             elapsed = time.perf_counter() - t0

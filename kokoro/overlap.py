@@ -141,7 +141,10 @@ class OverlapClassifier:
         url = f"{self._ollama_url}/api/chat"
         payload = {
             "model": self._model,
-            "messages": [{"role": "user", "content": f"User said '{text}' while AI was speaking. Reply with exactly one word: continue, soft_break, or hard_break."}],
+            "messages": [{
+                "role": "user",
+                "content": prompts.format_prompt("overlap.fallback_user", text=text),
+            }],
             "stream": False,
             "options": {"temperature": 0.1, "num_predict": 8},
         }
