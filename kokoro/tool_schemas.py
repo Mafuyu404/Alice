@@ -87,12 +87,48 @@ SAVE_TO_MEMORY = {
     },
 }
 
+VTS_EXPRESSION = {
+    "type": "function",
+    "function": {
+        "name": "vts_expression",
+        "description": "控制角色的Live2D面部表情。在你说的话需要配合特定表情时使用，例如微笑、挑眉、撇嘴、叹气、眨眼等。日常对话中的表情由情绪系统自动处理，你只需要在觉得此处应该有一个特定表情来强调语气时调用。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "enum": [
+                        "smile", "happy", "sad", "angry", "surprised",
+                        "tired", "thinking", "shy", "excited", "wink",
+                        "pout", "sigh", "cry", "doubt", "awkward", "neutral",
+                    ],
+                    "description": "要展示的表情。不调用时情绪系统会自动处理，这里只用于刻意强调。",
+                },
+                "intensity": {
+                    "type": "number",
+                    "description": "表情强度 0.0-1.0，1.0为全强度",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "duration_seconds": {
+                    "type": "number",
+                    "description": "表情持续秒数。0=持续到被下一个表情覆盖（默认），正数=秒后自动恢复",
+                    "minimum": 0,
+                    "maximum": 30,
+                },
+            },
+            "required": ["expression"],
+        },
+    },
+}
+
 ALL_TOOLS: list[dict] = [
     LOOK_AT_SCREEN,
     SEARCH_MEMORY,
     GET_CURRENT_TIME,
     GET_CURRENT_APP,
     SAVE_TO_MEMORY,
+    VTS_EXPRESSION,
 ]
 
 ALL_TOOLS_BY_NAME: dict[str, dict] = {
@@ -105,4 +141,5 @@ DEFAULT_ENABLED_TOOLS: set[str] = {
     "get_current_time",
     "get_current_app",
     "save_to_memory",
+    "vts_expression",
 }

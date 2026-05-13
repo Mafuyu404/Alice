@@ -19,6 +19,7 @@ _BUILTIN_HANDLERS: dict[str, Handler] = {
     "get_current_time": tool_handlers.handle_get_current_time,
     "get_current_app": tool_handlers.handle_get_current_app,
     "save_to_memory": tool_handlers.handle_save_to_memory,
+    "vts_expression": tool_handlers.handle_vts_expression,
 }
 
 

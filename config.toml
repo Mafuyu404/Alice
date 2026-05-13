@@ -80,6 +80,40 @@ screen_context_max_chars = 1200
 page_context_max_chars = 2500
 
 # ===========================================================================
+# 多角色对话调度器 — 用户 + 多个独立角色
+# ===========================================================================
+# 多角色调度器用于 text_cli.py --multi。它使用第三人称 planner 判断
+# 下一个该由谁说话、是否沉默、是否短回应或稍后再说；被选中的角色再用
+# 自己的 ChatSession、记忆、认知和情绪生成台词。
+[multi_dialogue]
+# 多角色 planner 模型。留空则复用 dialogue.planning_model、
+# impulse.planning_model 或默认对话模型。
+# 类型: string
+planning_model = ""
+
+# schedule 动作允许的最大延迟秒数。
+# 类型: float
+max_delay_seconds = 120.0
+
+# 每次用户输入后允许的 AI-AI 自动续接次数。0 表示用户说完后通常最多
+# 一个角色回应；需要观察角色互相接话时可调为 1。
+# 类型: int
+max_auto_followups = 0
+
+# 是否打印多角色 planner 决策。
+# 类型: bool
+log_decisions = true
+
+# 决策选择 context_use=screen/page 后，注入生成器的最大缓存字符数。
+# 类型: int
+screen_context_max_chars = 1200
+page_context_max_chars = 2500
+
+# 空闲上下文规划时，屏幕兴趣度至少达到多少才作为候选材料给 planner。
+# 类型: float
+context_idle_min_score = 70.0
+
+# ===========================================================================
 # LLM 路由
 # ===========================================================================
 

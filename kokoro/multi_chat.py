@@ -1,293 +1,663 @@
-"""Multi-character chat orchestrator.
+"""LLM-directed multi-character dialogue orchestration.
 
-Supports N AI characters talking to each other and the user in a shared
-conversation. Each character has its own ChatSession (memory, cognition,
-emotion) and model config. The orchestrator manages turn order and
-shared history with speaker labels.
+This module replaces the old round-robin multi-chat experiment. A third-person
+planner decides which character, if any, should speak next; each selected
+character still uses its own ChatSession, prompt, memory, cognition, and emotion.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Any
+
+import requests
 
 from kokoro import agent_loop
 from kokoro import chat_session
 from kokoro import config as _cfg
+from kokoro import edge_cache
 from kokoro import memory as _mem
-from kokoro import prompts as _prompts
+from kokoro import prompts
 from kokoro import scene as _scene
+from kokoro import screen_interest
 from kokoro import token_usage
 
 logger = logging.getLogger(__name__)
 
 
-# ── Data ────────────────────────────────────────────────────────────────────
+SUPPORTED_ACTIONS = {
+    "silence",
+    "backchannel",
+    "speak",
+    "schedule",
+    "observe",
+    "cancel_plan",
+}
 
 
 @dataclass
 class HistoryEntry:
-    speaker: str      # character name or user_name
+    speaker: str
     text: str
-    character_id: str = ""  # "" means it's a user message
+    character_id: str = ""
+
+
+@dataclass
+class MultiDialogueEvent:
+    type: str
+    text: str = ""
+    speaker: str = ""
+    source_id: str = ""
+    extra_context: str = ""
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class MultiDialogueDecision:
+    action: str = "silence"
+    speaker_id: str = ""
+    target: str = ""
+    delay_seconds: float = 0.0
+    utterance_mode: str = "normal"
+    intent: str = ""
+    topic: str = ""
+    context_use: str = "none"
+    notes: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict, valid_speakers: set[str]) -> "MultiDialogueDecision":
+        action = str(data.get("action", "silence") or "silence").strip().lower()
+        if action not in SUPPORTED_ACTIONS:
+            action = "silence"
+        speaker_id = str(data.get("speaker_id", "") or "").strip()
+        if speaker_id not in valid_speakers:
+            speaker_id = ""
+        if action in ("speak", "backchannel", "schedule") and not speaker_id:
+            action = "silence"
+        try:
+            delay = float(data.get("delay_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            delay = 0.0
+        return cls(
+            action=action,
+            speaker_id=speaker_id,
+            target=str(data.get("target", "") or "").strip(),
+            delay_seconds=max(0.0, delay),
+            utterance_mode=str(data.get("utterance_mode", "normal") or "normal").strip(),
+            intent=str(data.get("intent", "") or "").strip(),
+            topic=str(data.get("topic", "") or "").strip(),
+            context_use=_normalize_context_use(str(data.get("context_use", "none") or "none")),
+            notes=str(data.get("notes", "") or "").strip(),
+        )
+
+
+@dataclass
+class MultiDialoguePlan:
+    id: str
+    due_at: float
+    decision: MultiDialogueDecision
+    created_from: str = ""
+
+    def to_prompt_line(self, now: float, names: dict[str, str]) -> str:
+        remaining = max(0.0, self.due_at - now)
+        name = names.get(self.decision.speaker_id, self.decision.speaker_id or "未知角色")
+        topic = self.decision.topic or "无话题"
+        intent = self.decision.intent or "无意图"
+        return f"- {self.id}: {remaining:.0f}秒后，{name}，话题={topic}，意图={intent}"
 
 
 @dataclass
 class MultiChatConfig:
-    character_ids: list[str] = field(default_factory=lambda: ["penglai", "alice"])
+    character_ids: list[str] = field(default_factory=lambda: ["alice"])
     max_history: int = 30
     model: str = ""
+    planning_model: str = ""
+    max_delay_seconds: float = 120.0
+    max_auto_followups: int = 0
+    log_decisions: bool = True
     enable_tools: bool = False
-    # Optional TTS engines keyed by character_id
     tts_engines: dict[str, object] = field(default_factory=dict)
-    # Optional portrait worker for expression switching
     portrait_worker: object = None
 
 
-# ── Orchestrator ────────────────────────────────────────────────────────────
-
-
 class MultiChatOrchestrator:
-    """Orchestrate conversation among multiple AI characters + optional user."""
+    """Third-person planner for a user plus multiple AI characters."""
 
-    def __init__(self, config: MultiChatConfig | None = None):
+    def __init__(self, config: MultiChatConfig | None = None, runtime_config: dict | None = None):
         self.config = config or MultiChatConfig()
+        self.runtime_config = runtime_config or _cfg.load()
+        multi_section = self.runtime_config.get("multi_dialogue", {})
+        if not isinstance(multi_section, dict):
+            multi_section = {}
+        dialogue_section = self.runtime_config.get("dialogue", {})
+        if not isinstance(dialogue_section, dict):
+            dialogue_section = {}
+        impulse_section = self.runtime_config.get("impulse", {})
+        if not isinstance(impulse_section, dict):
+            impulse_section = {}
+
+        self.planning_model = (
+            self.config.planning_model
+            or str(multi_section.get("planning_model") or "")
+            or str(dialogue_section.get("planning_model") or "")
+            or str(impulse_section.get("planning_model") or "")
+            or _cfg.llm_model()
+        )
+        self.max_delay_seconds = max(1.0, float(multi_section.get("max_delay_seconds", self.config.max_delay_seconds)))
+        self.max_auto_followups = max(0, int(multi_section.get("max_auto_followups", self.config.max_auto_followups)))
+        self.log_decisions = bool(multi_section.get("log_decisions", self.config.log_decisions))
+        self.screen_context_max_chars = max(200, int(multi_section.get("screen_context_max_chars", 1200)))
+        self.page_context_max_chars = max(500, int(multi_section.get("page_context_max_chars", 2500)))
+        self.context_idle_min_score = max(0.0, float(multi_section.get("context_idle_min_score", 70.0)))
+        self.edge_cache_config = edge_cache.config_from_dict(self.runtime_config)
+
         self.shared_history: list[HistoryEntry] = []
-
-        runtime_cfg = _cfg.load()
-
-        # Resolve scene to multi_chat
+        self.memory_backend = _mem.create_backend(self.runtime_config)
+        self.user_name = _cfg.user_name()
         self.scene = _scene.SceneType.MULTI_CHAT
-        live_section = runtime_cfg.get("bilibili_live", {})
+        live_section = self.runtime_config.get("bilibili_live", {})
         if isinstance(live_section, dict) and live_section.get("live_mode", False):
             self.scene = _scene.SceneType.MULTI_LIVE
 
-        user_name = _cfg.user_name()
-        memory_backend = _mem.create_backend(runtime_cfg)
-
-        self.user_name = user_name
-        self.memory_backend = memory_backend
         self.sessions: dict[str, chat_session.ChatSession] = {}
-        self.order: list[str] = []  # character_ids in turn order
-
+        self.order: list[str] = []
         for cid in self.config.character_ids:
             session = chat_session.load_session(
-                cid, memory_backend, max_history=self.config.max_history,
+                cid,
+                self.memory_backend,
+                max_history=self.config.max_history,
             )
-            # Override scene
             session._scene = self.scene
             self.sessions[cid] = session
             self.order.append(cid)
+        if len(self.order) < 1:
+            raise ValueError("multi dialogue requires at least one character")
 
-        self._turn_index = 0
+        self._plans: list[MultiDialoguePlan] = []
+        self._lock = threading.Lock()
 
     @property
     def character_names(self) -> dict[str, str]:
-        return {cid: s.character_name for cid, s in self.sessions.items()}
+        return {cid: session.character_name for cid, session in self.sessions.items()}
 
-    # ── history ─────────────────────────────────────────────────────────────
+    @property
+    def participant_names(self) -> list[str]:
+        return [self.user_name] + [self.sessions[cid].character_name for cid in self.order]
+
+    def close(self) -> None:
+        close = getattr(self.memory_backend, "close", None)
+        if callable(close):
+            close()
 
     def add_user_message(self, text: str) -> None:
-        self.shared_history.append(
-            HistoryEntry(speaker=self.user_name, text=text, character_id=""),
-        )
+        self.shared_history.append(HistoryEntry(speaker=self.user_name, text=text, character_id=""))
 
     def add_ai_message(self, character_id: str, text: str) -> None:
         name = self.sessions[character_id].character_name
-        self.shared_history.append(
-            HistoryEntry(speaker=name, text=text, character_id=character_id),
+        self.shared_history.append(HistoryEntry(speaker=name, text=text, character_id=character_id))
+
+    def decide(self, event: MultiDialogueEvent) -> MultiDialogueDecision:
+        system_prompt = prompts.get("multi_dialogue_orchestrator.planner_system", "")
+        user_prompt = self._build_planner_user_prompt(event)
+        try:
+            raw = self._call_planner(system_prompt, user_prompt)
+            data = _extract_json_object(raw)
+            if not data:
+                raise ValueError("multi planner did not return JSON object")
+            decision = MultiDialogueDecision.from_dict(data, set(self.sessions.keys()))
+        except Exception as exc:
+            logger.warning("multi dialogue planner failed: %s", exc)
+            decision = self._fallback_decision(event, notes=f"planner fallback: {type(exc).__name__}")
+
+        if decision.action == "schedule":
+            decision.delay_seconds = min(decision.delay_seconds, self.max_delay_seconds)
+
+        if self.log_decisions:
+            speaker = self.character_names.get(decision.speaker_id, "-")
+            topic = f" topic={decision.topic}" if decision.topic else ""
+            print(
+                f"\n  [multi-dialogue] action={decision.action} speaker={speaker} "
+                f"mode={decision.utterance_mode} context={decision.context_use}{topic}"
+            )
+            if decision.notes:
+                print(f"  [multi-dialogue] notes={decision.notes[:180]}")
+        return decision
+
+    def user_turn(self, user_text: str, *, auto_followups: int | None = None) -> list[tuple[str, str, str]]:
+        self.add_user_message(user_text)
+        event = MultiDialogueEvent(
+            type="user_utterance",
+            text=user_text,
+            speaker=self.user_name,
+            source_id="",
         )
-
-    def _format_history(self, max_entries: int = 20) -> str:
-        """Format recent shared history with speaker labels."""
-        entries = self.shared_history[-max_entries:] if max_entries else self.shared_history
-        return "\n".join(f"{e.speaker}：{e.text}" for e in entries)
-
-    # ── message building ────────────────────────────────────────────────────
-
-    def build_messages_for(
-        self,
-        character_id: str,
-        input_text: str,
-        input_speaker: str = "",
-    ) -> list[dict]:
-        """Build the LLM message array for a character's turn.
-
-        Everything goes into a single user message to avoid role confusion
-        in multi-character chat. The system prompt sets the character identity.
-        """
-        session = self.sessions[character_id]
-        my_name = session.character_name
-
-        # -- assemble context blocks --
-        parts: list[str] = []
-
-        # Scene guidance
-        guidance = _scene.guidance_text(
-            self.scene, self.user_name, my_name,
-        )
-        if guidance:
-            prefix = _prompts.get("scene.prefix", "【当前场景：{scene_name}】")
-            scene_label = prefix.format(scene_name=_scene.scene_name(self.scene))
-            parts.append(f"{scene_label}\n{guidance}")
-
-        # Summary
-        with session._summarize_lock:
-            if session.summary:
-                parts.append(f"【对话摘要】\n{session.summary}")
-
-        # Recent conversation history with speaker labels
-        history_text = self._format_history(max_entries=self.config.max_history)
-        if history_text:
-            parts.append(f"【最近对话】\n{history_text}")
-
-        # Memory context
-        memory_ctx = session.memory_backend.get_context(
-            input_text, user_id=character_id,
-        )
-        if memory_ctx:
-            parts.append(memory_ctx)
-
-        # Cognition layer
-        cognition_ctx = session.cognition.get_context()
-        if cognition_ctx:
-            parts.append(cognition_ctx)
-
-        # Emotion layer
-        emotion_ctx = session.emotion.get_context()
-        if emotion_ctx:
-            parts.append(emotion_ctx)
-
-        # -- build messages --
-        messages: list[dict] = [
-            {"role": "system", "content": session.system_prompt},
-        ]
-
-        if parts:
-            messages.append({"role": "system", "content": "\n\n".join(parts)})
-
-        if input_speaker:
-            messages.append({
-                "role": "user",
-                "content": _prompts.format_prompt(
-                    "multi_chat.speaker_turn",
-                    my_name=my_name,
-                    input_speaker=input_speaker,
-                    input_text=input_text,
-                ),
-            })
-        elif input_text:
-            messages.append({"role": "user", "content": input_text})
-        else:
-            # Starter: no input yet
-            messages.append({
-                "role": "user",
-                "content": _prompts.format_prompt("multi_chat.starter", my_name=my_name),
-            })
-
-        return messages
-
-    # ── turn execution ──────────────────────────────────────────────────────
+        turns = self._execute_event(event)
+        followups = self.max_auto_followups if auto_followups is None else max(0, auto_followups)
+        for _ in range(followups):
+            if not turns:
+                break
+            last_id, last_name, last_reply = turns[-1]
+            next_event = MultiDialogueEvent(
+                type="character_utterance",
+                text=last_reply,
+                speaker=last_name,
+                source_id=last_id,
+            )
+            next_turns = self._execute_event(next_event, allow_schedule=False)
+            if not next_turns:
+                break
+            turns.extend(next_turns)
+        return turns
 
     def auto_turn(self) -> tuple[str, str, str]:
-        """Let the next AI character in the order respond to the latest message.
+        plan = self.pop_due_plan()
+        if plan is not None:
+            turn = self._execute_decision(plan.decision, trigger_text=plan.decision.topic or plan.decision.intent)
+            return turn or ("", "", "")
 
-        Returns:
-            (character_id, character_name, reply_text)
-        """
-        if not self.shared_history:
-            # No conversation yet — pick a starter
-            return self._starter_turn()
-
-        latest = self.shared_history[-1]
-        # Who should speak next? The next character in order after the last speaker.
-        next_id = self._next_speaker(latest.character_id)
-        session = self.sessions[next_id]
-
-        # What they respond to
-        input_text = latest.text
-        input_speaker = latest.speaker
-
-        model = self.config.model or session.character_config.get(
-            "llm_model", "",
-        ) or _cfg.llm_model()
-
-        messages = self.build_messages_for(next_id, input_text, input_speaker)
-        result = agent_loop.agent_chat(
-            messages, model,
-            agent_config=None,
-            cancel_event=threading.Event(),
-            usage_callback=token_usage.make_callback(model, "multi_chat"),
-            capture=True,
-        )
-
-        reply = result.reply.strip()
-        if reply:
-            self.add_ai_message(next_id, reply)
-            session.remember(input_text, reply, async_store=True)
-
-        return next_id, session.character_name, reply
-
-    def user_turn(self, user_text: str) -> tuple[str, str, str]:
-        """Process user input: store it, then let the next AI respond.
-
-        Returns:
-            (character_id, character_name, reply_text)
-        """
-        self.add_user_message(user_text)
-        return self.auto_turn()
-
-    def _starter_turn(self) -> tuple[str, str, str]:
-        """No conversation yet — kick off with a greeting from the first character."""
-        cid = self.order[0]
-        session = self.sessions[cid]
-        model = self.config.model or session.character_config.get(
-            "llm_model", "",
-        ) or _cfg.llm_model()
-
-        msgs = self.build_messages_for(cid, "", "")
-        result = agent_loop.agent_chat(
-            msgs, model,
-            agent_config=None,
-            cancel_event=threading.Event(),
-            usage_callback=token_usage.make_callback(model, "multi_chat"),
-            capture=True,
-        )
-        reply = result.reply.strip()
-        if reply:
-            self.add_ai_message(cid, reply)
-        return cid, session.character_name, reply
-
-    def _next_speaker(self, last_speaker_id: str) -> str:
-        """Determine the next speaker given who spoke last.
-
-        If last_speaker_id is a character, pick the *other* character.
-        If last_speaker_id is the user (""), pick the first in the order.
-        """
-        if not last_speaker_id:
-            return self.order[0]
-        idx = self.order.index(last_speaker_id) if last_speaker_id in self.order else -1
-        return self.order[(idx + 1) % len(self.order)]
-
-    # ── auto-run ────────────────────────────────────────────────────────────
+        event = MultiDialogueEvent(type="idle_tick", speaker="system", extra_context=self._cache_overview_for_planner())
+        turns = self._execute_event(event)
+        return turns[0] if turns else ("", "", "")
 
     def auto_cycle(self, rounds: int = 5, init_prompt: str = "") -> list[tuple[str, str, str]]:
-        """Run N auto turns. Returns list of (cid, name, reply)."""
         turns: list[tuple[str, str, str]] = []
-
-        if init_prompt and not self.shared_history:
-            # Use init_prompt as the first "user" message to start the conversation
-            self.add_user_message(init_prompt)
-            cid, name, reply = self.auto_turn()
-            turns.append((cid, name, reply))
-
+        if init_prompt:
+            turns.extend(self.user_turn(init_prompt))
         for _ in range(rounds):
             cid, name, reply = self.auto_turn()
             if not reply:
                 break
             turns.append((cid, name, reply))
-
         return turns
+
+    def cancel_plans(self) -> None:
+        with self._lock:
+            self._plans.clear()
+
+    def add_plan(self, decision: MultiDialogueDecision, created_from: str = "") -> MultiDialoguePlan:
+        plan = MultiDialoguePlan(
+            id=str(uuid.uuid4())[:8],
+            due_at=time.monotonic() + min(decision.delay_seconds, self.max_delay_seconds),
+            decision=decision,
+            created_from=created_from,
+        )
+        with self._lock:
+            self._plans.append(plan)
+            self._plans.sort(key=lambda item: item.due_at)
+        return plan
+
+    def pop_due_plan(self) -> MultiDialoguePlan | None:
+        now = time.monotonic()
+        with self._lock:
+            if not self._plans or self._plans[0].due_at > now:
+                return None
+            return self._plans.pop(0)
+
+    def _execute_event(self, event: MultiDialogueEvent, *, allow_schedule: bool = True) -> list[tuple[str, str, str]]:
+        decision = self.decide(event)
+        if decision.action == "cancel_plan":
+            self.cancel_plans()
+            return []
+        if decision.action in ("silence", "observe"):
+            return []
+        if decision.action == "schedule":
+            if allow_schedule:
+                self.add_plan(decision, created_from=event.text)
+            return []
+        turn = self._execute_decision(decision, trigger_text=event.text)
+        return [turn] if turn else []
+
+    def _execute_decision(self, decision: MultiDialogueDecision, *, trigger_text: str = "") -> tuple[str, str, str] | None:
+        if decision.speaker_id not in self.sessions:
+            return None
+        messages = self.build_reply_messages(decision, trigger_text=trigger_text)
+        session = self.sessions[decision.speaker_id]
+        model = self.config.model or session.character_config.get("llm_model") or _cfg.llm_model()
+        api_base_url = session.character_config.get("llm_url") or None
+        api_key = _api_key_for_model(model)
+        result = agent_loop.agent_chat(
+            messages,
+            model,
+            agent_config=None,
+            cancel_event=threading.Event(),
+            character_config=session.character_config,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            usage_callback=token_usage.make_callback(model, "multi_dialogue_chat"),
+            capture=True,
+        )
+        reply = result.reply.strip()
+        if not reply:
+            return None
+        self.add_ai_message(decision.speaker_id, reply)
+        self._remember_for_speaker(decision.speaker_id, trigger_text, reply)
+        return decision.speaker_id, session.character_name, reply
+
+    def build_reply_messages(self, decision: MultiDialogueDecision, *, trigger_text: str = "") -> list[dict]:
+        session = self.sessions[decision.speaker_id]
+        character_prompt = prompts.format_prompt(
+            "multi_dialogue_orchestrator.reply_character_prompt",
+            participants="、".join(self.participant_names),
+            name=session.character_name,
+            personality=str(session.character_data.get("personality", "") or "")[:900],
+        )
+        action_instruction = (
+            prompts.get("multi_dialogue_orchestrator.generator_backchannel_instruction", "")
+            if decision.action == "backchannel"
+            else prompts.format_prompt("multi_dialogue_orchestrator.generator_speak_instruction", name=session.character_name)
+        )
+        boundary = prompts.format_prompt(
+            "multi_dialogue_orchestrator.generator_context",
+            participants="、".join(self.participant_names),
+            name=session.character_name,
+            target=decision.target or "当前最需要回应的人",
+            action=decision.action,
+            mode=decision.utterance_mode or decision.action,
+            intent=decision.intent or "无",
+            topic=decision.topic or "无",
+            context_use=decision.context_use,
+            action_instruction=action_instruction,
+        )
+        messages: list[dict] = [
+            {"role": "system", "content": character_prompt or session.system_prompt},
+            {"role": "system", "content": boundary},
+        ]
+
+        scene_context = self._scene_context_for(session.character_name)
+        if scene_context:
+            messages.append({"role": "system", "content": scene_context})
+        cache_context = self.context_for_decision(decision)
+        if cache_context:
+            messages.append({"role": "system", "content": cache_context})
+        memory_query = " ".join(part for part in (trigger_text, decision.topic, decision.intent) if part)
+        memory_ctx = self._safe_memory_context(session.character_id, memory_query)
+        if memory_ctx:
+            messages.append({"role": "system", "content": memory_ctx})
+        cognition_ctx = _safe_context(getattr(session, "cognition", None))
+        if cognition_ctx:
+            messages.append({"role": "system", "content": cognition_ctx})
+        emotion_ctx = _safe_context(getattr(session, "emotion", None))
+        if emotion_ctx:
+            messages.append({"role": "system", "content": emotion_ctx})
+
+        history = self._format_history(max_entries=self.config.max_history) or "无"
+        user_prompt = (
+            f"【最近共享对话】\n{history}\n\n"
+            f"【当前触发内容】\n{trigger_text or decision.topic or '无'}\n\n"
+            f"请只写{session.character_name}现在会说出口的话："
+        )
+        messages.append({"role": "user", "content": user_prompt})
+        return messages
+
+    def context_for_decision(self, decision: MultiDialogueDecision) -> str:
+        parts: list[str] = []
+        if decision.context_use in ("screen", "both"):
+            screen = self._screen_context_for_generator()
+            if screen:
+                parts.append(prompts.format_prompt("multi_dialogue_orchestrator.screen_cache_context", screen=screen))
+        if decision.context_use in ("page", "both"):
+            page = self._page_context_for_generator()
+            if page:
+                parts.append(prompts.format_prompt("multi_dialogue_orchestrator.page_cache_context", page=page))
+        return "\n\n".join(parts)
+
+    def _build_planner_user_prompt(self, event: MultiDialogueEvent) -> str:
+        return prompts.format_prompt(
+            "multi_dialogue_orchestrator.planner_user",
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            event_type=event.type,
+            user_name=self.user_name,
+            speaker=event.speaker or "未知",
+            source_id=event.source_id or "无",
+            event_text=event.text or "空",
+            characters=self._characters_for_prompt(),
+            recent_history=self._format_history(max_entries=self.config.max_history) or "无",
+            runtime_context=self._runtime_context_for_prompt(),
+            pending_plans=self._plans_for_prompt() or "无",
+            extra_context=event.extra_context or "无",
+        )
+
+    def _characters_for_prompt(self) -> str:
+        lines: list[str] = []
+        for cid in self.order:
+            session = self.sessions[cid]
+            character = session.character_data
+            fields = [
+                f"id={cid}",
+                f"name={session.character_name}",
+            ]
+            for key in ("description", "personality", "relationship"):
+                value = str(character.get(key, "") or "").strip()
+                if value:
+                    fields.append(f"{key}={value[:420]}")
+            recent_count = sum(1 for item in self.shared_history[-8:] if item.character_id == cid)
+            fields.append(f"最近8条内发言次数={recent_count}")
+            lines.append("；".join(fields))
+        return "\n".join(lines)
+
+    def _runtime_context_for_prompt(self) -> str:
+        lines: list[str] = []
+        for cid in self.order:
+            session = self.sessions[cid]
+            chunks = []
+            cognition_ctx = _safe_context(getattr(session, "cognition", None))
+            emotion_ctx = _safe_context(getattr(session, "emotion", None))
+            if cognition_ctx:
+                chunks.append(cognition_ctx[:500])
+            if emotion_ctx:
+                chunks.append(emotion_ctx[:300])
+            lines.append(f"{session.character_name}（{cid}）：{chr(10).join(chunks) if chunks else '无'}")
+        return "\n\n".join(lines)
+
+    def _format_history(self, max_entries: int = 20) -> str:
+        entries = self.shared_history[-max_entries:] if max_entries else self.shared_history
+        return "\n".join(f"{entry.speaker}：{entry.text[:700]}" for entry in entries if entry.text)
+
+    def _scene_context_for(self, character_name: str) -> str:
+        guidance = _scene.guidance_text(self.scene, self.user_name, character_name)
+        if not guidance:
+            return ""
+        prefix = prompts.get("scene.prefix", "【当前场景：{scene_name}】")
+        scene_label = prefix.format(scene_name=_scene.scene_name(self.scene))
+        return f"{scene_label}\n{guidance}"
+
+    def _plans_for_prompt(self) -> str:
+        with self._lock:
+            plans = list(self._plans)
+        now = time.monotonic()
+        names = self.character_names
+        return "\n".join(plan.to_prompt_line(now, names) for plan in plans)
+
+    def _fallback_decision(self, event: MultiDialogueEvent, *, notes: str = "") -> MultiDialogueDecision:
+        if event.type == "user_utterance":
+            return MultiDialogueDecision(
+                action="speak",
+                speaker_id=self._fallback_speaker_for_text(event.text),
+                target=self.user_name,
+                intent="planner失败时由较少发言的角色接住用户输入",
+                topic=event.text[:40],
+                notes=notes,
+            )
+        return MultiDialogueDecision(action="silence", notes=notes)
+
+    def _fallback_speaker_for_text(self, text: str) -> str:
+        lowered = text.lower()
+        for cid, session in self.sessions.items():
+            if session.character_name and session.character_name.lower() in lowered:
+                return cid
+        recent_counts = {
+            cid: sum(1 for item in self.shared_history[-8:] if item.character_id == cid)
+            for cid in self.order
+        }
+        return min(self.order, key=lambda cid: recent_counts.get(cid, 0))
+
+    def _remember_for_speaker(self, speaker_id: str, trigger_text: str, reply: str) -> None:
+        session = self.sessions[speaker_id]
+        try:
+            session.remember(trigger_text, reply, async_store=True)
+        except Exception:
+            logger.exception("multi dialogue remember failed for %s", speaker_id)
+
+    def _safe_memory_context(self, character_id: str, query: str) -> str:
+        if not query:
+            return ""
+        try:
+            return self.memory_backend.get_context(query, user_id=character_id) or ""
+        except Exception:
+            return ""
+
+    def _call_planner(self, system_prompt: str, user_prompt: str) -> str:
+        model = self.planning_model
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        if _cfg.is_deepseek_model(model):
+            api_url = _cfg.deepseek_url().rstrip("/v1")
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_cfg.deepseek_api_key()}"}
+            resp = requests.post(
+                f"{api_url}/v1/chat/completions",
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.2,
+                    "max_tokens": 500,
+                    "response_format": {"type": "json_object"},
+                },
+                headers=headers,
+                timeout=45,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            usage = data.get("usage", {})
+            pt = int(usage.get("prompt_tokens", 0))
+            ct = int(usage.get("completion_tokens", 0))
+            if pt or ct:
+                token_usage.record(model, "multi_dialogue_plan", pt, ct)
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+        api_url = _cfg.llm_url()
+        resp = requests.post(
+            f"{api_url}/api/chat",
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": False,
+                "options": {"temperature": 0.2, "num_predict": 500},
+            },
+            timeout=45,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        pt = int(data.get("prompt_eval_count", 0))
+        ct = int(data.get("eval_count", 0))
+        if pt or ct:
+            token_usage.record(model, "multi_dialogue_plan", pt, ct)
+        return data.get("message", {}).get("content", "").strip()
+
+    def _cache_overview_for_planner(self) -> str:
+        parts: list[str] = []
+        try:
+            result, timestamp = screen_interest.get_cache().get()
+        except Exception:
+            result, timestamp = None, 0.0
+        if result and result.content and result.score >= self.context_idle_min_score:
+            age = max(0.0, time.time() - timestamp) if timestamp else 0.0
+            parts.append(
+                f"屏幕缓存候选：\n分数={result.score:.1f}，缓存年龄={age:.0f}秒，隐私={result.private}\n"
+                f"{result.content[:self.screen_context_max_chars]}"
+            )
+        page = self._page_context_for_generator()
+        if page:
+            parts.append(f"网页缓存候选：\n{page[:self.page_context_max_chars]}")
+        return "\n\n".join(parts)
+
+    def _screen_context_for_generator(self) -> str:
+        try:
+            result, timestamp = screen_interest.get_cache().get()
+        except Exception:
+            return ""
+        if not result or result.private or not result.content:
+            return ""
+        age = max(0.0, time.time() - timestamp) if timestamp else 0.0
+        return f"score={result.score:.1f}, age={age:.0f}s\n{result.content[:self.screen_context_max_chars]}"
+
+    def _page_context_for_generator(self) -> str:
+        if not self.edge_cache_config.enabled:
+            return ""
+        try:
+            return edge_cache.format_for_prompt(
+                self.edge_cache_config.cache_file,
+                max_chars=self.page_context_max_chars,
+            )
+        except Exception:
+            return ""
+
+
+def _api_key_for_model(model: str) -> str | None:
+    lowered = model.lower()
+    if lowered.startswith("charglm"):
+        return _cfg.charglm_api_key() or None
+    return None
+
+
+def _safe_context(obj) -> str:
+    if obj is None or not hasattr(obj, "get_context"):
+        return ""
+    try:
+        return obj.get_context() or ""
+    except Exception:
+        return ""
+
+
+def _normalize_context_use(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"screen", "page", "both", "none"}:
+        return normalized
+    if normalized in {"web", "网页", "browser"}:
+        return "page"
+    if normalized in {"屏幕", "desktop"}:
+        return "screen"
+    return "none"
+
+
+def _extract_json_object(text: str) -> dict | None:
+    stripped = text.strip().lstrip("\ufeff")
+    if not stripped:
+        return None
+    if "</think>" in stripped:
+        stripped = stripped.split("</think>")[-1].strip()
+    try:
+        value = json.loads(stripped)
+        return value if isinstance(value, dict) else None
+    except json.JSONDecodeError:
+        pass
+    code_match = re.search(r"```(?:json)?\s*\n?(.*?)```", stripped, re.DOTALL)
+    if code_match:
+        try:
+            value = json.loads(code_match.group(1).strip())
+            return value if isinstance(value, dict) else None
+        except json.JSONDecodeError:
+            pass
+    start = stripped.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    for index in range(start, len(stripped)):
+        ch = stripped[index]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    value = json.loads(stripped[start:index + 1])
+                    return value if isinstance(value, dict) else None
+                except json.JSONDecodeError:
+                    return None
+    return None

@@ -41,7 +41,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--character", "-c", default="alice", help="Character id (default: alice)")
     parser.add_argument("--model", default=None, help="Chat model")
     parser.add_argument("--multi", default=None, help="Multi-character mode: comma-separated IDs, e.g. 'alice,penglai'")
-    parser.add_argument("--auto", type=int, default=3, help="Auto rounds before interactive mode in multi-chat")
+    parser.add_argument("--auto", type=int, default=3, help="Auto follow-up turns after each user turn in multi-character mode")
     parser.add_argument("--no-memory", action="store_true", help="Disable memory backend for this run")
     parser.add_argument("--no-tools", action="store_true", help="Disable agent file tools")
     parser.add_argument("--read-only-tools", action="store_true", help="Enable file tools without write access")
@@ -262,78 +262,143 @@ def main() -> None:
 
 
 def _run_multi(args: argparse.Namespace) -> None:
-    """Multi-character chat mode."""
+    """Multi-character dialogue mode."""
     cids = [c.strip() for c in args.multi.split(",") if c.strip()]
     if len(cids) < 2:
         print("[error] --multi needs at least 2 character IDs")
         return
 
+    runtime_config = dict(CONFIG)
+    if args.no_memory:
+        runtime_config["memory_backend"] = "none"
     cfg_inst = multi_chat.MultiChatConfig(
         character_ids=cids,
         max_history=args.max_history,
         model=args.model or "",
+        max_auto_followups=max(0, args.auto),
     )
-    orch = multi_chat.MultiChatOrchestrator(cfg_inst)
+    orch = multi_chat.MultiChatOrchestrator(cfg_inst, runtime_config=runtime_config)
 
     user_name = orch.user_name
     names = orch.character_names
 
     print("=" * 50)
-    print("  Multi-Character Chat")
+    print("  Multi-Character Dialogue")
     for cid, cname in names.items():
         print(f"  {cid} → {cname}")
     print(f"  User: {user_name}")
-    print(f"  Commands: /exit, /auto N, /history")
-    print("  Empty input = auto next turn")
+    print(f"  Planner: {orch.planning_model}")
+    print(f"  Memory: {not args.no_memory}")
+    print(f"  Auto followups: {max(0, args.auto)}")
+    print(f"  Commands: /exit, /auto N, /history, /usage")
+    print("  Empty input = execute due/idle multi-dialogue turn")
     print("=" * 50)
 
-    # Auto cycle: the AIs chat among themselves first
-    if args.auto > 0:
-        print(f"\n--- Auto {args.auto} rounds ---")
-        turns = orch.auto_cycle(rounds=args.auto)
-        for cid, cname, reply in turns:
-            if reply:
-                print(f"\n{cname}> {reply}")
+    input_turns = None
+    if args.input_file:
+        input_turns = [
+            line.strip()
+            for line in Path(args.input_file).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    transcript_path = Path(args.transcript_file) if args.transcript_file else _default_transcript_path()
+    transcript_path.parent.mkdir(parents=True, exist_ok=True)
+    transcript = transcript_path.open("w", encoding="utf-8", buffering=1)
+    transcript.write("# Multi-Character Dialogue Log\n\n")
+    transcript.write(f"- Characters: {', '.join(names.values())}\n")
+    transcript.write(f"- Planner: {orch.planning_model}\n")
+    transcript.write(f"- Memory: {not args.no_memory}\n\n")
+    print(f"  Log file: {transcript_path}")
 
-    # Interactive: user can speak or let AIs auto-chat
-    while True:
-        try:
-            raw = input(f"\n[{user_name}] (enter=auto) > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-
-        if not raw:
-            # Auto turn — let next AI speak
-            cid, cname, reply = orch.auto_turn()
-            if reply:
-                print(f"\n{cname}> {reply}")
+    try:
+        turn_iter = iter(input_turns) if input_turns is not None else None
+        stdin_is_pipe = input_turns is not None or not sys.stdin.isatty()
+        while True:
+            if turn_iter is not None:
+                try:
+                    raw = next(turn_iter)
+                except StopIteration:
+                    break
+                print(f"\n[{user_name}] > ", end="", flush=True)
             else:
-                print("[no reply]")
-            continue
+                try:
+                    raw = input(f"\n[{user_name}] (enter=auto) > ").strip()
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    print("\n[stopped]")
+                    break
 
-        if raw in ("/exit", "/quit"):
-            break
+            if stdin_is_pipe and raw:
+                print(raw)
 
-        if raw.startswith("/auto "):
-            try:
-                n = int(raw.split("/auto ", 1)[1])
-            except (ValueError, IndexError):
-                n = 3
-            print(f"\n--- Auto {n} rounds ---")
-            for cid, cname, reply in orch.auto_cycle(rounds=n):
+            if not raw:
+                cid, cname, reply = orch.auto_turn()
                 if reply:
-                    print(f"{cname}> {reply}")
-            continue
+                    print(f"\n{cname}> {reply}")
+                    transcript.write(f"{cname}: {reply}\n\n")
+                else:
+                    print("[no reply]")
+                    transcript.write("[no reply]\n\n")
+                continue
 
-        if raw == "/history":
-            for entry in orch.shared_history:
-                print(f"  {entry.speaker}：{entry.text[:100]}")
-            continue
+            if raw in ("/exit", "/quit"):
+                break
 
-        # User speaks → AI responds
-        cid, cname, reply = orch.user_turn(raw)
-        if reply:
-            print(f"\n{cname}> {reply}")
+            if raw.startswith("/auto "):
+                try:
+                    n = int(raw.split("/auto ", 1)[1])
+                except (ValueError, IndexError):
+                    n = 3
+                print(f"\n--- Auto {n} rounds ---")
+                for cid, cname, reply in orch.auto_cycle(rounds=n):
+                    if reply:
+                        print(f"{cname}> {reply}")
+                        transcript.write(f"{cname}: {reply}\n\n")
+                continue
+
+            if raw == "/history":
+                for entry in orch.shared_history:
+                    print(f"  {entry.speaker}：{entry.text[:100]}")
+                continue
+
+            if raw == "/usage":
+                usage = token_usage.summary()
+                print(usage)
+                transcript.write(f"```text\n{usage}\n```\n\n")
+                continue
+
+            transcript.write(f"{user_name}: {raw}\n")
+            try:
+                turns = orch.user_turn(raw)
+            except requests.exceptions.ConnectionError:
+                message = f"[connection failed] Cannot connect to planner/model endpoint"
+                print(message)
+                transcript.write(f"{message}\n\n")
+                if stdin_is_pipe:
+                    break
+                continue
+            except Exception as exc:
+                message = f"[error] {type(exc).__name__}: {exc}"
+                print(message)
+                transcript.write(f"{message}\n\n")
+                if stdin_is_pipe:
+                    break
+                continue
+            if not turns:
+                print("[no reply]")
+                transcript.write("[no reply]\n\n")
+            for _cid, cname, reply in turns:
+                print(f"\n{cname}> {reply}")
+                transcript.write(f"{cname}: {reply}\n")
+            transcript.write("\n")
+    finally:
+        usage = token_usage.summary()
+        transcript.write(f"```text\n{usage}\n```\n")
+        transcript.close()
+        orch.close()
+        print()
+        print(usage)
 
 
 def _default_transcript_path() -> Path:

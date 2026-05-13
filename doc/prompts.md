@@ -21,8 +21,14 @@ prompts.format_prompt("conversation_summary.user_template", conversation="...")
 | `screen_interest` | 屏幕兴趣分析 |
 | `memory_events` | 记忆事件触发 |
 | `impulse` | 主动搭话 planner 和 trigger |
+| `dialogue_orchestrator` | 一对一自然对话调度、第三人称发言约束、屏幕/网页缓存使用决策 |
 | `bilibili_live` | 直播模式提示 |
 | `tool_calling` | 工具调用结果和错误提示 |
+| `tool_handlers` | 工具处理器默认文本 |
+| `vision` | 视觉识别默认提示和桌面分析后缀 |
+| `overlap` | 用户插话时的重叠判断 |
+| `multi_dialogue_orchestrator` | 多角色对话调度、speaker 选择和多人发言约束 |
+| `scene` | 场景提示 |
 
 ## 人格迭代建议
 
@@ -81,6 +87,16 @@ python text_cli.py --read-only-tools
 - 直播弹幕上下文
 
 `impulse.trigger_system` 和 `impulse.trigger_user` 用于把计划项转成一次具体发言。
+
+## Dialogue Orchestrator 提示词
+
+`dialogue_orchestrator.planner_system` 和 `dialogue_orchestrator.planner_user` 用于判断角色是否该开口、沉默、短回应或稍后再说。
+
+`dialogue_orchestrator.generator_context` 会把 planner 的决策传给发言生成器。它强调第三人称视角：场上是两个角色在对话，不是“用户”和“助手”。
+
+`dialogue_orchestrator.reply_character_prompt` 是窄版发言生成契约，目的是减少角色背景、屏幕、弹幕、物理动作等无关内容泄漏。
+
+`dialogue_orchestrator.screen_cache_*` 和 `dialogue_orchestrator.page_cache_*` 只描述缓存材料。是否讨论屏幕或网页由 planner 通过 `context_use` 决定。
 
 ## 修改注意
 

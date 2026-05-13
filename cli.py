@@ -41,6 +41,7 @@ from kokoro import bilibili_live as bilibili_live_mod
 from kokoro import edge_cache as edge_cache_mod
 from kokoro import token_usage
 from kokoro import tool_registry as tool_registry_mod
+from kokoro import vts_controller as vts_mod
 
 
 _PAREN_STRIP_RE = re.compile(r"\s*[\uff08(][^\uff09)]*[\uff09)]\s*")
@@ -303,6 +304,76 @@ def main() -> None:
         except Exception as exc:
             print(f"  [cli] Portrait overlay init failed: {exc}")
 
+    # ── VTube Studio ─────────────────────────────────────────────────────────
+    _vts_controller: vts_mod.VTSController | None = None
+    _vts_arbiter: vts_mod.VTSExpressionArbiter | None = None
+    _vts_idle_loop: vts_mod.VTSIdleLoop | None = None
+    _vts_lipsync: vts_mod.VTSLipSync | None = None
+    _vts_loop: asyncio.AbstractEventLoop | None = None
+    _vts_loop_thread: threading.Thread | None = None
+
+    vts_cfg = CONFIG.get("vts", {})
+    if vts_cfg.get("enabled", True):
+        try:
+            _vts_controller = vts_mod.VTSController(
+                host=str(vts_cfg.get("host", "localhost")),
+                port=int(vts_cfg.get("port", 8001)),
+                character_id=args.character,
+            )
+            _vts_loop = asyncio.new_event_loop()
+            _vts_loop_thread = threading.Thread(target=_vts_loop.run_forever, daemon=True)
+            _vts_loop_thread.start()
+
+            auth_future = asyncio.run_coroutine_threadsafe(
+                _vts_controller.authenticate(), _vts_loop,
+            )
+            auth_future.result(timeout=10)
+
+            _vts_arbiter = vts_mod.VTSExpressionArbiter(_vts_controller)
+            asyncio.run_coroutine_threadsafe(_vts_arbiter.start(), _vts_loop)
+
+            _vts_idle_loop = vts_mod.VTSIdleLoop(_vts_arbiter)
+            asyncio.run_coroutine_threadsafe(_vts_idle_loop.start(), _vts_loop)
+
+            _vts_lipsync = vts_mod.VTSLipSync(_vts_controller, _vts_arbiter)
+
+            if tts_engine is not None:
+                _original_audio_frame = tts_engine.on_audio_frame
+                def _vts_audio_wrapper(chunk):
+                    _vts_lipsync.on_audio_frame(chunk)
+                    if _original_audio_frame:
+                        _original_audio_frame(chunk)
+                tts_engine.on_audio_frame = _vts_audio_wrapper
+
+            def _on_vts_emotion(tone: str, motivation: str) -> None:
+                if _vts_arbiter is None:
+                    return
+                expr_id = _vts_controller.resolve_emotion_tone(tone) if _vts_controller else None
+                if expr_id:
+                    params = _vts_controller.get_expression_params(expr_id, 1.0)
+                    _vts_arbiter.set_layer("emotion", params)
+                else:
+                    _vts_arbiter.clear_layer("emotion")
+
+            if session is not None and hasattr(session, "emotion"):
+                session.emotion._on_update = _on_vts_emotion
+
+            def _tts_state_monitor():
+                while not machine.is_shutting_down and _vts_idle_loop:
+                    is_active = bool(tts_engine and tts_engine.is_playing)
+                    _vts_idle_loop.set_tts_active(is_active)
+                    time.sleep(0.5)
+            if _vts_idle_loop:
+                threading.Thread(target=_tts_state_monitor, daemon=True).start()
+
+            print("  [vts] VTube Studio connected")
+        except Exception as exc:
+            print(f"  [vts] Init failed: {exc}")
+            _vts_controller = None
+            _vts_arbiter = None
+            _vts_idle_loop = None
+            _vts_lipsync = None
+
     # ── subtitle overlay (tied to portrait on/off) ────────────────────────────
     _subtitle_client: subtitle_mod.SubtitleOverlayClient | None = None
     _stt_subtitle_client: subtitle_mod.SubtitleOverlayClient | None = None
@@ -563,7 +634,14 @@ def main() -> None:
                     messages.insert(-1, {"role": "system", "content": inline_prompt})
 
             try:
-                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(session=session, memory_backend=memory_backend, character_id=session.character_id), subtitle_client=_subtitle_client)
+                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(
+                    session=session,
+                    memory_backend=memory_backend,
+                    character_id=session.character_id,
+                    vts_controller=_vts_controller,
+                    vts_arbiter=_vts_arbiter,
+                    event_loop=_vts_loop,
+                ), subtitle_client=_subtitle_client)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
                 machine.emit_error("llm_connection")
@@ -662,6 +740,9 @@ def main() -> None:
                         session=session,
                         memory_backend=memory_backend,
                         character_id=session.character_id,
+                        vts_controller=_vts_controller,
+                        vts_arbiter=_vts_arbiter,
+                        event_loop=_vts_loop,
                     ),
                     subtitle_client=_subtitle_client,
                 )
@@ -772,6 +853,7 @@ def main() -> None:
     print(f"  Microphone: [{device}]")
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
+    print(f"  VTS: {_vts_controller is not None}")
     print(f"  Impulse: {_use_impulse}")
     print(f"  Tool calling: {_tool_enabled}")
     print(f"  Screen watch: {screen_watch_enabled}")
@@ -970,7 +1052,25 @@ def main() -> None:
             _stt_subtitle_client.shutdown()
         if tts_engine:
             tts_engine.close()
-        # Flush cached memory events to vector store
+        # ── VTS cleanup ──────────────────────────────────────────────────────────
+        if _vts_idle_loop:
+            try:
+                asyncio.run_coroutine_threadsafe(_vts_idle_loop.stop(), _vts_loop).result(timeout=3)
+            except Exception:
+                pass
+        if _vts_arbiter:
+            try:
+                asyncio.run_coroutine_threadsafe(_vts_arbiter.stop(), _vts_loop).result(timeout=3)
+            except Exception:
+                pass
+        if _vts_controller:
+            try:
+                asyncio.run_coroutine_threadsafe(_vts_controller.close(), _vts_loop).result(timeout=3)
+            except Exception:
+                pass
+        if _vts_loop:
+            _vts_loop.call_soon_threadsafe(_vts_loop.stop)
+        # ── Flush cached memory events to vector store ────────────────────────────
         if session is not None and hasattr(session, 'memory_events') and session.memory_events is not None:
             session.memory_events.flush_all(
                 user_name=session.user_name,

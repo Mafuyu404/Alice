@@ -25,12 +25,18 @@ _CHARACTERS_DIR = os.path.join(
 class EmotionState:
     """浅层情绪基调 + 短中期动机，可选，默认为空。"""
 
-    def __init__(self, character_id: str):
+    def __init__(self, character_id: str, on_update=None):
+        """
+        Args:
+            character_id: 角色ID
+            on_update: 可选回调，情绪更新后调用 callback(tone, motivation)
+        """
         self.character_id = character_id
         self._path = os.path.join(_CHARACTERS_DIR, character_id, "emotion.txt")
         self._legacy_json_path = os.path.join(_CHARACTERS_DIR, character_id, "emotion.json")
         self.tone: str = ""
         self.motivation: str = ""
+        self._on_update = on_update
         self._load()
 
     # ── public API ──────────────────────────────────────────────────────────
@@ -238,6 +244,11 @@ class EmotionState:
             updated = True
         if updated:
             self._save()
+            if self._on_update:
+                try:
+                    self._on_update(self.tone, self.motivation)
+                except Exception as exc:
+                    logger.debug("emotion on_update callback failed: %s", exc)
 
 
 def _parse_emotion_text(text: str) -> tuple[str, str]:
