@@ -121,6 +121,10 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--bilibili-room", type=int, default=None, help="Bilibili live room ID (overrides config)")
     parser.add_argument("--multi", default=None, help="Multi-character mode: comma-separated IDs, e.g. 'alice,penglai'")
     parser.add_argument("--auto", type=int, default=5, help="Auto rounds before interactive in --multi mode")
+    parser.add_argument("--watch", action="store_true", help="In --multi mode, keep characters talking without user input")
+    parser.add_argument("--idle-seconds", type=float, default=0.6, help="Seconds between unattended --multi turns")
+    parser.add_argument("--max-turns", type=int, default=0, help="Maximum unattended --multi turns; 0 means unlimited")
+    parser.add_argument("--topic", default=None, help="Opening topic for --multi watch/auto mode")
     return parser.parse_args()
 
 
@@ -1086,8 +1090,8 @@ def main() -> None:
 _tts_lock = threading.Lock()
 
 
-def _tts_say(engine, text):
-    """Push text to TTS engine and wait for playback. Uses global lock."""
+def _tts_say(engine, text, *, wait: bool = True):
+    """Push text to TTS engine. Uses global lock so character voices do not overlap."""
     if engine is None:
         return
     with _tts_lock:
@@ -1098,8 +1102,18 @@ def _tts_say(engine, text):
                 if line:
                     engine.push(line)
             engine.end_sentence()
+            if wait:
+                while getattr(engine, "is_playing", False):
+                    time.sleep(0.05)
         except Exception as exc:
             print("  [tts] error: " + str(exc))
+
+
+def _wait_for_multi_tts(tts_map: dict[str, object], cancel_event: threading.Event | None = None) -> None:
+    while any(getattr(engine, "is_playing", False) for engine in tts_map.values()):
+        if cancel_event and cancel_event.is_set():
+            break
+        time.sleep(0.05)
 
 
 def _run_multi_cli(args):
@@ -1152,52 +1166,166 @@ def _run_multi_cli(args):
         tts_on = "on" if tts_map.get(cid) else "off"
         print("  " + cid + " -> " + cname + "  [tts:" + tts_on + "]")
     print("  User: " + user_name)
-    print("  Commands: /exit, /auto N")
-    print("  Empty input = auto next turn")
+    if args.watch:
+        print("  Mode: watch (unattended)")
+        print("  Stop: Ctrl+C")
+    else:
+        print("  Commands: /exit, /auto N, /watch [N]")
+        print("  Empty input = auto next turn")
     print("=" * 50)
 
-    def do_turn(cid, cname, reply):
+    predicted_lock = threading.Lock()
+    predicted_turn: dict[str, object | None] = {"value": None}
+    predicted_thread: dict[str, threading.Thread | None] = {"value": None}
+    predicted_serial = {"value": 0}
+
+    def clear_prediction() -> None:
+        with predicted_lock:
+            predicted_serial["value"] += 1
+            predicted_turn["value"] = None
+            predicted_thread["value"] = None
+
+    def start_prediction(cid: str, cname: str, reply: str) -> None:
+        if not args.watch or not reply:
+            return
+        with predicted_lock:
+            predicted_serial["value"] += 1
+            serial = predicted_serial["value"]
+
+        def worker() -> None:
+            try:
+                prepared = orch.prepare_followup_turn(cid, cname, reply)
+            except Exception as exc:
+                print("  [multi-dialogue] prefetch failed: " + str(exc))
+                prepared = None
+            with predicted_lock:
+                if serial == predicted_serial["value"]:
+                    predicted_turn["value"] = prepared
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with predicted_lock:
+            predicted_turn["value"] = None
+            predicted_thread["value"] = thread
+        thread.start()
+
+    def take_prediction():
+        thread = predicted_thread.get("value")
+        if thread:
+            thread.join(timeout=0.1)
+            if thread.is_alive():
+                return "", "", ""
+        with predicted_lock:
+            prepared = predicted_turn["value"]
+            predicted_turn["value"] = None
+            predicted_thread["value"] = None
+        return orch.commit_prepared_turn(prepared)
+
+    def do_turn(cid, cname, reply, *, prefetch: bool = False):
         if not reply:
             return
         print()
         print(cname + "> " + reply)
+        if _portrait_worker:
+            _portrait_worker.submit("", reply)
         engine = tts_map.get(cid)
         if engine:
-            _tts_say(engine, reply)
+            _tts_say(engine, reply, wait=not prefetch)
+        if prefetch:
+            start_prediction(cid, cname, reply)
+
+    def run_auto_turns(limit: int, *, sleep_between: bool = False) -> int:
+        produced = 0
+        while limit <= 0 or produced < limit:
+            if sleep_between and produced > 0:
+                time.sleep(max(0.1, float(args.idle_seconds)))
+            _wait_for_multi_tts(tts_map)
+            cid, cname, reply = take_prediction()
+            if not reply:
+                cid, cname, reply = orch.auto_turn()
+            if not reply:
+                if limit > 0:
+                    break
+                time.sleep(max(0.5, float(args.idle_seconds)))
+                continue
+            do_turn(cid, cname, reply, prefetch=True)
+            produced += 1
+        return produced
 
     if args.auto > 0:
         print()
         print("--- Auto " + str(args.auto) + " rounds ---")
-        for cid, cname, reply in orch.auto_cycle(rounds=args.auto):
-            do_turn(cid, cname, reply)
-
-    while True:
-        try:
-            raw = input(chr(10) + "[" + user_name + "] (enter=auto) > ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not raw:
-            cid, cname, reply = orch.auto_turn()
-            do_turn(cid, cname, reply)
-            continue
-        if raw in ("/exit", "/quit"):
-            break
-        if raw.startswith("/auto "):
-            try:
-                n = int(raw.split("/auto ", 1)[1])
-            except (ValueError, IndexError):
-                n = 3
+        opening = args.topic
+        if opening:
             print()
-            print("--- Auto " + str(n) + " rounds ---")
-            for cid, cname, reply in orch.auto_cycle(rounds=n):
-                do_turn(cid, cname, reply)
-            continue
-        cid, cname, reply = orch.user_turn(raw)
-        do_turn(cid, cname, reply)
+            print(user_name + "> " + opening)
+            for cid, cname, reply in orch.user_turn(opening):
+                do_turn(cid, cname, reply, prefetch=args.watch)
+        for cid, cname, reply in orch.auto_cycle(rounds=args.auto):
+            do_turn(cid, cname, reply, prefetch=args.watch)
 
-    for engine in tts_map.values():
+    try:
         try:
-            engine.close()
+            if args.watch:
+                print()
+                print("--- Watch mode ---")
+                if not args.auto:
+                    opening = args.topic or "你们自己挑一个轻松的话题聊吧，我先旁听。"
+                    print()
+                    print(user_name + "> " + opening)
+                    for cid, cname, reply in orch.user_turn(opening):
+                        do_turn(cid, cname, reply, prefetch=True)
+                run_auto_turns(max(0, int(args.max_turns)), sleep_between=True)
+                return
+
+            while True:
+                try:
+                    raw = input(chr(10) + "[" + user_name + "] (enter=auto) > ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not raw:
+                    clear_prediction()
+                    cid, cname, reply = orch.auto_turn()
+                    do_turn(cid, cname, reply)
+                    continue
+                if raw in ("/exit", "/quit"):
+                    break
+                if raw.startswith("/auto "):
+                    try:
+                        n = int(raw.split("/auto ", 1)[1])
+                    except (ValueError, IndexError):
+                        n = 3
+                    print()
+                    print("--- Auto " + str(n) + " rounds ---")
+                    clear_prediction()
+                    for cid, cname, reply in orch.auto_cycle(rounds=n):
+                        do_turn(cid, cname, reply)
+                    continue
+                if raw.startswith("/watch"):
+                    parts = raw.split()
+                    try:
+                        n = int(parts[1]) if len(parts) > 1 else 0
+                    except ValueError:
+                        n = 0
+                    print()
+                    print("--- Watch mode " + ("unlimited" if n <= 0 else str(n) + " turns") + " ---")
+                    clear_prediction()
+                    run_auto_turns(n, sleep_between=True)
+                    continue
+                clear_prediction()
+                for cid, cname, reply in orch.user_turn(raw):
+                    do_turn(cid, cname, reply)
+        except KeyboardInterrupt:
+            pass
+    finally:
+        for engine in tts_map.values():
+            try:
+                engine.close()
+            except Exception:
+                pass
+        if _portrait_worker:
+            _portrait_worker.stop()
+        try:
+            orch.close()
         except Exception:
             pass
 

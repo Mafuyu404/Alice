@@ -40,6 +40,17 @@ SUPPORTED_ACTIONS = {
 }
 
 
+MULTI_DIALOGUE_PACE_GUIDANCE = """
+
+节奏补充：
+- 无人值守或角色互聊时，优先像同场的人自然接话，不要每句都道谢、确认、总结或征求许可。
+- 角色之间可以有轻微分歧、吐槽、反问、抢白和不完全同意；不要为了礼貌把每句话磨平。
+- character_utterance 后，如果另一名角色有明确态度、想挑刺、想纠正或想把话题拽向自己关心的点，可以选择 speak 或 backchannel。
+- 让对话往前走：接上一句里的具体词、判断或漏洞，不要只说“你说得对”“确实如此”“我明白了”。
+- 发言保持短而有钩子，留给下一位角色可接的点。
+"""
+
+
 @dataclass
 class HistoryEntry:
     speaker: str
@@ -125,6 +136,15 @@ class MultiChatConfig:
     portrait_worker: object = None
 
 
+@dataclass
+class PreparedMultiTurn:
+    character_id: str
+    character_name: str
+    reply: str
+    trigger_text: str = ""
+    history_len: int = 0
+
+
 class MultiChatOrchestrator:
     """Third-person planner for a user plus multiple AI characters."""
 
@@ -201,23 +221,34 @@ class MultiChatOrchestrator:
         name = self.sessions[character_id].character_name
         self.shared_history.append(HistoryEntry(speaker=name, text=text, character_id=character_id))
 
-    def decide(self, event: MultiDialogueEvent) -> MultiDialogueDecision:
+    def decide(self, event: MultiDialogueEvent, *, log: bool = True) -> MultiDialogueDecision:
         system_prompt = prompts.get("multi_dialogue_orchestrator.planner_system", "")
+        if system_prompt:
+            system_prompt += MULTI_DIALOGUE_PACE_GUIDANCE
         user_prompt = self._build_planner_user_prompt(event)
         try:
             raw = self._call_planner(system_prompt, user_prompt)
             data = _extract_json_object(raw)
             if not data:
+                raw = self._call_planner(
+                    system_prompt,
+                    user_prompt + "\n\n上一次输出不是合法 JSON。现在只输出一个 JSON 对象，不要解释，不要 Markdown。",
+                )
+                data = _extract_json_object(raw)
+            if not data:
                 raise ValueError("multi planner did not return JSON object")
             decision = MultiDialogueDecision.from_dict(data, set(self.sessions.keys()))
         except Exception as exc:
-            logger.warning("multi dialogue planner failed: %s", exc)
+            if log:
+                logger.warning("multi dialogue planner failed: %s", exc)
+            else:
+                logger.debug("multi dialogue planner failed during prefetch: %s", exc)
             decision = self._fallback_decision(event, notes=f"planner fallback: {type(exc).__name__}")
 
         if decision.action == "schedule":
             decision.delay_seconds = min(decision.delay_seconds, self.max_delay_seconds)
 
-        if self.log_decisions:
+        if self.log_decisions and log:
             speaker = self.character_names.get(decision.speaker_id, "-")
             topic = f" topic={decision.topic}" if decision.topic else ""
             print(
@@ -264,6 +295,34 @@ class MultiChatOrchestrator:
         turns = self._execute_event(event)
         return turns[0] if turns else ("", "", "")
 
+    def prepare_followup_turn(self, source_id: str, speaker: str, text: str) -> PreparedMultiTurn | None:
+        event = MultiDialogueEvent(
+            type="character_utterance",
+            text=text,
+            speaker=speaker,
+            source_id=source_id,
+        )
+        turns = self._execute_event(event, allow_schedule=False, commit=False, log=False)
+        if not turns:
+            return None
+        cid, name, reply = turns[0]
+        return PreparedMultiTurn(
+            character_id=cid,
+            character_name=name,
+            reply=reply,
+            trigger_text=text,
+            history_len=len(self.shared_history),
+        )
+
+    def commit_prepared_turn(self, prepared: PreparedMultiTurn | None) -> tuple[str, str, str]:
+        if prepared is None or not prepared.reply:
+            return "", "", ""
+        if prepared.history_len != len(self.shared_history):
+            return "", "", ""
+        self.add_ai_message(prepared.character_id, prepared.reply)
+        self._remember_for_speaker(prepared.character_id, prepared.trigger_text, prepared.reply)
+        return prepared.character_id, prepared.character_name, prepared.reply
+
     def auto_cycle(self, rounds: int = 5, init_prompt: str = "") -> list[tuple[str, str, str]]:
         turns: list[tuple[str, str, str]] = []
         if init_prompt:
@@ -298,8 +357,15 @@ class MultiChatOrchestrator:
                 return None
             return self._plans.pop(0)
 
-    def _execute_event(self, event: MultiDialogueEvent, *, allow_schedule: bool = True) -> list[tuple[str, str, str]]:
-        decision = self.decide(event)
+    def _execute_event(
+        self,
+        event: MultiDialogueEvent,
+        *,
+        allow_schedule: bool = True,
+        commit: bool = True,
+        log: bool = True,
+    ) -> list[tuple[str, str, str]]:
+        decision = self.decide(event, log=log)
         if decision.action == "cancel_plan":
             self.cancel_plans()
             return []
@@ -309,10 +375,16 @@ class MultiChatOrchestrator:
             if allow_schedule:
                 self.add_plan(decision, created_from=event.text)
             return []
-        turn = self._execute_decision(decision, trigger_text=event.text)
+        turn = self._execute_decision(decision, trigger_text=event.text, commit=commit)
         return [turn] if turn else []
 
-    def _execute_decision(self, decision: MultiDialogueDecision, *, trigger_text: str = "") -> tuple[str, str, str] | None:
+    def _execute_decision(
+        self,
+        decision: MultiDialogueDecision,
+        *,
+        trigger_text: str = "",
+        commit: bool = True,
+    ) -> tuple[str, str, str] | None:
         if decision.speaker_id not in self.sessions:
             return None
         messages = self.build_reply_messages(decision, trigger_text=trigger_text)
@@ -334,8 +406,9 @@ class MultiChatOrchestrator:
         reply = result.reply.strip()
         if not reply:
             return None
-        self.add_ai_message(decision.speaker_id, reply)
-        self._remember_for_speaker(decision.speaker_id, trigger_text, reply)
+        if commit:
+            self.add_ai_message(decision.speaker_id, reply)
+            self._remember_for_speaker(decision.speaker_id, trigger_text, reply)
         return decision.speaker_id, session.character_name, reply
 
     def build_reply_messages(self, decision: MultiDialogueDecision, *, trigger_text: str = "") -> list[dict]:
@@ -346,6 +419,8 @@ class MultiChatOrchestrator:
             name=session.character_name,
             personality=str(session.character_data.get("personality", "") or "")[:900],
         )
+        if character_prompt:
+            character_prompt += MULTI_DIALOGUE_PACE_GUIDANCE
         action_instruction = (
             prompts.get("multi_dialogue_orchestrator.generator_backchannel_instruction", "")
             if decision.action == "backchannel"
@@ -483,6 +558,17 @@ class MultiChatOrchestrator:
                 topic=event.text[:40],
                 notes=notes,
             )
+        if event.type == "character_utterance":
+            speaker_id = self._fallback_followup_speaker(event.source_id)
+            if speaker_id:
+                return MultiDialogueDecision(
+                    action="speak",
+                    speaker_id=speaker_id,
+                    target=event.speaker,
+                    intent="planner失败时由另一名角色自然接上一句",
+                    topic=event.text[:40],
+                    notes=notes,
+                )
         return MultiDialogueDecision(action="silence", notes=notes)
 
     def _fallback_speaker_for_text(self, text: str) -> str:
@@ -495,6 +581,18 @@ class MultiChatOrchestrator:
             for cid in self.order
         }
         return min(self.order, key=lambda cid: recent_counts.get(cid, 0))
+
+    def _fallback_followup_speaker(self, source_id: str) -> str:
+        candidates = [cid for cid in self.order if cid != source_id]
+        if not candidates:
+            candidates = list(self.order)
+        if not candidates:
+            return ""
+        recent_counts = {
+            cid: sum(1 for item in self.shared_history[-8:] if item.character_id == cid)
+            for cid in candidates
+        }
+        return min(candidates, key=lambda cid: recent_counts.get(cid, 0))
 
     def _remember_for_speaker(self, speaker_id: str, trigger_text: str, reply: str) -> None:
         session = self.sessions[speaker_id]
@@ -547,6 +645,7 @@ class MultiChatOrchestrator:
             json={
                 "model": model,
                 "messages": messages,
+                "format": "json",
                 "stream": False,
                 "options": {"temperature": 0.2, "num_predict": 500},
             },
@@ -636,14 +735,27 @@ def _extract_json_object(text: str) -> dict | None:
         value = json.loads(stripped)
         return value if isinstance(value, dict) else None
     except json.JSONDecodeError:
-        pass
+        repaired = _repair_json_object_text(stripped)
+        if repaired:
+            try:
+                value = json.loads(repaired)
+                return value if isinstance(value, dict) else None
+            except json.JSONDecodeError:
+                pass
     code_match = re.search(r"```(?:json)?\s*\n?(.*?)```", stripped, re.DOTALL)
     if code_match:
+        block = code_match.group(1).strip()
         try:
-            value = json.loads(code_match.group(1).strip())
+            value = json.loads(block)
             return value if isinstance(value, dict) else None
         except json.JSONDecodeError:
-            pass
+            repaired = _repair_json_object_text(block)
+            if repaired:
+                try:
+                    value = json.loads(repaired)
+                    return value if isinstance(value, dict) else None
+                except json.JSONDecodeError:
+                    pass
     start = stripped.find("{")
     if start < 0:
         return None
@@ -656,8 +768,28 @@ def _extract_json_object(text: str) -> dict | None:
             depth -= 1
             if depth == 0:
                 try:
-                    value = json.loads(stripped[start:index + 1])
+                    candidate = stripped[start:index + 1]
+                    value = json.loads(candidate)
                     return value if isinstance(value, dict) else None
                 except json.JSONDecodeError:
+                    repaired = _repair_json_object_text(candidate)
+                    if repaired:
+                        try:
+                            value = json.loads(repaired)
+                            return value if isinstance(value, dict) else None
+                        except json.JSONDecodeError:
+                            pass
                     return None
     return None
+
+
+def _repair_json_object_text(text: str) -> str:
+    candidate = text.strip()
+    if not candidate:
+        return ""
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        return candidate[start:end + 1]
+    return ""
