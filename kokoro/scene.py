@@ -1,9 +1,4 @@
-"""Scene context manager — guides LLM behavior by conversation scene.
-
-Scenes define the information source layout and role context for the LLM.
-Each scene has its own guidance template that sits alongside the character
-system prompt to tell the model what kind of input to expect.
-"""
+"""Scene context manager."""
 
 from __future__ import annotations
 
@@ -14,65 +9,96 @@ from kokoro import prompts as _prompts
 
 
 class SceneType(Enum):
-    SINGLE_CHAT = "single_chat"   # 单人普通对话 — 仅用户和 AI
-    SINGLE_LIVE = "single_live"   # 单人直播 — 用户 + 弹幕
-    MULTI_CHAT = "multi_chat"     # 多人普通对话 — 多人轮流发言
-    MULTI_LIVE = "multi_live"     # 多人直播 — 多人 + 弹幕
+    SINGLE_CHAT = "single_chat"
+    SINGLE_LIVE = "single_live"
+    MULTI_CHAT = "multi_chat"
+    MULTI_LIVE = "multi_live"
 
 
-# ── Resolve ────────────────────────────────────────────────────────────────
+def _legacy_flags_from_mode(raw: str) -> tuple[bool, bool]:
+    if raw == SceneType.SINGLE_LIVE.value:
+        return False, True
+    if raw == SceneType.MULTI_CHAT.value:
+        return True, False
+    if raw == SceneType.MULTI_LIVE.value:
+        return True, True
+    return False, False
+
+
+def _scene_from_flags(multi_enabled: bool, live_enabled: bool) -> SceneType:
+    if multi_enabled and live_enabled:
+        return SceneType.MULTI_LIVE
+    if multi_enabled:
+        return SceneType.MULTI_CHAT
+    if live_enabled:
+        return SceneType.SINGLE_LIVE
+    return SceneType.SINGLE_CHAT
 
 
 def resolve(config: dict | None = None) -> SceneType:
-    """Return the active scene based on runtime config.
-
-    Priority:
-      1. If ``scene.mode`` is set explicitly in config, use it.
-      2. If ``bilibili_live.live_mode`` is true, override to a LIVE variant.
-    """
     if config is None:
         config = _cfg.load()
 
-    # Read explicit scene mode from config
-    raw = "single_chat"
     scene_section = config.get("scene", {})
-    if isinstance(scene_section, dict):
-        raw = str(scene_section.get("mode", "single_chat"))
+    if not isinstance(scene_section, dict):
+        scene_section = {}
 
-    # Normalise to enum
-    if raw not in SceneType._value2member_map_:
-        raw = "single_chat"
-    scene = SceneType(raw)
+    raw_mode = str(scene_section.get("mode", "single_chat"))
+    legacy_multi, legacy_live = _legacy_flags_from_mode(raw_mode)
+    multi_enabled = bool(scene_section.get("multi_enabled", legacy_multi))
+    live_enabled = bool(scene_section.get("live_enabled", legacy_live))
 
-    # Live override: if bilibili_live is live, promote to LIVE variant
     live_section = config.get("bilibili_live", {})
-    if isinstance(live_section, dict) and live_section.get("live_mode", False):
-        if scene == SceneType.SINGLE_CHAT:
-            scene = SceneType.SINGLE_LIVE
-        elif scene == SceneType.MULTI_CHAT:
-            scene = SceneType.MULTI_LIVE
+    if "live_enabled" not in scene_section and isinstance(live_section, dict):
+        live_enabled = bool(live_section.get("live_mode", live_enabled))
 
-    return scene
+    return _scene_from_flags(multi_enabled, live_enabled)
 
 
-# ── Guidance builder ────────────────────────────────────────────────────────
+def multi_enabled(config: dict | None = None) -> bool:
+    return is_multi(resolve(config))
 
 
-def guidance_text(scene: SceneType, user_name: str = "你", character_name: str = "助手") -> str:
-    """Return the scene guidance block for the given scene.
+def live_enabled(config: dict | None = None) -> bool:
+    return is_live(resolve(config))
 
-    This is injected as a system-level context message to tell the LLM
-    what kind of conversation layout to expect.
-    """
+
+def random_mc_enabled(config: dict | None = None) -> bool:
+    if config is None:
+        config = _cfg.load()
+    section = config.get("scene", {})
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("random_mc_enabled", False))
+
+
+def random_mc_guidance() -> str:
+    return (
+        "【随机 MC 百科场景】\n"
+        "浏览器里会周期性打开 Minecraft 百科的随机页面，可能是模组、整合包、物品、机制或相关条目。"
+        "当前网页缓存是这个场景的核心材料。发言应围绕页面中明确出现的标题、简介、正文、版本、玩法、作者、依赖、特性或争议展开，"
+        "可以介绍、评价、吐槽、比较或提出观察，但不能编造页面没有出现的具体内容。"
+        "如果页面切换到新随机条目，要自然转向新页面；如果缓存为空或看不清，就直接说明信息不够。"
+    )
+
+
+def guidance_text(
+    scene: SceneType,
+    user_name: str = "你",
+    character_name: str = "助手",
+    config: dict | None = None,
+) -> str:
     template_path = f"scene.{scene.value}"
     raw = _prompts.get(template_path, "")
-    if not raw:
-        return ""
-    return raw.format(user_name=user_name, name=character_name)
+    parts = []
+    if raw:
+        parts.append(raw.format(user_name=user_name, name=character_name))
+    if random_mc_enabled(config):
+        parts.append(random_mc_guidance())
+    return "\n\n".join(parts)
 
 
 def scene_name(scene: SceneType) -> str:
-    """Human-readable Chinese scene name."""
     names = {
         SceneType.SINGLE_CHAT: "日常对话",
         SceneType.SINGLE_LIVE: "单人直播",

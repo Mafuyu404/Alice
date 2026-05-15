@@ -209,9 +209,11 @@ log_plan_table = false
 ## Bilibili 直播
 
 ```toml
+[scene]
+live_enabled = true
+
 [bilibili_live]
 enabled = false
-live_mode = true
 room_id = 0
 buffer_max_age = 60.0
 reconnect_delay = 5.0

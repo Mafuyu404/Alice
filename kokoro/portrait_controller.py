@@ -22,9 +22,22 @@ ROOT = Path(__file__).resolve().parent.parent
 OVERLAY_SCRIPT = ROOT / "overlay_slideshow.py"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17352
+SHARED_PORTRAITS_FILE = ROOT / "characters" / "portraits.json"
 
 
 def load_portrait_notes(character_id: str) -> list[dict]:
+    if SHARED_PORTRAITS_FILE.exists():
+        try:
+            data = json.loads(SHARED_PORTRAITS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                items = data.get(character_id, [])
+                if isinstance(items, list):
+                    return items
+                if isinstance(items, dict):
+                    return items.get("portraits", items.get("assets", []))
+        except Exception as exc:
+            logger.warning("failed to load shared portrait notes for %s: %s", character_id, exc)
+
     path = ROOT / "characters" / character_id / "portrait" / "portrait.json"
     if not path.exists():
         return []
@@ -37,10 +50,21 @@ def load_portrait_notes(character_id: str) -> list[dict]:
 
 
 class PortraitOverlayClient:
-    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, character_id: str = ""):
+    def __init__(
+        self,
+        host: str = DEFAULT_HOST,
+        port: int = DEFAULT_PORT,
+        character_id: str = "",
+        slot_index: int | None = None,
+        slot_count: int = 1,
+        state_file: str = "",
+    ):
         self.host = host
         self.port = port
         self.character_id = character_id
+        self.slot_index = slot_index
+        self.slot_count = max(1, slot_count)
+        self.state_file = state_file
         self.base_url = f"http://{host}:{port}"
         self.process: Optional[subprocess.Popen] = None
         self.owned_process = False
@@ -64,6 +88,11 @@ class PortraitOverlayClient:
         if self.character_id:
             image_dir = f"characters/{self.character_id}/portrait"
             cmd.extend(["--image-dir", image_dir])
+            cmd.extend(["--character-id", self.character_id])
+        if self.state_file:
+            cmd.extend(["--state-file", self.state_file])
+        if self.slot_index is not None:
+            cmd.extend(["--slot-index", str(self.slot_index), "--slot-count", str(self.slot_count)])
         self.process = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
@@ -287,10 +316,25 @@ class PortraitDecisionWorker:
         return ""
 
 
-def create_controller(character_id: str, model: str) -> tuple[PortraitOverlayClient, PortraitDecisionWorker]:
+def create_controller(
+    character_id: str,
+    model: str,
+    *,
+    port: int | None = None,
+    slot_index: int | None = None,
+    slot_count: int = 1,
+    state_file: str = "",
+) -> tuple[PortraitOverlayClient, PortraitDecisionWorker]:
     host = cfg.get("portrait_overlay_host", DEFAULT_HOST)
-    port = int(cfg.get("portrait_overlay_port", DEFAULT_PORT))
-    client = PortraitOverlayClient(host=host, port=port, character_id=character_id)
+    overlay_port = int(port if port is not None else cfg.get("portrait_overlay_port", DEFAULT_PORT))
+    client = PortraitOverlayClient(
+        host=host,
+        port=overlay_port,
+        character_id=character_id,
+        slot_index=slot_index,
+        slot_count=slot_count,
+        state_file=state_file,
+    )
     client.start()
     portrait_model = cfg.portrait_model()
     worker = PortraitDecisionWorker(client=client, model=portrait_model or model, character_id=character_id)

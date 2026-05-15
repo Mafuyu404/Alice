@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from kokoro import agent_loop
 from kokoro import chat_session
 from kokoro import config as cfg
 from kokoro import dialogue_orchestrator as dialogue_mod
+from kokoro import edge_cache as edge_cache_mod
 from kokoro import llm_client
 from kokoro import memory as mem_mod
 from kokoro import multi_chat
@@ -278,6 +280,8 @@ def _run_multi(args: argparse.Namespace) -> None:
         max_auto_followups=max(0, args.auto),
     )
     orch = multi_chat.MultiChatOrchestrator(cfg_inst, runtime_config=runtime_config)
+    stop_event = threading.Event()
+    edge_thread = _start_edge_cache_worker(runtime_config, stop_event)
 
     user_name = orch.user_name
     names = orch.character_names
@@ -289,6 +293,7 @@ def _run_multi(args: argparse.Namespace) -> None:
     print(f"  User: {user_name}")
     print(f"  Planner: {orch.planning_model}")
     print(f"  Memory: {not args.no_memory}")
+    print(f"  Edge page cache: {edge_thread is not None}")
     print(f"  Auto followups: {max(0, args.auto)}")
     print(f"  Commands: /exit, /auto N, /history, /usage")
     print("  Empty input = execute due/idle multi-dialogue turn")
@@ -393,12 +398,55 @@ def _run_multi(args: argparse.Namespace) -> None:
                 transcript.write(f"{cname}: {reply}\n")
             transcript.write("\n")
     finally:
+        stop_event.set()
+        if edge_thread is not None:
+            edge_thread.join(timeout=2.0)
         usage = token_usage.summary()
         transcript.write(f"```text\n{usage}\n```\n")
         transcript.close()
         orch.close()
         print()
         print(usage)
+
+
+def _start_edge_cache_worker(runtime_config: dict, stop_event: threading.Event) -> threading.Thread | None:
+    edge_cache_config = edge_cache_mod.config_from_dict(runtime_config)
+    if not edge_cache_config.enabled:
+        return None
+
+    def worker() -> None:
+        last_cache_signature = ""
+        last_error_message = ""
+        while not stop_event.is_set():
+            t0 = time.perf_counter()
+            try:
+                payload = edge_cache_mod.capture_and_save(edge_cache_config)
+                last_error_message = ""
+                tab = payload.get("tab", {}) if isinstance(payload, dict) else {}
+                title = tab.get("title") or "(untitled)"
+                signature = "|".join([
+                    str(tab.get("url") or ""),
+                    str(tab.get("title") or ""),
+                    str(payload.get("text") or "")[:500],
+                ])
+                if signature != last_cache_signature:
+                    last_cache_signature = signature
+                    print(f"\n  [edge] cached page: {str(title)[:80]}")
+            except Exception as exc:
+                message = f"{type(exc).__name__}: {exc}"
+                edge_cache_mod.write_error_cache(edge_cache_config.cache_file, message)
+                if message != last_error_message:
+                    last_error_message = message
+                    last_cache_signature = ""
+                    print(f"\n[edge cache error] {message}")
+
+            elapsed = time.perf_counter() - t0
+            wait_seconds = max(0.1, edge_cache_config.interval_seconds - elapsed)
+            stop_event.wait(wait_seconds)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    return thread
 
 
 def _default_transcript_path() -> Path:

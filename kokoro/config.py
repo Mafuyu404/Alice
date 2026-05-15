@@ -272,6 +272,9 @@ def bilibili_live_enabled() -> bool:
 
 
 def bilibili_live_live_mode() -> bool:
+    scene = get("scene", {})
+    if isinstance(scene, dict) and "live_enabled" in scene:
+        return bool(scene.get("live_enabled", False))
     section = get("bilibili_live", {})
     if not isinstance(section, dict):
         return False

@@ -84,7 +84,7 @@ class ChatSession:
     @property
     def scene_guidance(self) -> str:
         """Scene guidance block describing information sources."""
-        return scene_mod.guidance_text(self._scene, self.user_name, self.character_name)
+        return scene_mod.guidance_text(self._scene, self.user_name, self.character_name, _cfg.load())
 
     @property
     def character_config(self) -> dict:

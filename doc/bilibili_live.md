@@ -5,9 +5,11 @@
 ## 配置
 
 ```toml
+[scene]
+live_enabled = true
+
 [bilibili_live]
 enabled = false
-live_mode = true
 room_id = 0
 buffer_max_age = 60.0
 reconnect_delay = 5.0
@@ -18,9 +20,11 @@ reconnect_delay = 5.0
 配置房间号：
 
 ```toml
+[scene]
+live_enabled = true
+
 [bilibili_live]
 enabled = true
-live_mode = true
 room_id = 22632424
 ```
 

@@ -22,6 +22,7 @@ SLIDE_INTERVAL_MS = 2000
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 17352
 MAP_FILE = "portrait.json"
+SHARED_MAP_FILE = "characters/portraits.json"
 STATE_FILE = "portrait_overlay_state.json"
 MIN_SCALE = 0.2
 MAX_SCALE = 4.0
@@ -48,14 +49,16 @@ def load_config(base_dir: Path) -> dict:
 
 
 class PortraitCatalog:
-    def __init__(self, image_dir: Path) -> None:
+    def __init__(self, image_dir: Path, character_id: str = "", root_dir: Path | None = None) -> None:
         self.image_dir = image_dir
+        self.character_id = character_id
+        self.root_dir = root_dir or Path.cwd()
         self.map_path = image_dir / MAP_FILE
         self.assets = self._load_assets()
         self.by_name = {asset["new_name"]: asset for asset in self.assets}
 
     def _load_assets(self) -> list[dict]:
-        data = json.loads(self.map_path.read_text(encoding="utf-8"))
+        data = self._load_map_data()
         items = data if isinstance(data, list) else data.get("assets", data.get("portraits", []))
         assets = []
         for item in items:
@@ -71,6 +74,14 @@ class PortraitCatalog:
                 "path": str((self.image_dir / name).resolve()),
             })
         return assets
+
+    def _load_map_data(self) -> object:
+        shared_path = self.root_dir / SHARED_MAP_FILE
+        if self.character_id and shared_path.exists():
+            data = json.loads(shared_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and self.character_id in data:
+                return data[self.character_id]
+        return json.loads(self.map_path.read_text(encoding="utf-8"))
 
     def list_series(self) -> list[str]:
         return sorted({asset["series"] for asset in self.assets})
@@ -106,9 +117,20 @@ class PortraitCatalog:
 class PortraitOverlay(QWidget):
     ui_call_requested = Signal(object)
 
-    def __init__(self, image_dir: Path, host: str, port: int, click_through: bool, state_path: Path) -> None:
+    def __init__(
+        self,
+        image_dir: Path,
+        host: str,
+        port: int,
+        click_through: bool,
+        state_path: Path,
+        slot_index: int | None = None,
+        slot_count: int = 1,
+        character_id: str = "",
+        root_dir: Path | None = None,
+    ) -> None:
         super().__init__()
-        self.catalog = PortraitCatalog(image_dir)
+        self.catalog = PortraitCatalog(image_dir, character_id=character_id, root_dir=root_dir)
         self.current_asset: dict | None = None
         self.current_source_pixmap: QPixmap | None = None
         self.slide_assets = self.catalog.assets[:]
@@ -120,6 +142,8 @@ class PortraitOverlay(QWidget):
         self.position_restored = False
         self.host = host
         self.port = port
+        self.slot_index = slot_index
+        self.slot_count = max(1, slot_count)
         self.drag_origin: QPoint | None = None
         self.server: ThreadingHTTPServer | None = None
         self.tray: QSystemTrayIcon | None = None
@@ -282,7 +306,14 @@ class PortraitOverlay(QWidget):
             screen = QGuiApplication.primaryScreen()
             if screen:
                 geometry = screen.availableGeometry()
-                self.move((geometry.width() - self.width()) // 2, 40)
+                if self.slot_index is None:
+                    x = (geometry.width() - self.width()) // 2
+                else:
+                    slot = min(max(0, int(self.slot_index)), self.slot_count - 1)
+                    center_x = geometry.left() + int(geometry.width() * (slot + 1) / (self.slot_count + 1))
+                    x = center_x - self.width() // 2
+                    x = min(max(geometry.left(), x), max(geometry.left(), geometry.right() - self.width()))
+                self.move(x, 40)
                 self.save_state()
 
     def set_current_asset(self, asset: dict) -> None:
@@ -585,6 +616,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=DEFAULT_HOST, help="HTTP bind host")
     parser.add_argument("--port", default=DEFAULT_PORT, type=int, help="HTTP bind port")
     parser.add_argument("--image-dir", default="img", help="Portrait image directory")
+    parser.add_argument("--character-id", default="", help="Character id for shared portrait metadata")
+    parser.add_argument("--state-file", default=STATE_FILE, help="Window state file")
+    parser.add_argument("--slot-index", default=None, type=int, help="Default horizontal slot index")
+    parser.add_argument("--slot-count", default=1, type=int, help="Default horizontal slot count")
     return parser.parse_args()
 
 
@@ -594,10 +629,20 @@ def main() -> None:
     image_dir = (base_dir / args.image_dir).resolve()
     config = load_config(base_dir)
     click_through = bool(config.get("portrait_click_through", False))
-    state_path = base_dir / STATE_FILE
+    state_path = base_dir / args.state_file
 
     app = QApplication(sys.argv)
-    overlay = PortraitOverlay(image_dir, args.host, args.port, click_through=click_through, state_path=state_path)
+    overlay = PortraitOverlay(
+        image_dir,
+        args.host,
+        args.port,
+        click_through=click_through,
+        state_path=state_path,
+        slot_index=args.slot_index,
+        slot_count=args.slot_count,
+        character_id=args.character_id,
+        root_dir=base_dir,
+    )
     overlay.activateWindow()
 
     def handle_sigint(_signum, _frame) -> None:

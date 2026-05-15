@@ -26,6 +26,20 @@ _SHORT_LIVED_KEYWORDS = (
 )
 _BAD_KEY_CHARS_RE = re.compile(r"[()（）:：\[\]【】]")
 
+_GENERIC_PERSON_KEYS = {
+    "\u7528\u6237",
+    "\u73a9\u5bb6",
+    "\u5bf9\u65b9",
+    "\u4eba\u7c7b",
+    "\u4e3b\u4eba",
+    "\u81ea\u5df1\u548c\u7528\u6237\u7684\u5173\u7cfb",
+    "\u7528\u6237\u548c\u81ea\u5df1\u7684\u5173\u7cfb",
+    "\u81ea\u5df1\u548c\u73a9\u5bb6\u7684\u5173\u7cfb",
+    "\u73a9\u5bb6\u548c\u81ea\u5df1\u7684\u5173\u7cfb",
+    "\u81ea\u5df1\u548c\u5bf9\u65b9\u7684\u5173\u7cfb",
+    "\u5bf9\u65b9\u548c\u81ea\u5df1\u7684\u5173\u7cfb",
+}
+
 
 class CognitionStore:
     """Full cognition data + runtime cache manager."""
@@ -241,6 +255,8 @@ def _validate_entries(raw) -> dict[str, str] | None:
         clean_key = _normalize_key(key)
         clean_value = _normalize_value(value)
         if not clean_key or not clean_value:
+            continue
+        if clean_key in _GENERIC_PERSON_KEYS:
             continue
         if _is_short_lived_key(clean_key):
             continue

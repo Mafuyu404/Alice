@@ -31,6 +31,7 @@ from kokoro import multi_chat as multi_chat_mod
 from kokoro import portrait_controller
 from kokoro import impulse as impulse_mod
 from kokoro import screen_interest
+from kokoro import scene as scene_mod
 from kokoro import state_machine as sm
 from kokoro import subtitle as subtitle_mod
 from kokoro import stt as stt_mod
@@ -438,7 +439,7 @@ def main() -> None:
     _bilibili_manager: bilibili_live_mod.BilibiliLiveManager | None = None
     _bilibili_room_id_raw = args.bilibili_room if args.bilibili_room is not None else cfg.bilibili_live_room_id()
     _bilibili_enabled = cfg.bilibili_live_enabled() and _bilibili_room_id_raw > 0
-    _bilibili_live_mode = cfg.bilibili_live_live_mode()
+    _bilibili_live_mode = scene_mod.live_enabled(CONFIG)
     if _bilibili_enabled:
         _bilibili_manager = bilibili_live_mod.BilibiliLiveManager(
             room_id=_bilibili_room_id_raw,
@@ -1153,12 +1154,24 @@ def _run_multi_cli(args):
     orch = multi_chat_mod.MultiChatOrchestrator(cfg_inst)
     names = orch.character_names
 
-    _portrait_worker = None
+    portrait_clients = {}
+    portrait_workers = {}
     if not args.no_portrait:
-        try:
-            _, _portrait_worker = portrait_controller.create_controller(cids[0], model)
-        except Exception as exc:
-            print("  [portrait] init failed: " + str(exc))
+        base_port = int(runtime_cfg.get("portrait_overlay_port", 17352)) + 1
+        for idx, cid in enumerate(cids):
+            try:
+                client, worker = portrait_controller.create_controller(
+                    cid,
+                    model,
+                    port=base_port + idx,
+                    slot_index=idx,
+                    slot_count=len(cids),
+                    state_file="portrait_overlay_state_" + cid + ".json",
+                )
+                portrait_clients[cid] = client
+                portrait_workers[cid] = worker
+            except Exception as exc:
+                print("  [portrait] init failed for " + cid + ": " + str(exc))
 
     print("=" * 50)
     print("  Multi-Character Chat")
@@ -1208,10 +1221,10 @@ def _run_multi_cli(args):
             predicted_thread["value"] = thread
         thread.start()
 
-    def take_prediction():
+    def take_prediction(timeout: float = 0.1):
         thread = predicted_thread.get("value")
         if thread:
-            thread.join(timeout=0.1)
+            thread.join(timeout=max(0.0, timeout))
             if thread.is_alive():
                 return "", "", ""
         with predicted_lock:
@@ -1225,13 +1238,14 @@ def _run_multi_cli(args):
             return
         print()
         print(cname + "> " + reply)
-        if _portrait_worker:
-            _portrait_worker.submit("", reply)
+        portrait_worker = portrait_workers.get(cid)
+        if portrait_worker:
+            portrait_worker.submit("", reply)
+        if prefetch:
+            start_prediction(cid, cname, reply)
         engine = tts_map.get(cid)
         if engine:
             _tts_say(engine, reply, wait=not prefetch)
-        if prefetch:
-            start_prediction(cid, cname, reply)
 
     def run_auto_turns(limit: int, *, sleep_between: bool = False) -> int:
         produced = 0
@@ -1239,9 +1253,13 @@ def _run_multi_cli(args):
             if sleep_between and produced > 0:
                 time.sleep(max(0.1, float(args.idle_seconds)))
             _wait_for_multi_tts(tts_map)
-            cid, cname, reply = take_prediction()
+            cid, cname, reply = take_prediction(timeout=0.5)
             if not reply:
                 cid, cname, reply = orch.auto_turn()
+            if not reply and getattr(orch, "last_auto_action", "") in ("silence", "observe", "cancel_plan"):
+                clear_prediction()
+            elif not reply:
+                cid, cname, reply = take_prediction()
             if not reply:
                 if limit > 0:
                     break
@@ -1322,8 +1340,10 @@ def _run_multi_cli(args):
                 engine.close()
             except Exception:
                 pass
-        if _portrait_worker:
-            _portrait_worker.stop()
+        for worker in portrait_workers.values():
+            worker.stop()
+        for client in portrait_clients.values():
+            client.shutdown()
         try:
             orch.close()
         except Exception:

@@ -33,6 +33,9 @@ class MemoryBackend:
     def list_memories(self, user_id: str = "default", limit: int = 200) -> list[dict[str, Any]]:
         return []
 
+    def delete_all(self, user_id: str = "default") -> int:
+        return 0
+
     def close(self) -> None:
         pass
 
@@ -308,6 +311,22 @@ class Mem0Backend(MemoryBackend):
                 close()
         except Exception as exc:
             logger.debug("mem0 close failed: %s", exc)
+
+    def delete_all(self, user_id: str = "default") -> int:
+        if not self._ok:
+            return 0
+        deleted = 0
+        try:
+            result = self._mem.get_all(filters={"user_id": user_id}, top_k=10000)
+            for item in result.get("results", []) or []:
+                memory_id = item.get("id")
+                if not memory_id:
+                    continue
+                self._mem.delete(memory_id)
+                deleted += 1
+        except Exception as exc:
+            logger.warning("mem0 delete_all failed for %s: %s", user_id, exc)
+        return deleted
 
     def _cleanup(self, user_id: str) -> None:
         limit = self._lc["max_memories_per_user"]

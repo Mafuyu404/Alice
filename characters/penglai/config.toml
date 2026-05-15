@@ -4,7 +4,7 @@
 # 本角色使用的 CharGLM API 密钥对应的配置项名为 charglm_api_key。
 
 # 对话模型。使用智谱 CharGLM-4
-llm_model = "charglm-4"
+llm_model = "deepseek-v4-flash"
 
 # LLM 服务地址
-llm_url = "https://open.bigmodel.cn/api/paas/v4"
+# llm_url = "https://open.bigmodel.cn/api/paas/v4"

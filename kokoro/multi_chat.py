@@ -50,6 +50,34 @@ MULTI_DIALOGUE_PACE_GUIDANCE = """
 - 发言保持短而有钩子，留给下一位角色可接的点。
 """
 
+MULTI_DIALOGUE_PACE_GUIDANCE = (
+    MULTI_DIALOGUE_PACE_GUIDANCE
+    + "\n【节奏约束】\n"
+    "- 分歧、吐槽和反问只能针对已出现的具体话语或已证实上下文，不能为了好玩新造事实。\n"
+    "- 如果上一句已经开始把话题带向未证实的共同经历，下一步优先 silence 或把话题拉回用户/页面/屏幕中的实际内容。\n"
+    "- 没有新证据时，不要连续让两个角色围绕同一个虚构细节互相加码。\n"
+)
+
+
+FACT_ANCHORED_MULTI_DIALOGUE_GUIDANCE = (
+    "\n\n【事实锚定规则】\n"
+    "- 角色可以有语气、吐槽和态度，但不能发明具体事实。\n"
+    "- 不要把未在用户输入、网页/屏幕缓存、角色设定、认知或长期记忆中出现过的内容说成已经发生。"
+    "包括但不限于：一起修过 bug、某个原版代码、变量名、作者、会议、宠物、页面上有某标签或代码结构。\n"
+    "- 上一轮角色如果编出了未证实事实，下一轮不能继续承认或扩写；要把它降级成玩笑、猜测，或直接转回有证据的内容。\n"
+    "- 当证据不足时，说“不确定”“页面里没看到足够信息”比编一个具体场景更好。\n"
+)
+
+
+RANDOM_MC_MULTI_DIALOGUE_GUIDANCE = (
+    "\n\n【随机 MC 直播节奏】\n"
+    "- 当前是随机 MC 百科页面场景时，网页缓存是节目素材，不是一次性回答材料。\n"
+    "- 只要网页缓存里有具体内容，idle_tick 不应轻易 silence；优先让角色继续介绍、评价、吐槽、比较或追问页面中的明确内容。\n"
+    "- 页面切换到新条目时必须自然转向新页面；页面未切换时可以换角度继续讲同一页，例如玩法价值、依赖关系、作者信息、版本兼容、适合人群、槽点和疑问。\n"
+    "- 角色可以自言自语或互相接话，不必等待真冬继续点名；这是直播/讲解场景，需要维持活跃度。\n"
+    "- 为了节目效果可以有态度和推测，但具体事实必须来自网页缓存、对话或角色设定；不确定就明确说不确定。"
+)
+
 
 @dataclass
 class HistoryEntry:
@@ -175,14 +203,18 @@ class MultiChatOrchestrator:
         self.page_context_max_chars = max(500, int(multi_section.get("page_context_max_chars", 2500)))
         self.context_idle_min_score = max(0.0, float(multi_section.get("context_idle_min_score", 70.0)))
         self.edge_cache_config = edge_cache.config_from_dict(self.runtime_config)
+        self.random_mc_enabled = _scene.random_mc_enabled(self.runtime_config)
+        self._last_random_mc_signature = ""
 
         self.shared_history: list[HistoryEntry] = []
         self.memory_backend = _mem.create_backend(self.runtime_config)
         self.user_name = _cfg.user_name()
-        self.scene = _scene.SceneType.MULTI_CHAT
-        live_section = self.runtime_config.get("bilibili_live", {})
-        if isinstance(live_section, dict) and live_section.get("live_mode", False):
-            self.scene = _scene.SceneType.MULTI_LIVE
+        self.last_auto_action = ""
+        self.scene = (
+            _scene.SceneType.MULTI_LIVE
+            if _scene.live_enabled(self.runtime_config)
+            else _scene.SceneType.MULTI_CHAT
+        )
 
         self.sessions: dict[str, chat_session.ChatSession] = {}
         self.order: list[str] = []
@@ -225,6 +257,9 @@ class MultiChatOrchestrator:
         system_prompt = prompts.get("multi_dialogue_orchestrator.planner_system", "")
         if system_prompt:
             system_prompt += MULTI_DIALOGUE_PACE_GUIDANCE
+            system_prompt += FACT_ANCHORED_MULTI_DIALOGUE_GUIDANCE
+            if self.random_mc_enabled:
+                system_prompt += RANDOM_MC_MULTI_DIALOGUE_GUIDANCE
         user_prompt = self._build_planner_user_prompt(event)
         try:
             raw = self._call_planner(system_prompt, user_prompt)
@@ -247,6 +282,7 @@ class MultiChatOrchestrator:
 
         if decision.action == "schedule":
             decision.delay_seconds = min(decision.delay_seconds, self.max_delay_seconds)
+        decision = self._apply_context_guardrails(event, decision)
 
         if self.log_decisions and log:
             speaker = self.character_names.get(decision.speaker_id, "-")
@@ -269,6 +305,8 @@ class MultiChatOrchestrator:
         )
         turns = self._execute_event(event)
         followups = self.max_auto_followups if auto_followups is None else max(0, auto_followups)
+        if self.random_mc_enabled and self._text_asks_page(user_text) and self._page_context_for_generator():
+            followups = max(followups, 1)
         for _ in range(followups):
             if not turns:
                 break
@@ -286,14 +324,37 @@ class MultiChatOrchestrator:
         return turns
 
     def auto_turn(self) -> tuple[str, str, str]:
+        self.last_auto_action = ""
         plan = self.pop_due_plan()
         if plan is not None:
             turn = self._execute_decision(plan.decision, trigger_text=plan.decision.topic or plan.decision.intent)
+            self.last_auto_action = plan.decision.action
             return turn or ("", "", "")
 
-        event = MultiDialogueEvent(type="idle_tick", speaker="system", extra_context=self._cache_overview_for_planner())
-        turns = self._execute_event(event)
-        return turns[0] if turns else ("", "", "")
+        metadata = {}
+        if self.random_mc_enabled:
+            signature = self._page_signature()
+            if signature and signature != self._last_random_mc_signature:
+                self._last_random_mc_signature = signature
+                metadata["random_mc_page_changed"] = True
+        event = MultiDialogueEvent(
+            type="idle_tick",
+            speaker="system",
+            extra_context=self._cache_overview_for_planner(),
+            metadata=metadata,
+        )
+        decision = self.decide(event)
+        self.last_auto_action = decision.action
+        if decision.action == "cancel_plan":
+            self.cancel_plans()
+            return "", "", ""
+        if decision.action in ("silence", "observe"):
+            return "", "", ""
+        if decision.action == "schedule":
+            self.add_plan(decision, created_from=event.text)
+            return "", "", ""
+        turn = self._execute_decision(decision, trigger_text=event.text)
+        return turn or ("", "", "")
 
     def prepare_followup_turn(self, source_id: str, speaker: str, text: str) -> PreparedMultiTurn | None:
         event = MultiDialogueEvent(
@@ -320,7 +381,6 @@ class MultiChatOrchestrator:
         if prepared.history_len != len(self.shared_history):
             return "", "", ""
         self.add_ai_message(prepared.character_id, prepared.reply)
-        self._remember_for_speaker(prepared.character_id, prepared.trigger_text, prepared.reply)
         return prepared.character_id, prepared.character_name, prepared.reply
 
     def auto_cycle(self, rounds: int = 5, init_prompt: str = "") -> list[tuple[str, str, str]]:
@@ -408,7 +468,7 @@ class MultiChatOrchestrator:
             return None
         if commit:
             self.add_ai_message(decision.speaker_id, reply)
-            self._remember_for_speaker(decision.speaker_id, trigger_text, reply)
+            self._remember_for_speaker(decision.speaker_id, trigger_text, reply, decision=decision)
         return decision.speaker_id, session.character_name, reply
 
     def build_reply_messages(self, decision: MultiDialogueDecision, *, trigger_text: str = "") -> list[dict]:
@@ -421,6 +481,9 @@ class MultiChatOrchestrator:
         )
         if character_prompt:
             character_prompt += MULTI_DIALOGUE_PACE_GUIDANCE
+            character_prompt += FACT_ANCHORED_MULTI_DIALOGUE_GUIDANCE
+            if self.random_mc_enabled:
+                character_prompt += RANDOM_MC_MULTI_DIALOGUE_GUIDANCE
         action_instruction = (
             prompts.get("multi_dialogue_orchestrator.generator_backchannel_instruction", "")
             if decision.action == "backchannel"
@@ -449,6 +512,24 @@ class MultiChatOrchestrator:
         cache_context = self.context_for_decision(decision)
         if cache_context:
             messages.append({"role": "system", "content": cache_context})
+        anti_fiction = (
+            "\u3010\u4e8b\u5b9e\u8fb9\u754c\u3011\n"
+            "\u53ea\u80fd\u8ba8\u8bba\u6700\u8fd1\u5bf9\u8bdd\u3001\u660e\u786e\u6ce8\u5165\u7684\u7f51\u9875/\u5c4f\u5e55\u7f13\u5b58\u3001\u89d2\u8272\u7a33\u5b9a\u8bbe\u5b9a\u548c\u957f\u671f\u8bb0\u5fc6\u4e2d\u5df2\u7ecf\u5b58\u5728\u7684\u4e8b\u5b9e\u3002"
+            "\u4e0d\u8981\u7f16\u9020\u9875\u9762\u5185\u5bb9\u3001\u4ee3\u7801\u7ed3\u6784\u3001\u53d8\u91cf\u540d\u3001\u8fc7\u53bb\u4e00\u8d77\u4fee bug\u3001\u5f00\u4f1a\u3001\u4f5c\u8005\u6216\u5176\u4ed6\u672a\u51fa\u73b0\u7684\u7ecf\u5386\u3002"
+            "\u5982\u679c\u9875\u9762/\u5c4f\u5e55\u7f13\u5b58\u4e3a\u7a7a\u6216\u4e0d\u591f\u5177\u4f53\uff0c\u8981\u76f4\u63a5\u8bf4\u770b\u4e0d\u5230\u8db3\u591f\u5185\u5bb9\uff0c\u4e0d\u80fd\u7528\u60f3\u8c61\u8865\u9f50\u3002"
+        )
+        messages.append({"role": "system", "content": anti_fiction})
+        if self.random_mc_enabled and decision.context_use in ("page", "both"):
+            messages.append({
+                "role": "system",
+                "content": (
+                    "【随机 MC 讲解输出要求】\n"
+                    "这是一段直播式页面讲解，不是一次性问答。请围绕网页缓存中明确出现的内容说 2-4 句，"
+                    "至少包含一个具体页面信息点和一个角色自己的评价、疑问或吐槽。"
+                    "不要只问“你对哪个感兴趣”，也不要因为真冬没继续说就收束。"
+                    "如果信息不足，说明不足并点评已能看到的标题/栏目/条目，不要编造。"
+                ),
+            })
         memory_query = " ".join(part for part in (trigger_text, decision.topic, decision.intent) if part)
         memory_ctx = self._safe_memory_context(session.character_id, memory_query)
         if memory_ctx:
@@ -482,20 +563,107 @@ class MultiChatOrchestrator:
         return "\n\n".join(parts)
 
     def _build_planner_user_prompt(self, event: MultiDialogueEvent) -> str:
+        extra_context = event.extra_context or ""
+        if event.type == "user_utterance":
+            page = self._page_context_for_generator()
+            if page:
+                extra_context = "\n\n".join(
+                    part for part in (
+                        extra_context,
+                        f"\u7f51\u9875\u7f13\u5b58\u5019\u9009\uff1a\n{page[:self.page_context_max_chars]}",
+                    )
+                    if part
+                )
         return prompts.format_prompt(
             "multi_dialogue_orchestrator.planner_user",
             timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
             event_type=event.type,
             user_name=self.user_name,
-            speaker=event.speaker or "未知",
-            source_id=event.source_id or "无",
-            event_text=event.text or "空",
+            speaker=event.speaker or "\u672a\u77e5",
+            source_id=event.source_id or "\u65e0",
+            event_text=event.text or "\u7a7a",
             characters=self._characters_for_prompt(),
-            recent_history=self._format_history(max_entries=self.config.max_history) or "无",
+            recent_history=self._format_history(max_entries=self.config.max_history) or "\u65e0",
             runtime_context=self._runtime_context_for_prompt(),
-            pending_plans=self._plans_for_prompt() or "无",
-            extra_context=event.extra_context or "无",
+            pending_plans=self._plans_for_prompt() or "\u65e0",
+            extra_context=extra_context or "\u65e0",
         )
+
+    def _apply_context_guardrails(
+        self,
+        event: MultiDialogueEvent,
+        decision: MultiDialogueDecision,
+    ) -> MultiDialogueDecision:
+        text = event.text or ""
+        asks_page = self._text_asks_page(text)
+        asks_screen = any(
+            token in text
+            for token in ("\u5c4f\u5e55", "\u753b\u9762", "\u622a\u56fe", "\u7a97\u53e3", "screen")
+        )
+        if event.type == "user_utterance" and asks_page and self._page_context_for_generator():
+            decision.context_use = "both" if decision.context_use == "screen" or asks_screen else "page"
+            decision.notes = (
+                decision.notes + "\uff1b" if decision.notes else ""
+            ) + "\u7528\u6237\u660e\u786e\u8981\u6c42\u804a\u9875\u9762\uff0c\u5f3a\u5236\u4f7f\u7528\u7f51\u9875\u7f13\u5b58"
+        elif self.random_mc_enabled and event.metadata.get("random_mc_page_changed") and self._page_context_for_generator():
+            decision.context_use = "page" if decision.context_use != "screen" else "both"
+            if decision.action in ("silence", "observe"):
+                decision.action = "speak"
+                decision.speaker_id = self._fallback_speaker_for_text(text)
+                decision.target = self.user_name
+                decision.utterance_mode = "normal"
+                decision.intent = decision.intent or "讨论随机 MC 百科新页面"
+                decision.topic = decision.topic or "随机 MC 页面"
+            decision.notes = (decision.notes + "\uff1b" if decision.notes else "") + "随机 MC 页面变化，强制围绕当前网页"
+        elif self.random_mc_enabled and event.type == "idle_tick" and self._page_context_for_generator():
+            decision.context_use = "page" if decision.context_use != "screen" else "both"
+            if decision.action in ("silence", "observe"):
+                decision.action = "speak"
+                decision.speaker_id = self._random_mc_idle_speaker()
+                decision.target = self.user_name
+                decision.utterance_mode = "normal"
+                decision.intent = decision.intent or "keep random MC page commentary active"
+                decision.topic = decision.topic or self._page_topic_hint()
+            decision.notes = (decision.notes + "；" if decision.notes else "") + "random MC mode keeps page commentary active on idle ticks"
+        elif event.type == "user_utterance" and asks_screen and self._screen_context_for_generator():
+            decision.context_use = "both" if decision.context_use == "page" else "screen"
+            decision.notes = (
+                decision.notes + "\uff1b" if decision.notes else ""
+            ) + "\u7528\u6237\u660e\u786e\u8981\u6c42\u770b\u5c4f\u5e55\uff0c\u5f3a\u5236\u4f7f\u7528\u5c4f\u5e55\u7f13\u5b58"
+        return decision
+
+    @staticmethod
+    def _text_asks_page(text: str) -> bool:
+        return any(
+            token in text
+            for token in (
+                "页面", "网页", "当前页", "这页", "浏览器",
+                "模组", "整合包", "MC", "Minecraft", "mc", "page", "webpage",
+            )
+        )
+
+    def _random_mc_idle_speaker(self) -> str:
+        recent = [item.character_id for item in self.shared_history[-3:] if item.character_id]
+        if recent:
+            candidates = [cid for cid in self.order if cid != recent[-1]]
+            if candidates:
+                return self._least_recent_speaker(candidates)
+        return self._least_recent_speaker(self.order)
+
+    def _least_recent_speaker(self, candidates: list[str]) -> str:
+        recent_counts = {
+            cid: sum(1 for item in self.shared_history[-8:] if item.character_id == cid)
+            for cid in candidates
+        }
+        return min(candidates, key=lambda cid: recent_counts.get(cid, 0))
+
+    def _page_topic_hint(self) -> str:
+        data = edge_cache.read_cache(self.edge_cache_config.cache_file)
+        if not isinstance(data, dict):
+            return "random MC page"
+        tab = data.get("tab")
+        title = str((tab or {}).get("title") or "").strip() if isinstance(tab, dict) else ""
+        return title[:60] if title else "random MC page"
 
     def _characters_for_prompt(self) -> str:
         lines: list[str] = []
@@ -531,10 +699,16 @@ class MultiChatOrchestrator:
 
     def _format_history(self, max_entries: int = 20) -> str:
         entries = self.shared_history[-max_entries:] if max_entries else self.shared_history
-        return "\n".join(f"{entry.speaker}：{entry.text[:700]}" for entry in entries if entry.text)
+        lines = []
+        for entry in entries:
+            if not entry.text:
+                continue
+            marker = "\u53f0\u8bcd\uff0c\u4e0d\u81ea\u52a8\u4f5c\u4e3a\u4e8b\u5b9e" if entry.character_id else "\u7528\u6237\u8f93\u5165"
+            lines.append(f"{entry.speaker}\uff08{marker}\uff09\uff1a{entry.text[:700]}")
+        return "\n".join(lines)
 
     def _scene_context_for(self, character_name: str) -> str:
-        guidance = _scene.guidance_text(self.scene, self.user_name, character_name)
+        guidance = _scene.guidance_text(self.scene, self.user_name, character_name, self.runtime_config)
         if not guidance:
             return ""
         prefix = prompts.get("scene.prefix", "【当前场景：{scene_name}】")
@@ -594,7 +768,18 @@ class MultiChatOrchestrator:
         }
         return min(candidates, key=lambda cid: recent_counts.get(cid, 0))
 
-    def _remember_for_speaker(self, speaker_id: str, trigger_text: str, reply: str) -> None:
+    def _remember_for_speaker(
+        self,
+        speaker_id: str,
+        trigger_text: str,
+        reply: str,
+        *,
+        decision: MultiDialogueDecision | None = None,
+    ) -> None:
+        if decision is not None and decision.target != self.user_name:
+            return
+        if trigger_text and any(token in trigger_text for token in ("bug", "变量", "代码", "作者", "会议", "原版")):
+            return
         session = self.sessions[speaker_id]
         try:
             session.remember(trigger_text, reply, async_store=True)
@@ -696,6 +881,21 @@ class MultiChatOrchestrator:
             )
         except Exception:
             return ""
+
+    def _page_signature(self) -> str:
+        if not self.edge_cache_config.enabled:
+            return ""
+        data = edge_cache.read_cache(self.edge_cache_config.cache_file)
+        if not data or data.get("error"):
+            return ""
+        tab = data.get("tab") if isinstance(data.get("tab"), dict) else {}
+        return "|".join(
+            [
+                str(tab.get("url") or ""),
+                str(tab.get("title") or ""),
+                str(data.get("text") or "")[:500],
+            ]
+        )
 
 
 def _api_key_for_model(model: str) -> str | None:

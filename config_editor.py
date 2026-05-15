@@ -167,7 +167,7 @@ def _comment(text: str) -> str:
 SECTIONS = [
     "llm", "tts", "stt", "aec", "memory", "portrait_overlay",
     "subtitle", "subtitle_stt", "vision", "edge_page_cache",
-    "screen_watch", "impulse", "bilibili_live", "mem0_llm",
+    "scene", "screen_watch", "impulse", "bilibili_live", "mem0_llm",
     "mem0_embedder", "mem0_lifecycle", "tool_calling",
 ]
 
@@ -237,6 +237,21 @@ def toml_aec(cfg: dict) -> str:
         f"delay_ms = {_toml_val(c.get('delay_ms', 50))}\n",
         _comment("噪声抑制等级 (0 ~ 4)。2 = 中等推荐"),
         f"ns_level = {_toml_val(c.get('ns_level', 2))}\n",
+    ]
+    return "".join(lines)
+
+
+def toml_scene(cfg: dict) -> str:
+    c = cfg.get("scene", {})
+    lines = [
+        _comment("场景开关"),
+        f"\n[scene]\n",
+        _comment("多人场景。开启后按多人聊天理解带说话人标注的输入。"),
+        f"multi_enabled = {_toml_val(c.get('multi_enabled', False))}\n",
+        _comment("直播场景。开启后按直播间/弹幕/观众输入理解上下文。"),
+        f"live_enabled = {_toml_val(c.get('live_enabled', False))}\n",
+        _comment("随机 MC 百科场景。开启后当前网页缓存是核心讨论材料，页面切换时会顺应新页面。"),
+        f"random_mc_enabled = {_toml_val(c.get('random_mc_enabled', False))}\n",
     ]
     return "".join(lines)
 
@@ -363,6 +378,7 @@ def toml_edge_cache(cfg: dict) -> str:
         _comment("需要以远程调试端口启动 Edge。"),
         f"\n[edge_page_cache]\n",
         f"enabled = {_toml_val(c.get('enabled', True))}\n",
+        _comment("直播场景开关请使用 [scene].live_enabled。这里仅控制是否连接 Bilibili 弹幕源。"),
         _comment("抓取间隔 (秒)"),
         f"interval_seconds = {_toml_val(c.get('interval_seconds', 3.0))}\n",
         f"devtools_host = {_toml_val(c.get('devtools_host', '127.0.0.1'))}\n",
@@ -434,7 +450,6 @@ def toml_bilibili(cfg: dict) -> str:
         f"\n[bilibili_live]\n",
         f"enabled = {_toml_val(c.get('enabled', True))}\n",
         _comment("直播模式。启用后 AI 会选择性回复弹幕。"),
-        f"live_mode = {_toml_val(c.get('live_mode', True))}\n",
         _comment("Bilibili 直播间房间号"),
         f"room_id = {_toml_val(c.get('room_id', 1796292397))}\n",
         _comment("弹幕最长保留时间 (秒)。推荐 60 ~ 300"),
@@ -527,6 +542,8 @@ def write_config_toml(path: Path, cfg: dict) -> None:
         toml_portrait(cfg),
         "",
         toml_vision(cfg),
+        "",
+        toml_scene(cfg),
         "",
         # ── Section keys ──
         toml_aec(cfg),
@@ -928,6 +945,19 @@ def build_edge_cache_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
     return page, fields
 
 
+def build_scene_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
+    section = cfg.get("scene", {})
+    fields = [
+        BoolField("multi_enabled", QCheckBox("多人场景"), "scene"),
+        BoolField("live_enabled", QCheckBox("直播场景"), "scene"),
+        BoolField("random_mc_enabled", QCheckBox("随机 MC 百科"), "scene"),
+    ]
+    for f in fields:
+        f.set_value(section.get(f.key))
+    page = make_section_page("场景开关", fields, note="多人和直播是独立开关，可组合为普通对话、单人直播、多人对话或多人直播。")
+    return page, fields
+
+
 def build_screen_watch_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
     section = cfg.get("screen_watch", {})
     fields = [
@@ -969,7 +999,6 @@ def build_bilibili_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
     section = cfg.get("bilibili_live", {})
     fields = [
         BoolField("enabled", QCheckBox("连接 Bilibili"), "bilibili_live"),
-        BoolField("live_mode", QCheckBox("直播模式"), "bilibili_live"),
         IntField("room_id", QSpinBox(), mini=0, maxi=999999999, section="bilibili_live"),
         FloatField("buffer_max_age", QDoubleSpinBox(), mini=5.0, maxi=600.0, step=5.0, decimals=0, section="bilibili_live"),
         FloatField("reconnect_delay", QDoubleSpinBox(), mini=0.5, maxi=120.0, step=0.5, decimals=1, section="bilibili_live"),
@@ -1506,6 +1535,7 @@ class ConfigEditorWindow(QMainWindow):
             ("STT字幕", "subtitle_stt", build_subtitle_stt_page),
             ("视觉", "vision", build_vision_page),
             ("Edge缓存", "edge_cache", build_edge_cache_page),
+            ("场景", "scene", build_scene_page),
             ("屏幕监控", "screen_watch", build_screen_watch_page),
             ("主动搭话", "impulse", build_impulse_page),
             ("B站直播", "bilibili", build_bilibili_page),
