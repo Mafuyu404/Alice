@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from kokoro import character
+from kokoro import memory as memory_mod
 from kokoro import prompts
 from kokoro import scene as scene_mod
 
@@ -47,6 +48,7 @@ class ChatSession:
     # Config overrides — applied on top of the per-character config.toml
     # Used by relay mode to force different model/URL without touching disk
     _config_overrides: dict = field(default_factory=dict)
+    memory_counterpart: str = ""
 
     def _character_config(self) -> dict:
         """Disk config merged with overrides."""
@@ -95,6 +97,9 @@ class ChatSession:
         self.screen_contexts.append(content)
         if len(self.screen_contexts) > self.max_screen_contexts:
             self.screen_contexts = self.screen_contexts[-self.max_screen_contexts:]
+
+    def set_memory_counterpart(self, name: str) -> None:
+        self.memory_counterpart = str(name or "").strip()
 
     def load_summary(self) -> None:
         if not self.summary_file:
@@ -147,7 +152,10 @@ class ChatSession:
         if extra_context:
             messages.append({"role": "system", "content": extra_context})
         if inject_memory:
-            memory_ctx = self.memory_backend.get_context(user_text, user_id=self.character_id)
+            memory_ctx = self.memory_backend.get_context_multi(
+                user_text,
+                memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
+            )
             if memory_ctx:
                 messages.append({"role": "system", "content": memory_ctx})
         # Cognitive layer — runtime cache of relevant perceptions
@@ -204,7 +212,14 @@ class ChatSession:
                 summary = self.summary
             threading.Thread(
                 target=self.memory_events.on_conversation_turn,
-                args=(user_text, assistant_text, self.user_name, self.character_name, summary),
+                args=(
+                    user_text,
+                    assistant_text,
+                    self.user_name,
+                    self.character_name,
+                    summary,
+                    self.memory_counterpart or self.user_name,
+                ),
                 daemon=True,
             ).start()
 
@@ -247,8 +262,9 @@ class ChatSession:
 
                 # Cognition full evaluation after summarization
                 try:
-                    memories = self.memory_backend.get_context(
-                        conv_text[:500], user_id=self.character_id,
+                    memories = self.memory_backend.get_context_multi(
+                        conv_text[:500],
+                        memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
                     )
                     self.cognition.evaluate(
                         conversation=conv_text,
@@ -269,8 +285,9 @@ class ChatSession:
         """Periodic lightweight cognition evaluation (no summary needed)."""
         try:
             conv_text = f"{self.user_name}：{user_text}\n{self.character_name}：{assistant_text}"
-            memories = self.memory_backend.get_context(
-                conv_text[:500], user_id=self.character_id,
+            memories = self.memory_backend.get_context_multi(
+                conv_text[:500],
+                memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
             )
             self.cognition.evaluate(
                 conversation=conv_text,

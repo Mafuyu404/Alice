@@ -3,8 +3,11 @@
 import subprocess
 import sys
 
+from kokoro import console as console_mod
+
 
 def main():
+    console_mod.ensure_utf8_console()
     import argparse
 
     parser = argparse.ArgumentParser(description="Multi-character chat launcher")

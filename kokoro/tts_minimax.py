@@ -26,6 +26,10 @@ TTS_VOLUME = cfg.tts_volume()
 WS_URL = "wss://api.minimax.io/ws/v1/t2a_v2"
 WS_OPEN_TIMEOUT = 10
 WS_CLOSE_TIMEOUT = 1
+TASK_STARTED_TIMEOUT = 10
+FAST_FAIL_TIMEOUT = 1.5
+FAST_FAIL_RESET_SECONDS = 20.0
+FAST_FAIL_AFTER_FAILURES = 2
 
 VOICE_PRESETS = {
     "default": "Chinese (Mandarin)_Crisp_Girl",
@@ -239,6 +243,8 @@ class StreamingTTS:
         self._all_done = threading.Event()
         self._all_done.set()
         self._session_done = False
+        self._prepare_fail_count = 0
+        self._last_prepare_fail_at = 0.0
 
     @property
     def is_playing(self) -> bool:
@@ -262,14 +268,7 @@ class StreamingTTS:
             return True
 
         # WS 已死（中断后）→ 清理旧 recv 线程，重新建连
-        self._session_done = True
-        if self._ws:
-            try:
-                self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
-        self._ws_started.clear()
+        self._reset_session_state()
 
         self._all_done.set()
         self._session_done = False
@@ -279,10 +278,43 @@ class StreamingTTS:
             self._pending_count = 0
         self._ws_recv_thread = threading.Thread(target=self._ws_recv_worker, daemon=True)
         self._ws_recv_thread.start()
-        if not self._ws_started.wait(timeout=10):
+        timeout = self._prepare_wait_timeout()
+        if not self._ws_started.wait(timeout=timeout):
+            self._prepare_fail_count += 1
+            self._last_prepare_fail_at = time.monotonic()
             logger.warning("MiniMax TTS task_started timeout — TTS will be silent this turn")
+            self._reset_session_state()
             return False
+        self._prepare_fail_count = 0
         return True
+
+    def _prepare_wait_timeout(self) -> float:
+        if self._prepare_fail_count >= FAST_FAIL_AFTER_FAILURES:
+            if time.monotonic() - self._last_prepare_fail_at <= FAST_FAIL_RESET_SECONDS:
+                return FAST_FAIL_TIMEOUT
+            self._prepare_fail_count = 0
+        return TASK_STARTED_TIMEOUT
+
+    def _reset_session_state(self) -> None:
+        self._session_done = True
+        self._buf = []
+        with self._pending_lock:
+            self._pending_count = 0
+            self._all_done.set()
+        with self._state_lock:
+            self._is_playing = False
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except queue.Empty:
+                break
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._ws_started.clear()
 
     def _try_send(self, text: str) -> bool:
         """Send a sentence. Returns False if WS is down (caller should retry)."""
@@ -515,7 +547,11 @@ class StreamingTTS:
                             chunk = _apply_volume(chunk)
                             if self.on_audio_frame:
                                 self.on_audio_frame(chunk)
-                            stream.write(chunk)
+                            try:
+                                stream.write(chunk)
+                            except Exception:
+                                self._should_stop = True
+                                return
                         prebuf = []
                     started = False
                     prebuf_samples = 0
@@ -544,7 +580,11 @@ class StreamingTTS:
                             chunk = _apply_volume(chunk)
                             if self.on_audio_frame:
                                 self.on_audio_frame(chunk)
-                            stream.write(chunk)
+                            try:
+                                stream.write(chunk)
+                            except Exception:
+                                self._should_stop = True
+                                return
                         prebuf = []
                     continue
 
@@ -554,7 +594,11 @@ class StreamingTTS:
                 audio = _apply_volume(audio)
                 if self.on_audio_frame:
                     self.on_audio_frame(audio)
-                stream.write(audio)
+                try:
+                    stream.write(audio)
+                except Exception:
+                    self._should_stop = True
+                    return
                 if self._soft_stop:
                     self._soft_stop = False
                     with self._state_lock:

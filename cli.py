@@ -15,11 +15,13 @@ import sys
 import time
 import traceback
 import threading
+from collections import deque
 from datetime import datetime
 
 import requests
 
 from kokoro import chat_session
+from kokoro import console as console_mod
 from kokoro import config as cfg
 from kokoro import conversation as conversation_mod
 from kokoro import dialogue_orchestrator as dialogue_mod
@@ -51,6 +53,13 @@ def _strip_parens(text: str) -> str:
     return _PAREN_STRIP_RE.sub("", text).strip()
 
 
+_ECHO_TEXT_RE = re.compile(r"[\s\W_]+", re.UNICODE)
+
+
+def _normalize_echo_text(text: str) -> str:
+    return _ECHO_TEXT_RE.sub("", (text or "").lower())
+
+
 class _ParenFilter:
     """Stateful filter to remove parenthetical content during streaming."""
 
@@ -71,6 +80,7 @@ class _ParenFilter:
 
 
 CONFIG = cfg.load()
+console_mod.ensure_utf8_console()
 
 
 class _TeeStream:
@@ -1097,7 +1107,8 @@ def _tts_say(engine, text, *, wait: bool = True):
         return
     with _tts_lock:
         try:
-            engine.prepare()
+            if not engine.prepare():
+                return
             for line in text.splitlines():
                 line = line.strip()
                 if line:
@@ -1131,6 +1142,25 @@ def _run_multi_cli(args):
     runtime_cfg = cfg.load()
     user_name = cfg.user_name()
     default_model = cfg.llm_model()
+    machine = sm.SystemStateMachine()
+    machine.emit(sm.SystemEvent.INIT_DONE)
+
+    io_lock = threading.Lock()
+    speech_gate_lock = threading.Lock()
+    speech_gate_until = {"value": 0.0}
+
+    def safe_print(*parts, sep=" ", end="\n"):
+        with io_lock:
+            print(*parts, sep=sep, end=end, flush=True)
+
+    def hold_auto_turns(seconds: float) -> None:
+        until = time.monotonic() + max(0.0, float(seconds))
+        with speech_gate_lock:
+            speech_gate_until["value"] = max(speech_gate_until["value"], until)
+
+    def auto_turns_blocked() -> bool:
+        with speech_gate_lock:
+            return time.monotonic() < speech_gate_until["value"]
 
     tts_map = {}
     all_chars = char_mod.load()
@@ -1144,7 +1174,28 @@ def _run_multi_cli(args):
                 eng.prepare()
                 tts_map[cid] = eng
             except Exception as exc:
-                print("  [tts] init failed for " + cid + ": " + str(exc))
+                safe_print("  [tts] init failed for " + cid + ": " + str(exc))
+
+    _aec_processor = None
+    if cfg.aec_enabled() and tts_map:
+        try:
+            from kokoro.aec import AECProcessor
+
+            tts_sr = tts_mod.SAMPLE_RATE
+            _aec_processor = AECProcessor(
+                mic_sample_rate=stt_mod.SAMPLE_RATE,
+                tts_sample_rate=tts_sr,
+                ns_level=cfg.aec_ns_level(),
+            )
+            _aec_processor.set_delay(cfg.aec_delay_ms())
+            for engine in tts_map.values():
+                engine.on_audio_frame = _aec_processor.push_reference
+            safe_print(
+                f"  [aec] enabled (playback_sr={tts_sr}, mic_sr={stt_mod.SAMPLE_RATE}, delay={cfg.aec_delay_ms()}ms)"
+            )
+        except Exception as exc:
+            safe_print(f"  [aec] init failed: {exc}")
+            _aec_processor = None
 
     model = args.model or default_model
     if "charglm" in model:
@@ -1171,7 +1222,7 @@ def _run_multi_cli(args):
                 portrait_clients[cid] = client
                 portrait_workers[cid] = worker
             except Exception as exc:
-                print("  [portrait] init failed for " + cid + ": " + str(exc))
+                safe_print("  [portrait] init failed for " + cid + ": " + str(exc))
 
     print("=" * 50)
     print("  Multi-Character Chat")
@@ -1179,6 +1230,8 @@ def _run_multi_cli(args):
         tts_on = "on" if tts_map.get(cid) else "off"
         print("  " + cid + " -> " + cname + "  [tts:" + tts_on + "]")
     print("  User: " + user_name)
+    print("  Voice input: on")
+    print("  AEC: " + ("enabled" if _aec_processor is not None else "disabled"))
     if args.watch:
         print("  Mode: watch (unattended)")
         print("  Stop: Ctrl+C")
@@ -1191,6 +1244,31 @@ def _run_multi_cli(args):
     predicted_turn: dict[str, object | None] = {"value": None}
     predicted_thread: dict[str, threading.Thread | None] = {"value": None}
     predicted_serial = {"value": 0}
+    recent_tts_texts: deque[tuple[float, str]] = deque(maxlen=12)
+    recent_tts_lock = threading.Lock()
+
+    def remember_tts_text(text: str) -> None:
+        norm = _normalize_echo_text(text)
+        if not norm:
+            return
+        now = time.monotonic()
+        with recent_tts_lock:
+            recent_tts_texts.append((now, norm))
+            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+                recent_tts_texts.popleft()
+
+    def is_probable_tts_echo(text: str) -> bool:
+        norm = _normalize_echo_text(text)
+        if len(norm) < 8:
+            return False
+        now = time.monotonic()
+        with recent_tts_lock:
+            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+                recent_tts_texts.popleft()
+            for _, spoken in recent_tts_texts:
+                if norm in spoken or spoken in norm:
+                    return True
+        return False
 
     def clear_prediction() -> None:
         with predicted_lock:
@@ -1209,7 +1287,7 @@ def _run_multi_cli(args):
             try:
                 prepared = orch.prepare_followup_turn(cid, cname, reply)
             except Exception as exc:
-                print("  [multi-dialogue] prefetch failed: " + str(exc))
+                safe_print("  [multi-dialogue] prefetch failed: " + str(exc))
                 prepared = None
             with predicted_lock:
                 if serial == predicted_serial["value"]:
@@ -1236,26 +1314,137 @@ def _run_multi_cli(args):
     def do_turn(cid, cname, reply, *, prefetch: bool = False):
         if not reply:
             return
-        print()
-        print(cname + "> " + reply)
+        safe_print()
+        safe_print(cname + "> " + reply)
+        remember_tts_text(reply)
         portrait_worker = portrait_workers.get(cid)
         if portrait_worker:
             portrait_worker.submit("", reply)
-        if prefetch:
-            start_prediction(cid, cname, reply)
         engine = tts_map.get(cid)
         if engine:
-            _tts_say(engine, reply, wait=not prefetch)
+            _tts_say(engine, reply, wait=True)
+        if prefetch:
+            start_prediction(cid, cname, reply)
+
+    def handle_user_text(text: str, *, prefetch: bool | None = None):
+        if not text:
+            return
+        hold_auto_turns(1.2)
+        clear_prediction()
+        safe_print()
+        safe_print(user_name + "> " + text)
+        for cid, cname, reply in orch.user_turn(text):
+            do_turn(cid, cname, reply, prefetch=args.watch if prefetch is None else prefetch)
+
+    def on_user_utterance(text: str) -> None:
+        conversation.reset_stream()
+        if is_probable_tts_echo(text):
+            safe_print("\n  [stt] dropped probable tts echo")
+            machine.set_stt_state(sm.STTState.LISTENING)
+            return
+        machine.emit(sm.SystemEvent.STT_REFINED)
+        hold_auto_turns(2.0)
+        if _aec_processor is not None:
+            _aec_processor.reset()
+        handle_user_text(text, prefetch=args.watch)
+        machine.set_stt_state(sm.STTState.LISTENING)
+
+    def _on_stt_partial(text: str) -> None:
+        with io_lock:
+            sys.stdout.write(f"\r\033[K  [STT] {text}")
+            sys.stdout.flush()
+        hold_auto_turns(0.8)
+        if machine.is_idle:
+            machine.emit(sm.SystemEvent.USER_SPEECH_START)
+            machine.set_stt_state(sm.STTState.LISTENING)
+
+    device = args.device if args.device is not None else stt_mod.find_input_device()
+    if device is None:
+        safe_print("\n[error] No microphone device found.")
+        safe_print("Run `python cli.py --list-devices` to inspect available devices.\n")
+        return
+
+    model_path = stt_mod.download_model(CONFIG.get("stt_model_dir", "models/stt"))
+    safe_print("  [cli] Loading speech model...")
+    recognizer = stt_mod.create_recognizer(
+        model_path,
+        argparse.Namespace(num_threads=4, hotwords="", hotwords_score=1.5, verbose=False),
+    )
+    conversation = conversation_mod.ConversationManager(
+        recognizer=recognizer,
+        machine=machine,
+        on_user_utterance=on_user_utterance,
+        on_partial=_on_stt_partial,
+        sample_rate=stt_mod.SAMPLE_RATE,
+    )
+
+    # In multi-character voice chat, pausing STT during TTS makes the user
+    # effectively unable to break in while either character is speaking.
+    # Keep STT live here; echo handling should be solved separately by AEC.
+    pause_during_tts = False
+
+    def stt_worker() -> None:
+        import sounddevice as sd
+
+        audio_stream = None
+        try:
+            audio_stream = sd.InputStream(
+                device=device,
+                channels=1,
+                samplerate=stt_mod.SAMPLE_RATE,
+                dtype="float32",
+                blocksize=1600,
+            )
+            audio_stream.start()
+
+            while not machine.is_shutting_down:
+                try:
+                    chunk, _ = audio_stream.read(1600)
+                except Exception as exc:
+                    if machine.is_shutting_down or "Invalid stream pointer" in str(exc):
+                        break
+                    raise
+
+                if pause_during_tts and any(engine and engine.is_playing for engine in tts_map.values()):
+                    continue
+
+                if _aec_processor is not None:
+                    mono = _aec_processor.process(chunk[:, 0])
+                else:
+                    mono = stt_mod.denoise(chunk[:, 0])
+                conversation.feed_audio(mono)
+        except Exception as exc:
+            safe_print(f"\n[STT error] {exc}")
+            traceback.print_exc()
+            machine.emit_error("stt_multi")
+        finally:
+            if audio_stream is not None:
+                try:
+                    audio_stream.stop()
+                    audio_stream.close()
+                except Exception:
+                    pass
+
+    stt_thread = threading.Thread(target=stt_worker, daemon=True)
+    stt_thread.start()
 
     def run_auto_turns(limit: int, *, sleep_between: bool = False) -> int:
         produced = 0
         while limit <= 0 or produced < limit:
             if sleep_between and produced > 0:
                 time.sleep(max(0.1, float(args.idle_seconds)))
+            if machine.is_listening or auto_turns_blocked():
+                time.sleep(0.1)
+                continue
             _wait_for_multi_tts(tts_map)
-            cid, cname, reply = take_prediction(timeout=0.5)
-            if not reply:
+            page_changed = bool(getattr(orch, "consume_random_mc_page_change", lambda: False)())
+            if page_changed:
+                clear_prediction()
                 cid, cname, reply = orch.auto_turn()
+            else:
+                cid, cname, reply = take_prediction(timeout=0.5)
+                if not reply:
+                    cid, cname, reply = orch.auto_turn()
             if not reply and getattr(orch, "last_auto_action", "") in ("silence", "observe", "cancel_plan"):
                 clear_prediction()
             elif not reply:
@@ -1274,10 +1463,7 @@ def _run_multi_cli(args):
         print("--- Auto " + str(args.auto) + " rounds ---")
         opening = args.topic
         if opening:
-            print()
-            print(user_name + "> " + opening)
-            for cid, cname, reply in orch.user_turn(opening):
-                do_turn(cid, cname, reply, prefetch=args.watch)
+            handle_user_text(opening, prefetch=args.watch)
         for cid, cname, reply in orch.auto_cycle(rounds=args.auto):
             do_turn(cid, cname, reply, prefetch=args.watch)
 
@@ -1287,11 +1473,8 @@ def _run_multi_cli(args):
                 print()
                 print("--- Watch mode ---")
                 if not args.auto:
-                    opening = args.topic or "你们自己挑一个轻松的话题聊吧，我先旁听。"
-                    print()
-                    print(user_name + "> " + opening)
-                    for cid, cname, reply in orch.user_turn(opening):
-                        do_turn(cid, cname, reply, prefetch=True)
+                    opening = args.topic or "我们一起随便聊聊吧，你们两个也别太晾着我。"
+                    handle_user_text(opening, prefetch=True)
                 run_auto_turns(max(0, int(args.max_turns)), sleep_between=True)
                 return
 
@@ -1329,12 +1512,14 @@ def _run_multi_cli(args):
                     clear_prediction()
                     run_auto_turns(n, sleep_between=True)
                     continue
-                clear_prediction()
-                for cid, cname, reply in orch.user_turn(raw):
-                    do_turn(cid, cname, reply)
+                handle_user_text(raw, prefetch=False)
         except KeyboardInterrupt:
             pass
     finally:
+        try:
+            machine.emit(sm.SystemEvent.SHUTDOWN)
+        except Exception:
+            pass
         for engine in tts_map.values():
             try:
                 engine.close()

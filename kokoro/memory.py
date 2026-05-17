@@ -27,6 +27,18 @@ class MemoryBackend:
     def get_context(self, query: str, user_id: str = "default") -> str:
         return ""
 
+    def get_context_multi(self, query: str, user_ids: list[str]) -> str:
+        seen: set[str] = set()
+        parts: list[str] = []
+        for user_id in user_ids:
+            if not user_id or user_id in seen:
+                continue
+            seen.add(user_id)
+            ctx = self.get_context(query, user_id=user_id)
+            if ctx:
+                parts.append(ctx.strip())
+        return "\n".join(parts).strip()
+
     def store(self, user_msg: str, assistant_msg: str, user_id: str = "default", name: str = "助手") -> None:
         pass
 
@@ -91,11 +103,31 @@ class Mem0Backend(MemoryBackend):
         return {
             "provider": "ollama",
             "config": {
-                "model": embedder.get("model", "qwen2.5:0.5b"),
+                "model": embedder.get("model", "bge-m3:latest"),
                 "ollama_base_url": embedder.get("base_url", "http://127.0.0.1:11434"),
-                "embedding_dims": embedder.get("embedding_dims", 896),
+                "embedding_dims": embedder.get("embedding_dims", 1024),
             },
         }
+
+    @staticmethod
+    def _vector_store_path(embedder_cfg: dict) -> str:
+        model = str(embedder_cfg.get("config", {}).get("model", "")).strip() or "default"
+        dims = int(embedder_cfg.get("config", {}).get("embedding_dims", 0) or 0)
+        slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", model.replace(":", "_")).strip("._-") or "default"
+        base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "mem0_data")
+        return os.path.join(base_dir, f"{slug}_{dims}d")
+
+    @staticmethod
+    def _history_db_path(embedder_cfg: dict) -> str:
+        base_dir = Mem0Backend._vector_store_path(embedder_cfg)
+        return os.path.join(base_dir, "history.db")
+
+    @staticmethod
+    def _collection_name(embedder_cfg: dict) -> str:
+        model = str(embedder_cfg.get("config", {}).get("model", "")).strip() or "default"
+        dims = int(embedder_cfg.get("config", {}).get("embedding_dims", 0) or 0)
+        slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", model.replace(":", "_")).strip("._-") or "default"
+        return f"mem0_{slug}_{dims}d"
 
     def _init(self, config: dict) -> None:
         mem_cfg = config.get("mem0", {})
@@ -105,7 +137,29 @@ class Mem0Backend(MemoryBackend):
         llm_model = llm.get("model", "qwen2.5:1.5b")
 
         try:
+            os.environ.setdefault("MEM0_TELEMETRY", "False")
             from mem0 import Memory
+            from mem0.vector_stores.qdrant import Qdrant as Mem0Qdrant
+            from qdrant_client.models import Distance, VectorParams
+
+            if not getattr(Mem0Qdrant, "_alice_bm25_disabled", False):
+                def _create_col_without_bm25(self, vector_size: int, on_disk: bool, distance: Distance = Distance.COSINE):
+                    response = self.list_cols()
+                    for collection in response.collections:
+                        if collection.name == self.collection_name:
+                            logger.debug(f"Collection {self.collection_name} already exists. Skipping creation.")
+                            self._has_bm25_slot = False
+                            self._create_filter_indexes()
+                            return
+                    self.client.create_collection(
+                        collection_name=self.collection_name,
+                        vectors_config=VectorParams(size=vector_size, distance=distance, on_disk=on_disk),
+                    )
+                    self._has_bm25_slot = False
+                    self._create_filter_indexes()
+
+                Mem0Qdrant.create_col = _create_col_without_bm25
+                Mem0Qdrant._alice_bm25_disabled = True
 
             runtime_config = {
                 "llm": {
@@ -122,13 +176,12 @@ class Mem0Backend(MemoryBackend):
                 "vector_store": {
                     "provider": "qdrant",
                     "config": {
-                        "path": os.path.join(
-                            os.path.dirname(os.path.dirname(__file__)),
-                            "mem0_data",
-                        ),
+                        "path": self._vector_store_path(embedder_cfg),
+                        "collection_name": self._collection_name(embedder_cfg),
                         "embedding_model_dims": embedder_cfg["config"]["embedding_dims"],
                     },
                 },
+                "history_db_path": self._history_db_path(embedder_cfg),
                 "version": "v1.1",
             }
             self._mem = Memory.from_config(runtime_config)
@@ -340,6 +393,32 @@ class Mem0Backend(MemoryBackend):
                 self._mem.delete(item["id"])
         except Exception as exc:
             logger.warning("[mem0] cleanup failed: %s", exc)
+
+
+def normalize_entity_label(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return "unknown"
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", text)
+    text = text.strip("_").lower()
+    return text or "unknown"
+
+
+def scoped_user_id(owner_id: str, counterpart: str | None = None) -> str:
+    owner = normalize_entity_label(owner_id)
+    if counterpart:
+        return f"{owner}::counterpart::{normalize_entity_label(counterpart)}"
+    return f"{owner}::general"
+
+
+def context_user_ids(owner_id: str, counterpart: str | None = None) -> list[str]:
+    ids: list[str] = []
+    if counterpart:
+        ids.append(scoped_user_id(owner_id, counterpart))
+    ids.append(scoped_user_id(owner_id))
+    ids.append(str(owner_id or "default"))
+    return ids
 
 
 def create_backend(config: dict) -> MemoryBackend:

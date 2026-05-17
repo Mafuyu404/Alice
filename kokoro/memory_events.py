@@ -143,6 +143,7 @@ import logging
 from dataclasses import dataclass as _dataclass, field as _field
 
 from kokoro import config as _cfg
+from kokoro import memory as _memory
 from kokoro import prompts as _prompts
 
 _logger = logging.getLogger(__name__)
@@ -177,22 +178,24 @@ class MemoryEventStore:
 
     def on_conversation_turn(self, user_text: str, assistant_text: str,
                               user_name: str = "你", character_name: str = "助手",
-                              summary: str = "") -> None:
+                              summary: str = "", counterpart_name: str = "") -> None:
         """Extract events from a conversation turn and manage the cache cycle."""
         if not self.enabled:
             return
 
-        events = self._extract_events(user_text, assistant_text, user_name, character_name, summary)
+        events = self._extract_events(
+            user_text, assistant_text, user_name, character_name, summary, counterpart_name
+        )
         if events:
             self._pending.extend(events)
 
         self._counter += 1
         if self._counter >= self.eval_interval:
             self._counter = 0
-            self._summarize(user_name, character_name, summary)
+            self._summarize(user_name, character_name, summary, counterpart_name)
 
     def flush_all(self, user_name: str = "你", character_name: str = "助手",
-                   summary: str = "") -> None:
+                   summary: str = "", counterpart_name: str = "") -> None:
         """Flush all pending and cached events to the vector store."""
         if not self.enabled:
             return
@@ -201,7 +204,7 @@ class MemoryEventStore:
             return
 
         for event in all_events:
-            self._write_event(event)
+            self._write_event(event, counterpart_name)
         self._pending.clear()
         self._cache.clear()
         _logger.info("memory event flush: %d events written", len(all_events))
@@ -210,7 +213,7 @@ class MemoryEventStore:
 
     def _extract_events(self, user_text: str, assistant_text: str,
                         user_name: str, character_name: str,
-                        summary: str = "") -> list[StoredEvent]:
+                        summary: str = "", counterpart_name: str = "") -> list[StoredEvent]:
         system = _prompts.format_prompt(
             "memory_events.extract_system",
             name=character_name,
@@ -219,6 +222,7 @@ class MemoryEventStore:
             "memory_events.extract_user",
             name=character_name,
             user_name=user_name,
+            counterpart_name=counterpart_name or user_name,
             user_text=user_text,
             assistant_text=assistant_text,
             summary=summary or "（无）",
@@ -228,7 +232,7 @@ class MemoryEventStore:
         return self._parse_event_list(raw)
 
     def _summarize(self, user_name: str, character_name: str,
-                   summary: str = "") -> None:
+                   summary: str = "", counterpart_name: str = "") -> None:
         """Merge pending + cache, decide what goes to stable storage vs stays."""
         if not self._pending and not self._cache:
             return
@@ -248,6 +252,8 @@ class MemoryEventStore:
         )
         user_prompt = _prompts.format_prompt(
             "memory_events.summarize_user",
+            name=character_name,
+            counterpart_name=counterpart_name or user_name,
             pending_events=pending_json,
             summary_cache=cache_json,
             summary=summary or "（无）",
@@ -260,7 +266,7 @@ class MemoryEventStore:
         stable, keep_cache = result
 
         for event in stable:
-            self._write_event(event)
+            self._write_event(event, counterpart_name)
 
         self._pending = []
         self._cache = keep_cache
@@ -270,7 +276,7 @@ class MemoryEventStore:
             len(stable), len(keep_cache),
         )
 
-    def _write_event(self, event: StoredEvent) -> None:
+    def _write_event(self, event: StoredEvent, counterpart_name: str = "") -> None:
         """Store a single event to the mem0 backend with session-level dedup."""
         if not self._memory_backend or not event.desc:
             return
@@ -291,8 +297,8 @@ class MemoryEventStore:
         try:
             _mem.add(
                 event.desc,
-                user_id=self._user_id,
-                metadata={"tags": event.tags},
+                user_id=_memory.scoped_user_id(self._user_id, counterpart_name),
+                metadata={"tags": event.tags, "counterpart": counterpart_name or ""},
                 infer=False,
             )
         except Exception as exc:

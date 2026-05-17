@@ -339,7 +339,7 @@ stt_pause_during_tts = false
 # 类型: string
 # 可选值:
 #   "none"        - 禁用记忆功能
-#   "mem0"        - 本地向量记忆库（使用 mem0 + fastembed + Qdrant，完全本地运行）
+#   "mem0"        - 本地向量记忆库（当前推荐使用 mem0 + Ollama embedding + 本地 Qdrant）
 #   "kokoromemo"  - 外部 KokoroMemo 记忆服务（需要单独启动 kokoromemo 服务）
 memory_backend = "mem0"
 
@@ -693,15 +693,16 @@ model = "qwen2.5:1.5b"
 
 [mem0.embedder]
 # 向量搜索用的嵌入模型配置。
-# fastembed 完全本地运行，不依赖外部服务，无网络请求。
-# 更换模型后需要重建向量索引（删除 mem0_data/ 目录）。
-provider = "fastembed"
-# 嵌入模型名。BAAI/bge-small-zh-v1.5 对中文支持好，速度快。
-# 可选替代: "BAAI/bge-base-zh-v1.5"（更准但更慢）
-model = "BAAI/bge-small-zh-v1.5"
-# 嵌入向量的维度数，必须与嵌入模型匹配。
-# bge-small-zh-v1.5 → 512，bge-base-zh-v1.5 → 768。
-embedding_dims = 512
+# 使用 Ollama 本地嵌入模型，避免 fastembed 的 Hugging Face 下载链。
+# 数据统一保存在项目根目录下的 mem0_data/ 中；不同嵌入模型使用不同子目录和 collection。
+provider = "ollama"
+# 本地 Ollama 地址。
+base_url = "http://127.0.0.1:11434"
+# 更偏中文/多语检索的 embedding 模型。
+model = "bge-m3:latest"
+# 嵌入向量的维度数，必须与模型匹配。
+# bge-m3:latest -> 1024
+embedding_dims = 1024
 
 [mem0.lifecycle]
 # 重要度模式。决定哪些对话值得存入长期记忆。

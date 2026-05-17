@@ -18,8 +18,8 @@ _CHARACTERS_DIR = os.path.join(
     "characters",
 )
 
-_PRIORITY_KEYS = {"Alice", "爱丽丝", "自己", "自我", "真冬", "真冬和自己的关系"}
-_RELATION_MARKERS = ("关系", "和自己", "和Alice", "和爱丽丝")
+_PRIORITY_KEYS = {"自己", "自我"}
+_RELATION_MARKERS = ("关系", "和自己")
 _SHORT_LIVED_KEYWORDS = (
     "当前", "今天", "今晚", "明天", "页面", "网页", "屏幕", "计划", "日程",
     "刚才", "这次", "本次", "临时", "弹幕", "直播间当前",
@@ -40,6 +40,15 @@ _GENERIC_PERSON_KEYS = {
     "\u5bf9\u65b9\u548c\u81ea\u5df1\u7684\u5173\u7cfb",
 }
 
+_GENERIC_PERSON_PREFIXES = (
+    "用户和自己",
+    "自己和用户",
+    "对方和自己",
+    "自己和对方",
+    "观众和自己",
+    "自己和观众",
+)
+
 
 class CognitionStore:
     """Full cognition data + runtime cache manager."""
@@ -59,6 +68,8 @@ class CognitionStore:
                 matched[key] = value
         _ensure(self._entries, matched, _PRIORITY_KEYS)
         _ensure(self._entries, matched, {k for k in self._entries if _is_relation_key(k)})
+        # Keep a small self-anchor even when the current turn does not mention it explicitly.
+        _ensure(self._entries, matched, {k for k in self._entries if k in {"自己", "自我"}})
         self._cache = matched
 
     def evaluate(
@@ -216,7 +227,7 @@ class CognitionStore:
 
     def _seed(self, data: dict) -> None:
         seeds: dict[str, str] = {}
-        name = str(data.get("name") or "Alice")
+        name = str(data.get("name") or "角色")
         rel = str(data.get("relationship") or "")
         if rel:
             seeds[f"{name}和自己的关系"] = rel
@@ -257,6 +268,8 @@ def _validate_entries(raw) -> dict[str, str] | None:
         if not clean_key or not clean_value:
             continue
         if clean_key in _GENERIC_PERSON_KEYS:
+            continue
+        if clean_key.startswith(_GENERIC_PERSON_PREFIXES):
             continue
         if _is_short_lived_key(clean_key):
             continue

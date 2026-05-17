@@ -1,128 +1,58 @@
-# 记忆
+# 记忆系统
 
 记忆系统由两层组成：
 
-1. **向量记忆后端** — 持久化存储（mem0 / none / kokoromemo）
-2. **记忆事件系统** — LLM 驱动的结构化事件提取和总结（叠加在向量后端之上）
+1. 向量记忆后端
+2. 事件式记忆抽取与总结
 
-## 向量记忆后端
-
-由 `kokoro/memory.py` 提供，支持三种模式：
+## 后端类型
 
 - `none`
 - `mem0`
 - `kokoromemo`
 
-### 配置
+## 当前推荐方案
 
 ```toml
 memory_backend = "mem0"
 ```
 
-KokoroMemo：
+并配合：
 
-```toml
-kokoromo_url = "http://127.0.0.1:14514"
-kokoromo_dir = "D:/program/kokoromemo"
-```
+- `mem0.llm = ollama`
+- `mem0.embedder = bge-m3:latest`
 
-### ChatSession 中的记忆
+## 当前目录结构
 
-`ChatSession.build_messages()` 会根据当前用户输入检索记忆，并把结果注入 messages。
+- 根目录：`mem0_data/`
+- 子目录：按 embedding 模型区分
+- 每个子目录包含：
+  - 本地 qdrant 数据
+  - `history.db`
 
-`ChatSession.remember()` 在每轮回复后触发记忆事件提取和存储周期。
+## 设计原则
 
-## 记忆事件系统
+- 记忆层存事件
+- cognition 层存稳定印象
+- emotion 层存当前情绪状态
 
-`kokoro/memory_events.py` 中的 `MemoryEventStore` 取代了原始的对话对存储。
+## memory_events
 
-### 工作流程
+`memory_events` 会在每轮对话后做两步：
 
-```
-每轮对话 → LLM 事件提取 → pending_events（内存缓存）
-                             │
-                每 N 轮（interval）→ LLM 总结 → ─ stable → mem0（向量库）
-                                                 └ cache → 继续缓存
-                             │
-                进程关闭 → flush_all → pending + cache → mem0
-```
+1. 从本轮对话里提取具体事件
+2. 每隔若干轮做去重、合并、稳定性判断
 
-### 事件提取
+输出结果分成两类：
 
-每次对话后，LLM 从本轮对话中提取独立、具体的事件。每个事件包含：
+- `stable`：写入长期记忆
+- `cache`：暂存在内存中，等待后续合并
 
-- `desc`：事件描述（一句话）
-- `tags`：标签数组（1-3 个，方便回想）
+## 当前 mem0 行为
 
-提取通过提示词 `memory_events.extract_system` / `extract_user` 驱动，不写死逻辑。
-
-### 缓存周期
-
-提取的事件先存放在内存的 `pending_events` 中。每 `eval_interval` 轮对话，LLM 对 pending 和 cache 中的事件进行：
-
-- **去重合并**：合并高度相似的事件
-- **稳定性判断**：哪些事件上下文已不再涵盖 → 写入 mem0（stable）
-- **活跃保留**：哪些事件仍需跟踪 → 留在缓存（cache）
-
-### 关闭刷入
-
-对话进程关闭时（finally 块），所有 pending 和 cache 中的事件一次性刷入 mem0。
-
-### 配置
-
-```toml
-[memory_events]
-enabled = true
-eval_interval = 3
-eval_model = ""
-```
-
-### 标签显示
-
-检索记忆时，事件标签会以 `#标签` 形式显示在结果中：
-
-```
-【记忆】
-- [今天] #偏好 #咖啡 真冬说喜欢喝美式咖啡
-- [昨天] #计划 #户外 真冬提到周末想去露营
-```
-
-## ChatSession 中的记忆
-
-`ChatSession.build_messages()` 会根据当前用户输入检索记忆，并把结果注入 messages。
-
-`ChatSession.remember()` 会在回复后异步写入本轮对话。
-
-关闭写入：
-
-```bash
-python text_cli.py --no-store
-```
-
-关闭记忆后端：
-
-```bash
-python text_cli.py --no-memory
-```
-
-完整 CLI 临时关闭需要把配置改为：
-
-```toml
-memory_backend = "none"
-```
-
-## 工具调用
-
-完整 CLI 支持：
-
-- `search_memory`
-- `save_to_memory`
-
-文字 CLI 的文件工具不等同于长期记忆工具。
-
-## 记忆事件（旧）
-
-`MemoryEventDetector` 会按配置检查某些时间或查询事件，并把结果作为上下文注入会话。它由完整 CLI 启动，`text_cli.py` 不启动。
+- telemetry 已关闭
+- BM25 稀疏检索已关闭
+- 默认只使用 dense semantic search
 
 ## 查看记忆
 
@@ -130,14 +60,8 @@ memory_backend = "none"
 python memory_viewer.py
 ```
 
-默认用于查看本地 mem0 记忆。
+说明：
 
-## 人格测试建议
-
-做 prompt 回归测试时建议：
-
-```bash
-python text_cli.py --no-memory --no-store --no-cognition
-```
-
-这样输出更可重复，不会被长期记忆影响。
+- Windows 非 UTF-8 控制台可能把中文显示成 `?`
+- 这不等于记忆损坏
+- 查看中文内容时优先使用 `memory_viewer.py` 或 `/api/memories`

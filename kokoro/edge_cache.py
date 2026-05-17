@@ -87,7 +87,7 @@ def capture_and_save(config: EdgeCacheConfig) -> dict[str, Any]:
 def capture_current_page(config: EdgeCacheConfig) -> dict[str, Any]:
     foreground = vision.get_foreground_app()
     tabs = list_tabs(config)
-    active_tab = choose_tab(tabs, foreground)
+    active_tab = choose_tab(tabs, foreground, config)
     if active_tab is None:
         raise EdgeCacheError("No matching Edge page tab found")
 
@@ -114,6 +114,7 @@ def capture_current_page(config: EdgeCacheConfig) -> dict[str, Any]:
         "source": "edge_devtools",
         "foreground": foreground or {},
         "tab": {
+            "id": str(active_tab.get("id") or ""),
             "title": str(value.get("title") or active_tab.get("title") or ""),
             "url": str(value.get("url") or active_tab.get("url") or ""),
         },
@@ -138,7 +139,7 @@ def list_tabs(config: EdgeCacheConfig) -> list[dict[str, Any]]:
     return [item for item in data if isinstance(item, dict) and item.get("type") == "page"]
 
 
-def choose_tab(tabs: list[dict[str, Any]], foreground: dict | None) -> dict[str, Any] | None:
+def choose_tab(tabs: list[dict[str, Any]], foreground: dict | None, config: EdgeCacheConfig | None = None) -> dict[str, Any] | None:
     pages = [tab for tab in tabs if tab.get("webSocketDebuggerUrl")]
     if not pages:
         return None
@@ -154,6 +155,26 @@ def choose_tab(tabs: list[dict[str, Any]], foreground: dict | None) -> dict[str,
             tab_title = _normalize_title(str(tab.get("title") or ""))
             if normalized and (normalized in tab_title or tab_title in normalized):
                 return tab
+
+    previous = read_cache(config.cache_file) if config else None
+    previous_tab = previous.get("tab") if isinstance(previous, dict) and isinstance(previous.get("tab"), dict) else {}
+    previous_id = str(previous_tab.get("id") or "").strip()
+    if previous_id:
+        for tab in pages:
+            if str(tab.get("id") or "").strip() == previous_id:
+                return tab
+
+    previous_url = str(previous_tab.get("url") or "").strip()
+    if previous_url:
+        for tab in pages:
+            if str(tab.get("url") or "").strip() == previous_url:
+                return tab
+
+    mcmod_pages = [tab for tab in pages if "mcmod.cn" in str(tab.get("url") or "").lower()]
+    if len(mcmod_pages) == 1:
+        return mcmod_pages[0]
+    if mcmod_pages:
+        return mcmod_pages[0]
 
     return pages[0]
 

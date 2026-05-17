@@ -184,6 +184,12 @@ def main() -> None:
 
     server = ThreadingHTTPServer((args.host, args.port), MemoryViewerHandler)
     url = f"http://{args.host}:{args.port}/"
+    try:
+        import sys
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     print(f"[memory_viewer] {url}")
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

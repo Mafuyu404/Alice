@@ -14,6 +14,7 @@ import requests
 
 from kokoro import agent_loop
 from kokoro import chat_session
+from kokoro import console as console_mod
 from kokoro import config as cfg
 from kokoro import dialogue_orchestrator as dialogue_mod
 from kokoro import edge_cache as edge_cache_mod
@@ -25,6 +26,7 @@ from kokoro import token_usage
 
 
 CONFIG = cfg.load()
+console_mod.ensure_utf8_console()
 
 
 class _NullLayer:

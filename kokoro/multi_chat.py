@@ -74,8 +74,14 @@ RANDOM_MC_MULTI_DIALOGUE_GUIDANCE = (
     "- 当前是随机 MC 百科页面场景时，网页缓存是节目素材，不是一次性回答材料。\n"
     "- 只要网页缓存里有具体内容，idle_tick 不应轻易 silence；优先让角色继续介绍、评价、吐槽、比较或追问页面中的明确内容。\n"
     "- 页面切换到新条目时必须自然转向新页面；页面未切换时可以换角度继续讲同一页，例如玩法价值、依赖关系、作者信息、版本兼容、适合人群、槽点和疑问。\n"
-    "- 角色可以自言自语或互相接话，不必等待真冬继续点名；这是直播/讲解场景，需要维持活跃度。\n"
+    "- 角色可以自言自语或互相接话，不必等待人类参与者继续点名；这是直播/讲解场景，需要维持活跃度。\n"
     "- 为了节目效果可以有态度和推测，但具体事实必须来自网页缓存、对话或角色设定；不确定就明确说不确定。"
+)
+
+STRICT_JSON_OUTPUT_SUFFIX = (
+    "\n\n只输出一个 JSON 对象本体。"
+    "不要输出任何解释、前言、后记、代码块、Markdown、列表或额外文本。"
+    "如果你输出的内容不是单个 JSON 对象，将被直接判定为失败。"
 )
 
 
@@ -157,7 +163,7 @@ class MultiChatConfig:
     model: str = ""
     planning_model: str = ""
     max_delay_seconds: float = 120.0
-    max_auto_followups: int = 0
+    max_auto_followups: int = 1
     log_decisions: bool = True
     enable_tools: bool = False
     tts_engines: dict[str, object] = field(default_factory=dict)
@@ -171,6 +177,7 @@ class PreparedMultiTurn:
     reply: str
     trigger_text: str = ""
     history_len: int = 0
+    page_signature: str = ""
 
 
 class MultiChatOrchestrator:
@@ -205,6 +212,7 @@ class MultiChatOrchestrator:
         self.edge_cache_config = edge_cache.config_from_dict(self.runtime_config)
         self.random_mc_enabled = _scene.random_mc_enabled(self.runtime_config)
         self._last_random_mc_signature = ""
+        self._last_page_refresh_error = ""
 
         self.shared_history: list[HistoryEntry] = []
         self.memory_backend = _mem.create_backend(self.runtime_config)
@@ -260,17 +268,22 @@ class MultiChatOrchestrator:
             system_prompt += FACT_ANCHORED_MULTI_DIALOGUE_GUIDANCE
             if self.random_mc_enabled:
                 system_prompt += RANDOM_MC_MULTI_DIALOGUE_GUIDANCE
+            system_prompt += STRICT_JSON_OUTPUT_SUFFIX
         user_prompt = self._build_planner_user_prompt(event)
         try:
             raw = self._call_planner(system_prompt, user_prompt)
             data = _extract_json_object(raw)
             if not data:
+                if log:
+                    logger.warning("multi dialogue planner raw output: %s", (raw or "")[:400])
                 raw = self._call_planner(
                     system_prompt,
                     user_prompt + "\n\n上一次输出不是合法 JSON。现在只输出一个 JSON 对象，不要解释，不要 Markdown。",
                 )
                 data = _extract_json_object(raw)
             if not data:
+                if log:
+                    logger.warning("multi dialogue planner retry raw output: %s", (raw or "")[:400])
                 raise ValueError("multi planner did not return JSON object")
             decision = MultiDialogueDecision.from_dict(data, set(self.sessions.keys()))
         except Exception as exc:
@@ -332,13 +345,16 @@ class MultiChatOrchestrator:
             return turn or ("", "", "")
 
         metadata = {}
+        event_text = ""
         if self.random_mc_enabled:
             signature = self._page_signature()
             if signature and signature != self._last_random_mc_signature:
                 self._last_random_mc_signature = signature
                 metadata["random_mc_page_changed"] = True
+                event_text = "随机 MC 页面刚刚更新了，请立刻留意新页面并自然转向新内容。"
         event = MultiDialogueEvent(
             type="idle_tick",
+            text=event_text,
             speaker="system",
             extra_context=self._cache_overview_for_planner(),
             metadata=metadata,
@@ -356,7 +372,17 @@ class MultiChatOrchestrator:
         turn = self._execute_decision(decision, trigger_text=event.text)
         return turn or ("", "", "")
 
+    def consume_random_mc_page_change(self) -> bool:
+        if not self.random_mc_enabled:
+            return False
+        signature = self._page_signature()
+        if not signature or signature == self._last_random_mc_signature:
+            return False
+        self._last_random_mc_signature = signature
+        return True
+
     def prepare_followup_turn(self, source_id: str, speaker: str, text: str) -> PreparedMultiTurn | None:
+        page_signature = self._page_signature() if self.random_mc_enabled else ""
         event = MultiDialogueEvent(
             type="character_utterance",
             text=text,
@@ -373,12 +399,15 @@ class MultiChatOrchestrator:
             reply=reply,
             trigger_text=text,
             history_len=len(self.shared_history),
+            page_signature=page_signature,
         )
 
     def commit_prepared_turn(self, prepared: PreparedMultiTurn | None) -> tuple[str, str, str]:
         if prepared is None or not prepared.reply:
             return "", "", ""
         if prepared.history_len != len(self.shared_history):
+            return "", "", ""
+        if prepared.page_signature and prepared.page_signature != self._page_signature():
             return "", "", ""
         self.add_ai_message(prepared.character_id, prepared.reply)
         return prepared.character_id, prepared.character_name, prepared.reply
@@ -452,17 +481,21 @@ class MultiChatOrchestrator:
         model = self.config.model or session.character_config.get("llm_model") or _cfg.llm_model()
         api_base_url = session.character_config.get("llm_url") or None
         api_key = _api_key_for_model(model)
-        result = agent_loop.agent_chat(
-            messages,
-            model,
-            agent_config=None,
-            cancel_event=threading.Event(),
-            character_config=session.character_config,
-            api_base_url=api_base_url,
-            api_key=api_key,
-            usage_callback=token_usage.make_callback(model, "multi_dialogue_chat"),
-            capture=True,
-        )
+        try:
+            result = agent_loop.agent_chat(
+                messages,
+                model,
+                agent_config=None,
+                cancel_event=threading.Event(),
+                character_config=session.character_config,
+                api_base_url=api_base_url,
+                api_key=api_key,
+                usage_callback=token_usage.make_callback(model, "multi_dialogue_chat"),
+                capture=True,
+            )
+        except Exception as exc:
+            logger.warning("multi dialogue execution failed for %s: %s", decision.speaker_id, exc)
+            return None
         reply = result.reply.strip()
         if not reply:
             return None
@@ -473,6 +506,8 @@ class MultiChatOrchestrator:
 
     def build_reply_messages(self, decision: MultiDialogueDecision, *, trigger_text: str = "") -> list[dict]:
         session = self.sessions[decision.speaker_id]
+        counterpart_name = (decision.target or "").strip() or self.user_name
+        session.memory_counterpart = counterpart_name
         character_prompt = prompts.format_prompt(
             "multi_dialogue_orchestrator.reply_character_prompt",
             participants="、".join(self.participant_names),
@@ -505,6 +540,15 @@ class MultiChatOrchestrator:
             {"role": "system", "content": character_prompt or session.system_prompt},
             {"role": "system", "content": boundary},
         ]
+        messages.append({
+            "role": "system",
+            "content": (
+                "【角色区分】\n"
+                f"当前场上参与者：{'、'.join(self.participant_names)}。\n"
+                "每个参与者都是彼此独立的主体。\n"
+                "不要把一个参与者当成另一个参与者，也不要把某个参与者的话默认解释成与自己和第三方之间的私下经历。"
+            ),
+        })
 
         scene_context = self._scene_context_for(session.character_name)
         if scene_context:
@@ -526,12 +570,25 @@ class MultiChatOrchestrator:
                     "【随机 MC 讲解输出要求】\n"
                     "这是一段直播式页面讲解，不是一次性问答。请围绕网页缓存中明确出现的内容说 2-4 句，"
                     "至少包含一个具体页面信息点和一个角色自己的评价、疑问或吐槽。"
-                    "不要只问“你对哪个感兴趣”，也不要因为真冬没继续说就收束。"
+                    "不要只问“你对哪个感兴趣”，也不要因为人类参与者没继续说就收束。"
                     "如果信息不足，说明不足并点评已能看到的标题/栏目/条目，不要编造。"
+                    "默认带着熟悉 MC 模组社区、整合包社区的视角去聊：可以自然提口碑、常见玩法定位、配方思路、版本兼容焦虑、"
+                    "作者取向、任务线习惯、社区里这类条目通常会被怎么评价。"
+                    "同时带一点初级模组开发者视角：优先注意命名、依赖、版本、配置、维护成本、资源闭环、引导设计、"
+                    "平衡性和实现取舍，但不要装成权威，更不要编造页面没写出来的实现细节。"
+                ),
+            })
+        if self.random_mc_enabled and "页面刚刚更新" in trigger_text:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "【页面更新提醒】\n"
+                    "刚刚检测到网页已经切换到新页面。优先明确指出这是新页，"
+                    "先抓住新的标题、栏目或条目，再继续评价，不要沿着上一页的话题惯性续聊。"
                 ),
             })
         memory_query = " ".join(part for part in (trigger_text, decision.topic, decision.intent) if part)
-        memory_ctx = self._safe_memory_context(session.character_id, memory_query)
+        memory_ctx = self._safe_memory_context(session.character_id, memory_query, counterpart_name)
         if memory_ctx:
             messages.append({"role": "system", "content": memory_ctx})
         cognition_ctx = _safe_context(getattr(session, "cognition", None))
@@ -723,6 +780,20 @@ class MultiChatOrchestrator:
         return "\n".join(plan.to_prompt_line(now, names) for plan in plans)
 
     def _fallback_decision(self, event: MultiDialogueEvent, *, notes: str = "") -> MultiDialogueDecision:
+        if (
+            self.random_mc_enabled
+            and event.metadata.get("random_mc_page_changed")
+            and self._page_context_for_generator()
+        ):
+            return MultiDialogueDecision(
+                action="speak",
+                speaker_id=self._random_mc_idle_speaker(),
+                target=self.user_name,
+                intent="页面已切换，立刻转向当前随机 MC 新页面",
+                topic=self._page_topic_hint(),
+                context_use="page",
+                notes=(notes + "；" if notes else "") + "fallback forced to current page after random MC page change",
+            )
         if event.type == "user_utterance":
             return MultiDialogueDecision(
                 action="speak",
@@ -735,12 +806,14 @@ class MultiChatOrchestrator:
         if event.type == "character_utterance":
             speaker_id = self._fallback_followup_speaker(event.source_id)
             if speaker_id:
+                page_topic = self._page_topic_hint() if self.random_mc_enabled and self._page_context_for_generator() else ""
                 return MultiDialogueDecision(
                     action="speak",
                     speaker_id=speaker_id,
                     target=event.speaker,
                     intent="planner失败时由另一名角色自然接上一句",
-                    topic=event.text[:40],
+                    topic=page_topic or event.text[:40],
+                    context_use="page" if page_topic else "none",
                     notes=notes,
                 )
         return MultiDialogueDecision(action="silence", notes=notes)
@@ -776,21 +849,32 @@ class MultiChatOrchestrator:
         *,
         decision: MultiDialogueDecision | None = None,
     ) -> None:
-        if decision is not None and decision.target != self.user_name:
-            return
         if trigger_text and any(token in trigger_text for token in ("bug", "变量", "代码", "作者", "会议", "原版")):
             return
         session = self.sessions[speaker_id]
+        memory_trigger = trigger_text
+        counterpart = self.user_name
+        if decision is not None:
+            counterpart = (decision.target or "").strip() or self.user_name
+            session.memory_counterpart = counterpart
+            if counterpart and counterpart != self.user_name:
+                basis = trigger_text or decision.topic or decision.intent or ""
+                memory_trigger = f"与{counterpart}对话：{basis}".strip()
+            elif counterpart == self.user_name and trigger_text:
+                memory_trigger = f"{self.user_name}说：{trigger_text}"
         try:
-            session.remember(trigger_text, reply, async_store=True)
+            session.remember(memory_trigger, reply, async_store=True)
         except Exception:
             logger.exception("multi dialogue remember failed for %s", speaker_id)
 
-    def _safe_memory_context(self, character_id: str, query: str) -> str:
+    def _safe_memory_context(self, character_id: str, query: str, counterpart_name: str = "") -> str:
         if not query:
             return ""
         try:
-            return self.memory_backend.get_context(query, user_id=character_id) or ""
+            return self.memory_backend.get_context_multi(
+                query,
+                _mem.context_user_ids(character_id, counterpart_name),
+            ) or ""
         except Exception:
             return ""
 
@@ -874,6 +958,7 @@ class MultiChatOrchestrator:
     def _page_context_for_generator(self) -> str:
         if not self.edge_cache_config.enabled:
             return ""
+        self._refresh_page_cache()
         try:
             return edge_cache.format_for_prompt(
                 self.edge_cache_config.cache_file,
@@ -885,6 +970,7 @@ class MultiChatOrchestrator:
     def _page_signature(self) -> str:
         if not self.edge_cache_config.enabled:
             return ""
+        self._refresh_page_cache()
         data = edge_cache.read_cache(self.edge_cache_config.cache_file)
         if not data or data.get("error"):
             return ""
@@ -896,6 +982,15 @@ class MultiChatOrchestrator:
                 str(data.get("text") or "")[:500],
             ]
         )
+
+    def _refresh_page_cache(self) -> None:
+        if not self.edge_cache_config.enabled:
+            return
+        try:
+            edge_cache.capture_and_save(self.edge_cache_config)
+            self._last_page_refresh_error = ""
+        except Exception as exc:
+            self._last_page_refresh_error = f"{type(exc).__name__}: {exc}"
 
 
 def _api_key_for_model(model: str) -> str | None:
@@ -987,9 +1082,17 @@ def _repair_json_object_text(text: str) -> str:
     candidate = text.strip()
     if not candidate:
         return ""
+    candidate = candidate.replace("\u201c", '"').replace("\u201d", '"')
+    candidate = candidate.replace("\u2018", "'").replace("\u2019", "'")
+    candidate = candidate.replace("\uff1a", ":").replace("\uff0c", ",")
     candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
     start = candidate.find("{")
     end = candidate.rfind("}")
     if start >= 0 and end > start:
-        return candidate[start:end + 1]
-    return ""
+        candidate = candidate[start:end + 1]
+    else:
+        return ""
+    if "'" in candidate and '"' not in candidate:
+        candidate = re.sub(r"(?<!\\)'([^'\\]*(?:\\.[^'\\]*)*)'", r'"\1"', candidate)
+    candidate = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', candidate)
+    return candidate

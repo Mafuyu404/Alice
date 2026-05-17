@@ -1,19 +1,31 @@
 # Alice Chat
 
-Alice Chat 是一个桌面 AI 陪伴与人格实验框架。它有两种主要入口：
+Alice Chat 是一个面向桌面陪伴、多角色对话和语音交互的本地化 AI 框架。项目当前包含两条主要入口：
 
-- `cli.py`：完整桌面模式，包含语音输入、语音输出、立绘、字幕、屏幕感知、主动搭话、直播弹幕和工具调用。
-- `text_cli.py`：精简文字模式，只保留文字输入/输出和可选的项目内文件工具，适合人格测试、提示词迭代和自动化评测。
+- `cli.py`：完整桌面模式，包含 STT、TTS、立绘、字幕、屏幕/网页上下文、多人对话和长期记忆
+- `text_cli.py`：轻量文本模式，适合调试提示词、人格、记忆和多角色调度
 
-核心代码在 `kokoro/`，角色数据在 `characters/`，全局配置在 `config.toml`，本地密钥覆盖在已忽略的 `config.json`。
+## 当前状态
 
-## 快速开始
+当前主线实现已经切到以下方案：
 
-环境要求：
+- 记忆后端：`mem0`
+- 记忆 embedding：`Ollama + bge-m3:latest`
+- 记忆数据目录：项目根目录 `mem0_data/`
+- 稠密检索：启用
+- BM25 稀疏检索：关闭
+- 多角色语音输入：支持
+- 随机 MC 页面场景：支持
+
+## 环境要求
 
 - Windows
 - Python 3.11+
-- 一个 OpenAI 兼容 LLM 服务，或 DeepSeek 云端 API
+- 一个可用的 LLM 服务：
+  - 本地 `Ollama`
+  - 或 DeepSeek 兼容接口
+
+## 安装
 
 常用依赖：
 
@@ -21,15 +33,29 @@ Alice Chat 是一个桌面 AI 陪伴与人格实验框架。它有两种主要�
 pip install requests numpy websockets pywin32 pillow
 pip install sherpa-onnx sounddevice
 pip install PySide6
-pip install mem0ai fastembed
+pip install mem0ai
 pip install cartesia
 ```
 
-只运行 `text_cli.py` 时通常只需要 `requests`，以及你选择的记忆后端依赖。
+如果启用 `memory_backend = "mem0"`，还需要本地 `Ollama` 和 embedding 模型：
 
-## 配置
+```bash
+ollama pull bge-m3:latest
+```
 
-主要配置写在 `config.toml`。真实 API key 不要提交到 Git，可写入 `config.json`：
+## 最小配置
+
+`config.toml`：
+
+```toml
+llm_url = "http://127.0.0.1:11434"
+llm_model = "deepseek-v4-flash"
+memory_backend = "mem0"
+tts_backend = "minimax"
+tts_volume = 1.0
+```
+
+本地私密密钥放 `config.json`：
 
 ```json
 {
@@ -40,16 +66,6 @@ pip install cartesia
 }
 ```
 
-最小可用配置示例：
-
-```toml
-llm_url = "http://127.0.0.1:11434"
-llm_model = "deepseek-v4-flash"
-memory_backend = "none"
-tts_backend = "minimax"
-tts_volume = 1.0
-```
-
 ## 运行
 
 完整桌面模式：
@@ -57,21 +73,23 @@ tts_volume = 1.0
 ```bash
 python cli.py
 python cli.py --character penglai
-python cli.py --model qwen2.5:7b
 python cli.py --no-tts
 python cli.py --no-portrait
-python cli.py --no-impulse
-python cli.py --no-screen-watch
 python cli.py --list-devices
 ```
 
-精简文字测试模式：
+文本模式：
 
 ```bash
 python text_cli.py
 python text_cli.py --no-memory --no-store --no-cognition
 python text_cli.py --read-only-tools
-python text_cli.py --no-tools --no-memory --no-store --no-cognition
+```
+
+多人 watch 模式：
+
+```bash
+python run_multi.py --watch --chars alice,penglai --topic "我们一起随便聊聊吧"
 ```
 
 记忆查看器：
@@ -80,64 +98,67 @@ python text_cli.py --no-tools --no-memory --no-store --no-cognition
 python memory_viewer.py
 ```
 
-## 角色目录
-
-运行时角色来自 `characters/{character_id}/`：
+## 目录说明
 
 ```text
-characters/
-  alice/
-    alice.json
-    config.toml
-    cognition.json
-    emotion.json
-    portrait/
-      portrait.json
-      *.png
+characters/      角色数据
+doc/             文档
+kokoro/          核心运行时模块
+mem0_data/       本地长期记忆数据
+logs/            CLI 日志
+config.toml      主配置
+config.json      本地密钥覆盖
 ```
 
-角色主文件必须与目录同名，例如 `characters/alice/alice.json`。根目录的 `characters.json` 是旧聚合格式，当前主流程不依赖它。
+## 主要能力
 
-## 主要功能
+- 单角色对话
+- 多角色对话
+- 语音输入 / 语音输出
+- AEC 回声消除
+- 屏幕上下文 / Edge 网页缓存
+- 随机 MC 页面讲解
+- 长期记忆 / 认知 / 情绪
+- 立绘与字幕叠加层
+- Bilibili 直播弹幕接入
 
-- 语音输入：`kokoro/stt.py` + `kokoro/pool.py`
-- LLM 对话：`kokoro/llm_client.py` + `kokoro/agent_loop.py`
-- 工具调用：查看屏幕、搜索记忆、保存记忆、获取时间、获取前台应用
-- 精简文字工具：项目内列文件、读文件、写文件
-- 语音输出：MiniMax 或 Cartesia，支持 `tts_volume`
-- 立绘和字幕：PySide6 覆盖层 + HTTP 控制
-- 主动搭话：`kokoro/impulse.py`
-- 屏幕感知：周期性截图分析
-- Edge 网页缓存：周期性读取当前 Edge 标签页正文并覆盖缓存文件
-- 直播弹幕：Bilibili 直播间弹幕缓冲与主动回复
-- 记忆：`none`、`mem0`、`kokoromemo`
-- 人格层：角色设定、认知缓存、情绪状态、对话摘要
+## 记忆后端说明
 
-## 文档
+当前推荐方案：
+
+- `mem0.llm.provider = "ollama"`
+- `mem0.embedder.provider = "ollama"`
+- `mem0.embedder.model = "bge-m3:latest"`
+
+记忆目录结构：
+
+- 根目录固定为 `mem0_data/`
+- 不同 embedding 模型使用不同子目录
+- 每个子目录包含：
+  - 本地 qdrant 数据
+  - `history.db`
+
+## 文档入口
 
 - [架构概览](doc/overview.md)
 - [快速开始](doc/quickstart.md)
 - [配置说明](doc/config.md)
-- [文字测试 CLI](doc/text_cli.md)
+- [记忆系统](doc/memory.md)
+- [文本 CLI](doc/text_cli.md)
 - [角色系统](doc/character.md)
 - [会话与人格层](doc/chat_session.md)
-- [提示词](doc/prompts.md)
-- [记忆](doc/memory.md)
-- [主动搭话](doc/impulse.md)
-- [屏幕感知](doc/screen_interest.md)
-- [Edge 网页缓存](doc/edge_page_cache.md)
+- [提示词系统](doc/prompts.md)
+- [单角色调度器](doc/dialogue_orchestrator.md)
+- [多角色调度器](doc/multi_dialogue_orchestrator.md)
 - [STT](doc/stt.md)
 - [TTS](doc/tts.md)
-- [立绘](doc/portrait.md)
-- [字幕](doc/subtitle.md)
-- [直播弹幕](doc/bilibili_live.md)
-- [工具调用](doc/user_commands.md)
+- [屏幕兴趣度](doc/screen_interest.md)
+- [Edge 页面缓存](doc/edge_page_cache.md)
 - [状态机](doc/state_machine.md)
 
 ## 注意
 
-- 不要提交真实 API key。
-- `config.toml` 是可提交的主配置，`config.json` 是本地密钥覆盖。
-- `text_cli.py` 的文件工具只能访问项目目录内文件，不能执行命令。
-- Edge 网页缓存需要用 `--remote-debugging-port` 启动 Edge。
-- 小模型对 function calling 支持可能不稳定，必要时使用 `--no-tools`。
+- 不要提交真实 API key
+- `config.toml` 可提交，`config.json` 仅本地使用
+- Windows 非 UTF-8 控制台可能把中文显示成 `?`；优先使用浏览器或 UTF-8 输出查看中文内容
+- `text_cli.py` 的文件工具只允许访问项目目录内文件
