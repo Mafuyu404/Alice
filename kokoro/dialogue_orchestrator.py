@@ -113,6 +113,7 @@ class DialogueOrchestrator:
         self.planning_model = str(
             section.get("planning_model")
             or impulse_section.get("planning_model")
+            or cfg.impulse_model()
             or cfg.llm_model()
         )
         self.log_decisions = bool(section.get("log_decisions", True))

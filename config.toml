@@ -131,6 +131,16 @@ llm_url = "http://127.0.0.1:11434"
 # 可通过启动参数 --model 临时覆盖。
 llm_model = "deepseek-v4-flash"
 
+# 主对话生成模型。
+# 类型: string（模型名）
+# 留空时复用 llm_model；若角色卡里填写 llm_model，启动参数 --model 仍优先覆盖。
+dialogue_model = "deepseek-v4-flash"
+
+# impulse 主动说话生成模型。
+# 类型: string（模型名）
+# 默认使用 deepseek-v4-flash，与主对话模型独立。
+impulse_model = "deepseek-v4-flash"
+
 # DeepSeek API 密钥。模型名以 deepseek 开头时自动使用 DeepSeek 云端 API。
 # 也可以通过环境变量 DEEPSEEK_API_KEY 设置（环境变量优先级更高）。
 # 留空时从 config.json 的 deepseek_api_key 读取。
@@ -657,7 +667,7 @@ memory_check_interval = 300.0
 [bilibili_live]
 # 总开关。设为 false 时完全不连接 Bilibili。
 # 类型: bool (true/false)
-enabled = true
+enabled = false
 
 # 是否以直播场景理解弹幕/观众输入请使用 [scene].live_enabled。
 

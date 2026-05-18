@@ -297,9 +297,10 @@ class VTSLipSync:
     injects directly (less coordinated with other layers).
     """
 
-    def __init__(self, controller: VTSController, arbiter: VTSExpressionArbiter | None = None):
+    def __init__(self, controller: VTSController, arbiter: VTSExpressionArbiter | None = None, loop: asyncio.AbstractEventLoop | None = None):
         self.controller = controller
         self.arbiter = arbiter
+        self._loop = loop
         cfg = controller.lipsync_config
         self.energy_mult = float(cfg["energy_multiplier"])
         self.smooth_factor = float(cfg["smooth_factor"])
@@ -321,7 +322,9 @@ class VTSLipSync:
 
     def on_audio_frame(self, chunk: np.ndarray) -> None:
         if not self._active:
-            return
+            self.start()  # auto-start on first audio frame
+            if not self._active:  # still not active after start()
+                return
 
         rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float64)))))
         raw = min(rms * self.energy_mult, self.mouth_max)
@@ -342,10 +345,10 @@ class VTSLipSync:
 
         if self.arbiter:
             self.arbiter.set_layer("lipsync", params)
-        else:
+        elif self._loop is not None:
             asyncio.run_coroutine_threadsafe(
                 self.controller.inject(params),
-                asyncio.get_event_loop(),
+                self._loop,
             )
 
 
@@ -398,7 +401,7 @@ class VTSExpressionArbiter:
                 await self.controller.inject(params)
             await asyncio.sleep(self._period)
 
-    def start(self) -> None:
+    async def start(self) -> None:
         if self._running:
             return
         self._running = True
@@ -446,6 +449,7 @@ class VTSIdleLoop:
         self._running = False
         self._task: asyncio.Task | None = None
         self._t0 = 0.0
+        self._blink_until = 0.0  # blink eye-close duration window
 
     def set_tts_active(self, active: bool) -> None:
         self.tts_active = active
@@ -453,35 +457,34 @@ class VTSIdleLoop:
     async def _loop(self) -> None:
         self._t0 = time.monotonic()
         next_blink = self._t0 + random.uniform(self.blink_min, self.blink_max)
+        BLINK_DURATION = 0.08  # 80ms
 
         while self._running:
             now = time.monotonic()
             elapsed = now - self._t0
 
-            # Continuous: breathing + sway
-            idle_params: dict[str, float] = {}
+            # Continuous: breathing + sway + eyes always open by default
+            idle_params: dict[str, float] = {
+                PARAM_EYE_OPEN_L: 1.0,
+                PARAM_EYE_OPEN_R: 1.0,
+            }
             if self.breathing_amp > 0:
                 idle_params[PARAM_FACE_POS_Z] = math.sin(elapsed * math.pi / 2.0) * self.breathing_amp
             if self.head_sway_amp > 0:
                 idle_params[PARAM_FACE_ANGLE_X] = math.sin(elapsed * 0.7) * self.head_sway_amp * 0.5
-            self.arbiter.set_layer("idle", idle_params)
-
-            # Periodic blink
+            # Periodic blink: set close window, auto-opens after BLINK_DURATION
             if now >= next_blink and not self.tts_active:
-                self.arbiter.set_layer("idle", {
-                    **idle_params,
-                    PARAM_EYE_OPEN_L: 0.0, PARAM_EYE_OPEN_R: 0.0,
-                })
-                await asyncio.sleep(0.15)
-                self.arbiter.set_layer("idle", {
-                    **idle_params,
-                    PARAM_EYE_OPEN_L: 1.0, PARAM_EYE_OPEN_R: 1.0,
-                })
+                self._blink_until = now + BLINK_DURATION
                 next_blink = time.monotonic() + random.uniform(self.blink_min, self.blink_max)
 
+            if now < self._blink_until:
+                idle_params[PARAM_EYE_OPEN_L] = 0.0
+                idle_params[PARAM_EYE_OPEN_R] = 0.0
+
+            self.arbiter.set_layer("idle", idle_params)
             await asyncio.sleep(0.05)
 
-    def start(self) -> None:
+    async def start(self) -> None:
         if self._running:
             return
         self._running = True

@@ -14,6 +14,7 @@ it calls ``on_user_utterance(text)`` — the CLI layer then handles LLM dispatch
 from __future__ import annotations
 
 import logging
+import time
 import threading
 from typing import Callable, Optional
 
@@ -41,6 +42,7 @@ class ConversationManager:
         on_user_utterance: Optional[Callable[[str], None]] = None,
         on_partial: Optional[Callable[[str], None]] = None,
         sample_rate: int = 16000,
+        silence_endpoint_delay: float = 2.0,
     ):
         self._recognizer = recognizer
         self._machine = machine
@@ -58,6 +60,13 @@ class ConversationManager:
         self._ai_context = ""
         self._partial_count = 0  # Partial updates in current utterance
 
+        # ── silence-based endpoint ────────────────────────────────────────────
+        self._silence_endpoint_delay = silence_endpoint_delay
+        self._silence_since: float = 0.0  # time.monotonic when text last changed
+        self._last_voice_at: float = 0.0  # time.monotonic when mic energy last looked like speech
+        self._had_partial = False         # True once we've seen any non-empty text
+        self._last_delivery_time: float = 0.0  # cooldown to prevent double-delivery
+
         # Set by cli.py after callback returns, tells cli.py which interrupt was used
         self.last_reason: str = "endpoint"
 
@@ -66,6 +75,10 @@ class ConversationManager:
     def feed_audio(self, chunk: np.ndarray) -> None:
         """Process one AEC-cleaned mic chunk."""
         with self._lock:
+            now = time.monotonic()
+            if self._looks_like_speech(chunk):
+                self._last_voice_at = now
+
             self._stream.accept_waveform(self._sr, chunk)
 
             if not self._recognizer.is_ready(self._stream):
@@ -73,21 +86,36 @@ class ConversationManager:
 
             self._recognizer.decode_stream(self._stream)
             text = self._recognizer.get_result(self._stream)
-            if not text:
-                return
 
-            is_new = (text != self._last_partial)
-            self._last_partial = text
+            if text:
+                is_new = (text != self._last_partial)
+                self._last_partial = text
 
-            if is_new:
-                self._partial_count += 1
-                if self._on_partial:
-                    self._on_partial(text)
-                self._check_overlap(text)
+                if is_new:
+                    self._partial_count += 1
+                    self._silence_since = now
+                    self._had_partial = True
+                    if self._on_partial:
+                        self._on_partial(text)
+                    self._check_overlap(text)
 
-            if self._recognizer.is_endpoint(self._stream):
-                self._finalize_utterance(text)
-                return
+                # Silence-based endpoint: text unchanged for delay → utterance done
+                if (
+                    not self._delivered
+                    and len(text.strip()) >= 2
+                    and self._has_real_silence(now)
+                    and (now - self._silence_since) >= self._silence_endpoint_delay
+                    and (now - self._last_delivery_time) >= 1.5  # cooldown: no double-delivery
+                ):
+                    self._deliver(text, "endpoint:silence")
+
+            elif self._had_partial and not self._delivered:
+                # Recognizer returned empty (e.g. stream reset internally).
+                # If it's been silent long enough, deliver the last known text.
+                if self._has_real_silence(now) and (now - self._silence_since) >= self._silence_endpoint_delay:
+                    last = self._last_partial.strip()
+                    if len(last) >= 2 and (now - self._last_delivery_time) >= 1.5:
+                        self._deliver(last, "endpoint:silence")
 
     def reset_stream(self) -> None:
         """Reset the STT stream.  Call after barge-in or utterance delivery."""
@@ -96,6 +124,10 @@ class ConversationManager:
             self._last_partial = ""
             self._delivered = False
             self._partial_count = 0
+            self._silence_since = 0.0
+            self._last_voice_at = 0.0
+            self._had_partial = False
+            self._last_delivery_time = 0.0
 
     def update_ai_context(self, text: str) -> None:
         """Feed back what the AI is currently saying (for overlap context)."""
@@ -134,9 +166,27 @@ class ConversationManager:
 
         self._deliver(text, "overlap:hard_break")
 
+    def _looks_like_speech(self, chunk: np.ndarray) -> bool:
+        if chunk.size == 0:
+            return False
+        rms = float(np.sqrt(np.mean(np.square(chunk, dtype=np.float32))))
+        return rms >= 0.003
+
+    def _has_real_silence(self, now: float) -> bool:
+        if self._last_voice_at <= 0.0:
+            return False
+        return (now - self._last_voice_at) >= self._silence_endpoint_delay
+
     def _finalize_utterance(self, text: str) -> None:
         """User finished speaking — deliver if not already delivered."""
         if self._delivered:
+            self._reset_after_delivery()
+            return
+
+        # Drop very short utterances — single-character endpoints are almost
+        # always mid-speech pauses, not complete sentences.  The user will
+        # keep talking and the next result will contain the full text.
+        if len(text.strip()) < 2:
             self._reset_after_delivery()
             return
 
@@ -145,6 +195,7 @@ class ConversationManager:
     def _deliver(self, text: str, reason: str) -> None:
         """Deliver user text to the conversation layer."""
         self._delivered = True
+        self._last_delivery_time = time.monotonic()
         self.last_reason = reason
         stripped = text.strip()
         if stripped and self._on_user_utterance:

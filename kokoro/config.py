@@ -68,6 +68,19 @@ def llm_model() -> str:
     return get("llm_model", "deepseek-v4-flash")
 
 
+def dialogue_model() -> str:
+    return get("dialogue_model", llm_model())
+
+
+def impulse_model() -> str:
+    section = get("impulse", {})
+    if isinstance(section, dict):
+        value = str(section.get("model", "") or "").strip()
+        if value:
+            return value
+    return get("impulse_model", "deepseek-v4-flash")
+
+
 def memory_backend() -> str:
     return get("memory_backend", "mem0")
 
@@ -185,6 +198,13 @@ def aec_ns_level() -> int:
     if not isinstance(section, dict):
         return 2
     return int(section.get("ns_level", 2))
+
+
+def aec_auto_reset_on_tts_done() -> bool:
+    section = get("aec", {})
+    if not isinstance(section, dict):
+        return True
+    return bool(section.get("auto_reset_on_tts_done", True))
 
 
 # ── cognition / emotion ─────────────────────────────────────────────────────────

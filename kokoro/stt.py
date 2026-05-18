@@ -68,9 +68,9 @@ def denoise(audio: np.ndarray, sample_rate: int = 16000) -> np.ndarray:
     for i in range(1, len(audio)):
         y[i] = alpha * y[i - 1] + alpha * (audio[i] - audio[i - 1])
 
-    # 3. RMS 噪声门控
+    # 3. RMS 噪声门控（阈值设得很低，只拦完全静音，不拦轻声说话）
     rms = np.sqrt(np.mean(y ** 2))
-    if rms < 0.002:
+    if rms < 0.0005:
         return np.zeros_like(audio)
 
     return y
@@ -205,10 +205,10 @@ def create_recognizer(model_path: str, args) -> sherpa_onnx.OnlineRecognizer:
         decoder=os.path.join(model_path, "decoder-epoch-99-avg-1.onnx"),
         joiner=os.path.join(model_path, "joiner-epoch-99-avg-1.onnx"),
         num_threads=getattr(args, "num_threads", 4),
-        enable_endpoint_detection=True,
-        rule1_min_trailing_silence=3.0,   # 规则1: 尾部静音 3.0s 判结束（仅作兜底）
-        rule2_min_trailing_silence=2.0,   # 规则2: 较短尾部静音 2.0s
-        rule3_min_utterance_length=15,    # 规则3: 最长 15s 强制结束
+        enable_endpoint_detection=False,  # 由 ConversationManager 自己控制断句
+        rule1_min_trailing_silence=3.0,
+        rule2_min_trailing_silence=0,
+        rule3_min_utterance_length=20,
         decoding_method="greedy_search",
         hotwords_file=getattr(args, "hotwords", ""),
         hotwords_score=getattr(args, "hotwords_score", 1.5),

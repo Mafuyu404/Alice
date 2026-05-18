@@ -9,6 +9,7 @@ import queue
 import re
 import threading
 import time
+from collections import deque
 from typing import Callable, Generator, Optional, Tuple
 
 import numpy as np
@@ -114,6 +115,8 @@ def _send_and_receive_stream(text: str, voice_id: str, speed: float) -> Generato
                 continue
             data = json.loads(msg)
             event = data.get("event", "")
+            if event == "connected_success":
+                continue
             if event == "task_started":
                 ws.send(json.dumps(_task_continue(text)))
             elif event == "task_continued":
@@ -123,7 +126,13 @@ def _send_and_receive_stream(text: str, voice_id: str, speed: float) -> Generato
                     yield audio
                 if data.get("is_final") or payload.get("is_final"):
                     break
-            elif event in ("task_finished", "task_failed"):
+            elif event == "task_failed":
+                logger.warning(
+                    "MiniMax TTS task_failed: %s",
+                    data.get("base_resp", {}).get("status_msg", "unknown error"),
+                )
+                break
+            elif event == "task_finished":
                 break
         try:
             ws.send(json.dumps({"event": "task_finish"}))
@@ -208,7 +217,9 @@ def stop_playback() -> None:
     pass
 
 
-_SENTENCE_END = re.compile(r"[。！？!?；;]")
+_SENTENCE_END = re.compile(r"[。！？?!；;，,：:、…~\-]")
+
+_SENTENCE_END = re.compile(r"[\u3002\uff01\uff1f?!\uff1b;\uff0c,\uff1a:\u3001\u2026~\-]")
 
 class StreamingTTS:
     """Streaming TTS with persistent WebSocket and automatic reconnect.
@@ -240,6 +251,7 @@ class StreamingTTS:
         self._ws_recv_thread: threading.Thread | None = None
         self._pending_count = 0
         self._pending_lock = threading.Lock()
+        self._inflight_texts: deque[str] = deque()
         self._all_done = threading.Event()
         self._all_done.set()
         self._session_done = False
@@ -264,7 +276,13 @@ class StreamingTTS:
             self._play_thread.start()
 
         # WS 还活着 → 无需重建
-        if self._ws_started.is_set() and self._ws is not None:
+        if (
+            self._ws_started.is_set()
+            and self._ws is not None
+            and self._ws_recv_thread is not None
+            and self._ws_recv_thread.is_alive()
+            and not self._session_done
+        ):
             return True
 
         # WS 已死（中断后）→ 清理旧 recv 线程，重新建连
@@ -276,6 +294,7 @@ class StreamingTTS:
         self._llm_to_tts_logged = False
         with self._pending_lock:
             self._pending_count = 0
+            self._inflight_texts.clear()
         self._ws_recv_thread = threading.Thread(target=self._ws_recv_worker, daemon=True)
         self._ws_recv_thread.start()
         timeout = self._prepare_wait_timeout()
@@ -300,6 +319,7 @@ class StreamingTTS:
         self._buf = []
         with self._pending_lock:
             self._pending_count = 0
+            self._inflight_texts.clear()
             self._all_done.set()
         with self._state_lock:
             self._is_playing = False
@@ -325,6 +345,7 @@ class StreamingTTS:
             token_usage.record(MINIMAX_MODEL, "tts", cc, 0)
         try:
             with self._pending_lock:
+                self._inflight_texts.append(text)
                 self._pending_count += 1
                 self._all_done.clear()
             self._ws.send(json.dumps(_task_continue(text)))
@@ -332,11 +353,31 @@ class StreamingTTS:
         except Exception as exc:
             logger.debug("TTS send failed: %s", exc)
             with self._pending_lock:
-                self._pending_count = max(0, self._pending_count - 1)
-                if self._pending_count == 0:
-                    self._all_done.set()
+                self._requeue_inflight_locked()
+                self._pending_count = 0
+                self._all_done.set()
             self._ws_started.clear()
             return False
+
+    def _requeue_inflight_locked(self) -> None:
+        if not self._inflight_texts:
+            return
+        combined = "".join(text for text in self._inflight_texts if text)
+        self._inflight_texts.clear()
+        if not combined:
+            return
+        if self._buf:
+            self._buf.insert(0, combined)
+        else:
+            self._buf = [combined]
+
+    def _mark_one_text_done(self) -> None:
+        with self._pending_lock:
+            if self._inflight_texts:
+                self._inflight_texts.popleft()
+            self._pending_count = max(0, self._pending_count - 1)
+            if self._pending_count == 0:
+                self._all_done.set()
 
     def push(self, text: str) -> None:
         """Accumulate text; send complete sentences when WS is available."""
@@ -345,26 +386,48 @@ class StreamingTTS:
         self._buf.append(text)
         while True:
             combined = "".join(self._buf)
-            match = _SENTENCE_END.search(combined)
-            if not match:
+            if not combined.strip():
+                self._buf = []
                 break
-            idx = match.end()
-            sentence = combined[:idx]
-            stripped = sentence.strip()
-            if stripped and self._try_send(stripped):
-                rest = combined[idx:]
+            match = _SENTENCE_END.search(combined)
+            send_text = ""
+            rest = ""
+            if match:
+                idx = match.end()
+                sentence = combined[:idx]
+                stripped = sentence.strip()
+                if stripped:
+                    send_text = stripped
+                    rest = combined[idx:]
+
+            if not send_text:
+                break
+            if not self._ws_started.is_set():
+                if not self.prepare():
+                    break
+            if self._try_send(send_text):
                 self._buf = [rest] if rest else []
             else:
                 break  # WS down, retry on next push() or end_sentence()
 
     def end_sentence(self) -> None:
         """Flush remaining text, then finish the session."""
+        if not self._buf and self._pending_count == 0 and not self._ws_started.is_set():
+            self._session_done = True
+            return
         # Keep trying to send remaining text until WS is available and it goes through
         deadline = time.perf_counter() + 30
         while True:
             remaining = "".join(self._buf).strip()
             if not remaining:
                 break
+            if not self._ws_started.is_set():
+                if not self.prepare():
+                    if time.perf_counter() > deadline or self._should_stop:
+                        self._buf = []
+                        break
+                    time.sleep(0.1)
+                    continue
             if self._try_send(remaining):
                 self._buf = []
                 break
@@ -422,6 +485,7 @@ class StreamingTTS:
         self._buf = []
         with self._pending_lock:
             self._pending_count = 0
+            self._inflight_texts.clear()
             self._all_done.set()
         # Drain audio queue
         while not self._audio_queue.empty():
@@ -476,6 +540,8 @@ class StreamingTTS:
                     data = json.loads(msg)
                     event = data.get("event", "")
 
+                    if event == "connected_success":
+                        continue
                     if event == "task_started":
                         self._ws_started.set()
                     elif event == "task_continued":
@@ -483,14 +549,23 @@ class StreamingTTS:
                         if audio is not None and len(audio) > 0:
                             self._audio_queue.put(audio)
                         if data.get("is_final") or data.get("data", {}).get("is_final"):
-                            with self._pending_lock:
-                                self._pending_count = max(0, self._pending_count - 1)
-                                if self._pending_count == 0:
-                                    self._all_done.set()
-                    elif event in ("task_finished", "task_failed"):
+                            self._mark_one_text_done()
+                    elif event == "task_finished":
                         self._audio_queue.put(None)
                         self._ws_started.clear()
                         return
+                    elif event == "task_failed":
+                        logger.warning(
+                            "MiniMax TTS task_failed: %s",
+                            data.get("base_resp", {}).get("status_msg", "unknown error"),
+                        )
+                        self._audio_queue.put(None)
+                        self._ws_started.clear()
+                        with self._pending_lock:
+                            self._requeue_inflight_locked()
+                            self._pending_count = 0
+                            self._all_done.set()
+                        break
             except Exception:
                 pass
             finally:
@@ -498,6 +573,7 @@ class StreamingTTS:
                 # Reset pending on unexpected disconnect — lost sentence audio
                 # will be compensated by re-sending from buffer on the new connection.
                 with self._pending_lock:
+                    self._requeue_inflight_locked()
                     self._pending_count = 0
                     self._all_done.set()
                 if self._ws:

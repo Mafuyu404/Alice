@@ -9,6 +9,7 @@ doing. All workers consult it instead of ad-hoc flags."""
 from __future__ import annotations
 
 import argparse
+import asyncio
 import os
 import re
 import sys
@@ -31,7 +32,6 @@ from kokoro import memory_events
 from kokoro import memory as mem_mod
 from kokoro import multi_chat as multi_chat_mod
 from kokoro import portrait_controller
-from kokoro import impulse as impulse_mod
 from kokoro import screen_interest
 from kokoro import scene as scene_mod
 from kokoro import state_machine as sm
@@ -239,7 +239,6 @@ def create_tts_engine(enabled: bool, voice_id: str | None = None):
     try:
         tts_mod.warmup()
         engine = tts_mod.StreamingTTS(voice=voice_id)
-        engine.prepare()
         return engine
     except Exception as exc:
         print(f"  [cli] TTS init failed: {exc}")
@@ -289,7 +288,8 @@ def main() -> None:
     session.summary_file = os.path.join(summary_dir, f"summary_{args.character}.json")
     session.load_summary()
 
-    model = args.model or session.character_config.get("llm_model") or cfg.llm_model()
+    dialogue_model = args.model or session.character_config.get("llm_model") or cfg.dialogue_model()
+    impulse_model = cfg.impulse_model()
     tts_engine = create_tts_engine(not args.no_tts, session.character_data.get("tts_voice_id"))
 
     # ── AEC (Acoustic Echo Cancellation) ────────────────────────────────────────
@@ -314,7 +314,7 @@ def main() -> None:
     portrait_worker = None
     if not args.no_portrait:
         try:
-            portrait_client, portrait_worker = portrait_controller.create_controller(args.character, model)
+            portrait_client, portrait_worker = portrait_controller.create_controller(args.character, dialogue_model)
             machine.set_portrait_state(sm.PortraitState.SLIDESHOW)
         except Exception as exc:
             print(f"  [cli] Portrait overlay init failed: {exc}")
@@ -350,7 +350,7 @@ def main() -> None:
             _vts_idle_loop = vts_mod.VTSIdleLoop(_vts_arbiter)
             asyncio.run_coroutine_threadsafe(_vts_idle_loop.start(), _vts_loop)
 
-            _vts_lipsync = vts_mod.VTSLipSync(_vts_controller, _vts_arbiter)
+            _vts_lipsync = vts_mod.VTSLipSync(_vts_controller, _vts_arbiter, loop=_vts_loop)
 
             if tts_engine is not None:
                 _original_audio_frame = tts_engine.on_audio_frame
@@ -374,9 +374,17 @@ def main() -> None:
                 session.emotion._on_update = _on_vts_emotion
 
             def _tts_state_monitor():
+                was_active = False
                 while not machine.is_shutting_down and _vts_idle_loop:
                     is_active = bool(tts_engine and tts_engine.is_playing)
                     _vts_idle_loop.set_tts_active(is_active)
+                    if is_active and not was_active:
+                        if _vts_lipsync:
+                            _vts_lipsync.start()
+                    elif not is_active and was_active:
+                        if _vts_lipsync:
+                            _vts_lipsync.stop()
+                    was_active = is_active
                     time.sleep(0.5)
             if _vts_idle_loop:
                 threading.Thread(target=_tts_state_monitor, daemon=True).start()
@@ -444,6 +452,37 @@ def main() -> None:
 
     # ── shared cancel token for barge-in ──────────────────────────────────────
     _current_cancel: list[threading.Event | None] = [None]
+    recent_tts_texts: deque[tuple[float, str]] = deque(maxlen=12)
+    recent_tts_lock = threading.Lock()
+
+    def remember_tts_text(text: str) -> None:
+        norm = _normalize_echo_text(text)
+        if not norm:
+            return
+        now = time.monotonic()
+        with recent_tts_lock:
+            recent_tts_texts.append((now, norm))
+            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+                recent_tts_texts.popleft()
+
+    def is_probable_tts_echo(text: str) -> bool:
+        norm = _normalize_echo_text(text)
+        if len(norm) < 2:
+            return False
+        now = time.monotonic()
+        with recent_tts_lock:
+            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+                recent_tts_texts.popleft()
+            for _, spoken in recent_tts_texts:
+                if len(norm) < 8:
+                    if norm == spoken or (
+                        len(norm) >= 2 and (spoken.startswith(norm) or spoken.endswith(norm))
+                    ):
+                        return True
+                    continue
+                if norm in spoken or spoken in norm:
+                    return True
+        return False
 
     # ── Bilibili live manager (connection only, impulse drives replies) ────
     _bilibili_manager: bilibili_live_mod.BilibiliLiveManager | None = None
@@ -466,39 +505,24 @@ def main() -> None:
     _dialogue = dialogue_mod.DialogueOrchestrator(
         config=CONFIG,
         session=session,
-        model=model,
+        model=dialogue_model,
         memory_backend=memory_backend,
     )
     _use_impulse = cfg.impulse_enabled() and not args.no_impulse
-    if _use_impulse:
-        machine.set_proactive_state(sm.ProactiveState.ACCRUING)
-        _impulse = impulse_mod.ImpulsePlanner(
-            config=CONFIG,
-            session=session,
-            model=model,
-            tts_engine=tts_engine,
-            portrait_worker=portrait_worker,
-            machine=machine,
-            agent_config=_agent_config,
-            cancel_slot=_current_cancel,
-            memory_backend=memory_backend,
-            chat_stream_fn=chat_stream,
-            stt_refine_inline=_stt_refine_inline,
-            bilibili_manager=_bilibili_manager,
-            live_mode=_bilibili_live_mode,
-            subtitle_client=_subtitle_client,
-        )
-    else:
-        _impulse = None
-        machine.set_proactive_state(sm.ProactiveState.DISABLED)
+    machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_impulse else sm.ProactiveState.DISABLED)
     # ── conversation handler (fast path: in STT thread, must not block) ─────
     def on_user_utterance(text: str) -> None:
+        if is_probable_tts_echo(text):
+            if _stt_subtitle_client:
+                _stt_subtitle_client.clear()
+            print("\n  [stt] dropped probable tts echo")
+            conversation.reset_stream()
+            machine.set_stt_state(sm.STTState.LISTENING)
+            return
         if _stt_subtitle_client:
             _stt_subtitle_client.clear()
         display_user(text)
         _dialogue.cancel_plans()
-        if _impulse is not None:
-            _impulse.reset()
 
         reason = getattr(conversation, 'last_reason', 'endpoint')
         is_overlap = machine.tts_state in (sm.TTSState.STREAMING, sm.TTSState.DRAINING)
@@ -534,12 +558,6 @@ def main() -> None:
 
     # ── conversation worker (runs in its own thread, may block) ────────────
     def _handle_conversation(text: str) -> None:
-        if tts_engine:
-            try:
-                tts_engine.prepare()
-            except Exception as exc:
-                print(f"\n  [tts] prepare failed: {exc}")
-
         cancel_event = threading.Event()
         _current_cancel[0] = cancel_event
 
@@ -622,8 +640,6 @@ def main() -> None:
                 machine.set_tts_state(sm.TTSState.IDLE)
                 machine.emit(sm.SystemEvent.TTS_DONE)
                 machine.reset_error_count()
-                if _impulse is not None:
-                    _impulse.on_conversation_end()
                 return
 
             if decision.action == "schedule":
@@ -633,8 +649,6 @@ def main() -> None:
                 machine.set_tts_state(sm.TTSState.IDLE)
                 machine.emit(sm.SystemEvent.TTS_DONE)
                 machine.reset_error_count()
-                if _impulse is not None:
-                    _impulse.on_conversation_end()
                 return
 
             messages = _dialogue.build_reply_messages(
@@ -649,7 +663,7 @@ def main() -> None:
                     messages.insert(-1, {"role": "system", "content": inline_prompt})
 
             try:
-                reply, cancelled = chat_stream(messages, session.character_name, model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(model, "chat"), tool_context=dict(
+                reply, cancelled = chat_stream(messages, session.character_name, dialogue_model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(dialogue_model, "chat"), tool_context=dict(
                     session=session,
                     memory_backend=memory_backend,
                     character_id=session.character_id,
@@ -658,7 +672,7 @@ def main() -> None:
                     event_loop=_vts_loop,
                 ), subtitle_client=_subtitle_client)
             except requests.exceptions.ConnectionError:
-                print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
+                print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
                 machine.emit_error("llm_connection")
                 _current_cancel[0] = None
                 return
@@ -673,9 +687,8 @@ def main() -> None:
                 return
 
             machine.emit(sm.SystemEvent.LLM_DONE)
-
-            if _impulse is not None:
-                _impulse.on_conversation_end()
+            if reply:
+                remember_tts_text(reply)
 
             if tts_engine:
                 machine.set_tts_state(sm.TTSState.STREAMING)
@@ -690,6 +703,8 @@ def main() -> None:
                 if cancel_event.is_set():
                     _current_cancel[0] = None
                     return
+                if _aec_processor is not None and cfg.aec_auto_reset_on_tts_done():
+                    _aec_processor.reset()
                 tts_engine.prepare()
 
             machine.set_tts_state(sm.TTSState.IDLE)
@@ -720,12 +735,6 @@ def main() -> None:
         _current_cancel[0] = cancel_event
 
         try:
-            if tts_engine:
-                try:
-                    tts_engine.prepare()
-                except Exception as exc:
-                    print(f"\n  [tts] prepare failed: {exc}")
-
             context = ""
             memory_query = " ".join(part for part in (decision.topic, decision.intent) if part)
             if memory_query:
@@ -735,6 +744,12 @@ def main() -> None:
                     memory_ctx = ""
                 if memory_ctx:
                     context = memory_ctx
+            continuation_guard = (
+                "【续接约束】这是同一场景里稍后补充的一句新话。"
+                "不要重复你上一句已经说过的内容，不要重说同一段开场，"
+                "直接补充新的后半句、新的信息或新的角度；如果没有新的补充点，就宁可更短。"
+            )
+            context = f"{continuation_guard}\n\n{context}" if context else continuation_guard
             messages = _dialogue.build_reply_messages(
                 user_text=prompts.get("dialogue_orchestrator.scheduled_user_prompt", "请直接说出现在要说的话。"),
                 decision=decision,
@@ -745,12 +760,12 @@ def main() -> None:
                 reply, cancelled = chat_stream(
                     messages,
                     session.character_name,
-                    model,
+                    dialogue_model,
                     tts_engine,
                     cancel_event=cancel_event,
                     character_config=session.character_config,
                     agent_config=_agent_config,
-                    usage_callback=token_usage.make_callback(model, "dialogue_scheduled"),
+                    usage_callback=token_usage.make_callback(dialogue_model, "dialogue_scheduled"),
                     tool_context=dict(
                         session=session,
                         memory_backend=memory_backend,
@@ -762,7 +777,7 @@ def main() -> None:
                     subtitle_client=_subtitle_client,
                 )
             except requests.exceptions.ConnectionError:
-                print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(model)}")
+                print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
                 machine.emit_error("dialogue_scheduled_connection")
                 return
             except Exception as exc:
@@ -782,8 +797,6 @@ def main() -> None:
                     portrait_worker.submit("", reply)
 
             machine.emit(sm.SystemEvent.LLM_DONE)
-            if _impulse is not None:
-                _impulse.on_conversation_end()
 
             if tts_engine:
                 machine.set_tts_state(sm.TTSState.STREAMING)
@@ -811,6 +824,8 @@ def main() -> None:
     def _dialogue_context_worker() -> None:
         while not machine.is_shutting_down:
             time.sleep(_dialogue.idle_context_interval_seconds)
+            if not _use_impulse:
+                continue
             if not machine.can_start_conversation:
                 continue
             event = _dialogue.build_context_event(reason="idle_context")
@@ -864,7 +879,8 @@ def main() -> None:
     print("=" * 50)
     print("  Alice CLI")
     print(f"  Character: {session.character_name}")
-    print(f"  Model: {model}")
+    print(f"  Dialogue model: {dialogue_model}")
+    print(f"  Impulse model: {impulse_model}")
     print(f"  Microphone: [{device}]")
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
@@ -1042,8 +1058,6 @@ def main() -> None:
     error_thread.start()
 
     # ── first impulse trigger (system is idle, start planning) ────────────
-    if _use_impulse:
-        _impulse.on_conversation_end()
 
     # ── main loop ──────────────────────────────────────────────────────────
     try:
@@ -1376,6 +1390,7 @@ def _run_multi_cli(args):
         on_user_utterance=on_user_utterance,
         on_partial=_on_stt_partial,
         sample_rate=stt_mod.SAMPLE_RATE,
+        silence_endpoint_delay=cfg.stt_refine_stable_seconds(),
     )
 
     # In multi-character voice chat, pausing STT during TTS makes the user
