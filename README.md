@@ -140,23 +140,40 @@ config.json      本地密钥覆盖
 
 ## 文档入口
 
-- [架构概览](doc/overview.md)
-- [快速开始](doc/quickstart.md)
-- [配置说明](doc/config.md)
-- [记忆系统](doc/memory.md)
-- [文本 CLI](doc/text_cli.md)
-- [角色系统](doc/character.md)
-- [会话与人格层](doc/chat_session.md)
-- [内在叙事流](doc/inner_stream.md)
-- [提示词系统](doc/prompts.md)
-- [单角色调度器](doc/dialogue_orchestrator.md)
-- [主动对话](doc/proactive_dialogue.md)
-- [多角色调度器](doc/multi_dialogue_orchestrator.md)
-- [STT](doc/stt.md)
-- [TTS](doc/tts.md)
-- [屏幕兴趣度](doc/screen_interest.md)
-- [Edge 页面缓存](doc/edge_page_cache.md)
-- [状态机](doc/state_machine.md)
+### 架构与配置
+- [架构概览](doc/overview.md) — 分层结构、数据流、设计决策
+- [快速开始](doc/quickstart.md) — 从零到运行
+- [配置说明](doc/config.md) — 完整配置参考
+- [状态机](doc/state_machine.md) — 系统状态定义与事件驱动
+
+### 对话与角色
+- [角色系统](doc/character.md) — 角色目录结构、system prompt 构建
+- [会话与人格层](doc/chat_session.md) — 历史、摘要、上下文注入、异步维护链
+- [对话调度器](doc/dialogue_orchestrator.md) — 话轮判断 + 主动搭话 + 计划执行
+- [多角色调度器](doc/multi_dialogue_orchestrator.md) — 谁说、对谁说、自动续接、预取
+- [提示词系统](doc/prompts.md) — 所有 LLM 提示词目录与设计原则
+
+### 语音
+- [STT](doc/stt.md) — 语音识别、模型、AEC、精炼模式
+- [对话输入层](doc/conversation.md) — 端点检测、重叠分类、回声过滤
+- [TTS](doc/tts.md) — 语音合成、流式控制、多角色串行
+
+### 记忆与人格
+- [记忆系统](doc/memory.md) — 向量记忆、事件提取、生命周期
+- [认知层迭代指南](doc/cognition_iteration_guide.md) — 边界检查、测试场景
+- [情绪层迭代指南](doc/emotion_iteration_guide.md) — 评估流程、稳定性规则
+- [记忆测试](doc/memory_test.md) — 写入/检索/质量验证
+
+### 上下文感知
+- [屏幕兴趣度](doc/screen_interest.md) — 桌面截图分析、隐私检测
+- [Edge 页面缓存](doc/edge_page_cache.md) — 浏览器正文读取、MC 场景
+- [Bilibili 直播](doc/bilibili_live.md) — 弹幕接收、场景集成
+
+### 显示与集成
+- [立绘](doc/portrait.md) — 表情选择、衰减、多角色
+- [字幕](doc/subtitle.md) — 流式字幕、双实例
+- [文本 CLI](doc/text_cli.md) — 调试工具、只读模式
+- [VTS 集成](doc/vts_integration_plan.md) — Live2D 表情、口型同步
 
 ## 注意
 

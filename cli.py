@@ -510,7 +510,7 @@ def main() -> None:
                     return True
         return False
 
-    # ── Bilibili live manager (connection only; dialogue planner drives replies) ────
+    # ── Bilibili live manager ──────────────────────────────────────────────
     _bilibili_manager: bilibili_live_mod.BilibiliLiveManager | None = None
     _bilibili_room_id_raw = args.bilibili_room if args.bilibili_room is not None else cfg.bilibili_live_room_id()
     _bilibili_enabled = cfg.bilibili_live_enabled() and _bilibili_room_id_raw > 0
@@ -525,7 +525,7 @@ def main() -> None:
         print(f"  [bilibili] Room {_bilibili_room_id_raw} set but bilibili_live.enabled = false in config")
         _bilibili_enabled = False
 
-    # ── dialogue planner ────────────────────────────────────────────────────
+    # ── dialogue orchestrator + proactive speech ────────────────────────────
     _stt_refine_mode = cfg.stt_refine_mode()
     _stt_refine_inline = _stt_refine_mode == "inline"
     _dialogue = dialogue_mod.DialogueOrchestrator(
@@ -1161,7 +1161,7 @@ def main() -> None:
                 time.sleep(5.0)
                 continue
 
-            # Always update cache; the dialogue planner reads from here.
+            # Always update cache (dialogue orchestrator reads from here)
             sc.put(result)
 
             # Keep this as cache only. DialogueOrchestrator decides whether
