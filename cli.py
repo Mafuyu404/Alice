@@ -289,7 +289,6 @@ def main() -> None:
     session.load_summary()
 
     dialogue_model = args.model or session.character_config.get("llm_model") or cfg.dialogue_model()
-    impulse_model = cfg.impulse_model()
     tts_engine = create_tts_engine(not args.no_tts, session.character_data.get("tts_voice_id"))
 
     # ── AEC (Acoustic Echo Cancellation) ────────────────────────────────────────
@@ -484,7 +483,7 @@ def main() -> None:
                     return True
         return False
 
-    # ── Bilibili live manager (connection only, impulse drives replies) ────
+    # ── Bilibili live manager ──────────────────────────────────────────────
     _bilibili_manager: bilibili_live_mod.BilibiliLiveManager | None = None
     _bilibili_room_id_raw = args.bilibili_room if args.bilibili_room is not None else cfg.bilibili_live_room_id()
     _bilibili_enabled = cfg.bilibili_live_enabled() and _bilibili_room_id_raw > 0
@@ -499,7 +498,7 @@ def main() -> None:
         print(f"  [bilibili] Room {_bilibili_room_id_raw} set but bilibili_live.enabled = false in config")
         _bilibili_enabled = False
 
-    # ── impulse planner ─────────────────────────────────────────────────────
+    # ── dialogue orchestrator + proactive speech ────────────────────────────
     _stt_refine_mode = cfg.stt_refine_mode()
     _stt_refine_inline = _stt_refine_mode == "inline"
     _dialogue = dialogue_mod.DialogueOrchestrator(
@@ -880,7 +879,6 @@ def main() -> None:
     print("  Alice CLI")
     print(f"  Character: {session.character_name}")
     print(f"  Dialogue model: {dialogue_model}")
-    print(f"  Impulse model: {impulse_model}")
     print(f"  Microphone: [{device}]")
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
@@ -970,7 +968,7 @@ def main() -> None:
                 time.sleep(5.0)
                 continue
 
-            # Always update cache (impulse reads from here)
+            # Always update cache (dialogue orchestrator reads from here)
             sc.put(result)
 
             # Keep this as cache only. DialogueOrchestrator decides whether
@@ -1056,8 +1054,6 @@ def main() -> None:
 
     error_thread = threading.Thread(target=error_recovery_worker, daemon=True)
     error_thread.start()
-
-    # ── first impulse trigger (system is idle, start planning) ────────────
 
     # ── main loop ──────────────────────────────────────────────────────────
     try:
