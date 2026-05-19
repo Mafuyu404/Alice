@@ -192,15 +192,15 @@ class MultiChatOrchestrator:
         dialogue_section = self.runtime_config.get("dialogue", {})
         if not isinstance(dialogue_section, dict):
             dialogue_section = {}
-        impulse_section = self.runtime_config.get("impulse", {})
-        if not isinstance(impulse_section, dict):
-            impulse_section = {}
+        proactive_section = self.runtime_config.get("proactive", {})
+        if not isinstance(proactive_section, dict):
+            proactive_section = {}
 
         self.planning_model = (
             self.config.planning_model
             or str(multi_section.get("planning_model") or "")
             or str(dialogue_section.get("planning_model") or "")
-            or str(impulse_section.get("planning_model") or "")
+            or str(proactive_section.get("planning_model") or "")
             or _cfg.llm_model()
         )
         self.max_delay_seconds = max(1.0, float(multi_section.get("max_delay_seconds", self.config.max_delay_seconds)))
@@ -594,9 +594,9 @@ class MultiChatOrchestrator:
         cognition_ctx = _safe_context(getattr(session, "cognition", None))
         if cognition_ctx:
             messages.append({"role": "system", "content": cognition_ctx})
-        emotion_ctx = _safe_context(getattr(session, "emotion", None))
-        if emotion_ctx:
-            messages.append({"role": "system", "content": emotion_ctx})
+        inner_ctx = _safe_context(getattr(session, "inner_stream", None))
+        if inner_ctx:
+            messages.append({"role": "system", "content": inner_ctx})
 
         history = self._format_history(max_entries=self.config.max_history) or "无"
         user_prompt = (
@@ -746,11 +746,11 @@ class MultiChatOrchestrator:
             session = self.sessions[cid]
             chunks = []
             cognition_ctx = _safe_context(getattr(session, "cognition", None))
-            emotion_ctx = _safe_context(getattr(session, "emotion", None))
+            inner_ctx = _safe_context(getattr(session, "inner_stream", None))
             if cognition_ctx:
                 chunks.append(cognition_ctx[:500])
-            if emotion_ctx:
-                chunks.append(emotion_ctx[:300])
+            if inner_ctx:
+                chunks.append(inner_ctx[:500])
             lines.append(f"{session.character_name}（{cid}）：{chr(10).join(chunks) if chunks else '无'}")
         return "\n\n".join(lines)
 

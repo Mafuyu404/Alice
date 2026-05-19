@@ -39,7 +39,7 @@ random_mc_enabled = true
 # 类型: bool
 enabled = true
 
-# 对话调度 planner 模型。留空则复用 impulse.planning_model 或默认对话模型。
+# 对话调度 planner 模型。留空则复用 proactive.planning_model 或默认 LLM 模型。
 # 类型: string
 planning_model = ""
 
@@ -86,7 +86,7 @@ page_context_max_chars = 2500
 # 自己的 ChatSession、记忆、认知和情绪生成台词。
 [multi_dialogue]
 # 多角色 planner 模型。留空则复用 dialogue.planning_model、
-# impulse.planning_model 或默认对话模型。
+# proactive.planning_model 或默认 LLM 模型。
 # 类型: string
 planning_model = ""
 
@@ -136,11 +136,6 @@ llm_model = "deepseek-v4-flash"
 # 留空时复用 llm_model；若角色卡里填写 llm_model，启动参数 --model 仍优先覆盖。
 dialogue_model = "deepseek-v4-flash"
 
-# impulse 主动说话生成模型。
-# 类型: string（模型名）
-# 默认使用 deepseek-v4-flash，与主对话模型独立。
-impulse_model = "deepseek-v4-flash"
-
 # DeepSeek API 密钥。模型名以 deepseek 开头时自动使用 DeepSeek 云端 API。
 # 也可以通过环境变量 DEEPSEEK_API_KEY 设置（环境变量优先级更高）。
 # 留空时从 config.json 的 deepseek_api_key 读取。
@@ -171,7 +166,7 @@ tts_backend = "minimax"
 # 类型: float
 # 1.0 = 原始音量，0.5 = 一半音量，0 = 静音，最大 2.0。
 # 超过 1.0 可能产生削波失真，建议优先使用 0.3 ~ 1.0。
-tts_volume = 1.6
+tts_volume = 1.25
 
 # ── Cartesia 配置 ──
 # Cartesia 海外 TTS 服务。需要海外网络访问和有效 API Key。
@@ -237,19 +232,25 @@ enabled = true
 # 类型: int
 # 包括音频缓冲区延迟 + 空气传播延迟。
 # 值越大，AEC 使用越"旧"的参考信号做抵消。
-# 一般桌面场景 30 ~ 80ms。建议从 50 开始调试。
+# 一般桌面场景 60 ~ 110ms。外放防回灌建议从 85 开始调试。
 # 如果回声听起来像"重叠/双份"，说明延迟偏大。
 # 如果回声残留明显，说明延迟偏小或声道延迟不稳定。
-delay_ms = 50
+delay_ms = 85
 
 # 噪声抑制等级（0 ~ 4）。
 # 类型: int
 # 0 = 关闭（仅回声消除）
 # 1 = 轻度
-# 2 = 中等（推荐，平衡降噪与音质）
-# 3 = 激进
+# 2 = 中等（耳机或轻度外放）
+# 3 = 激进（推荐外放防回灌）
 # 4 = 非常激进（适合麦克风底噪大的场景）
-ns_level = 2
+ns_level = 3
+
+# TTS 完成后重置 AEC 自适应滤波状态。
+# 类型: bool (true/false)
+# true: 避免多轮播放后滤波器漂移导致偶发回灌（推荐）
+# false: 保留连续自适应状态，适合稳定固定设备链路
+auto_reset_on_tts_done = true
 
 
 # ===========================================================================
@@ -282,7 +283,8 @@ cognition_eval_interval = 5
 
 # 情绪层评估用模型。留空则使用 llm_model。
 # 类型: string（模型名）
-# 每次对话后对情绪状态进行评估，频率很高，强烈建议配本地小模型。
+# 当前对话 prompt 不再直接注入 emotion；情绪/短期动机由 inner_stream 吸收。
+# 此配置主要保留给 VTS/表情等外部兼容路径。
 emotion_model = ""
 
 # STT 精炼模式。
@@ -301,8 +303,35 @@ stt_refine_mode = "inline"
 # 收到最后一段 STT 片段的静默时长超过此值后，触发精炼和推送。
 # 太短：用户话没说完就推送，对话不完整。
 # 太长：响应迟钝，需要等待更久。
-# 根据用户说话习惯调整。一般 1.0 ~ 2.0 秒。
-stt_refine_stable_seconds = 0.7
+# 根据用户说话习惯调整。一般 0.8 ~ 2.0 秒。
+stt_refine_stable_seconds = 0.9
+
+# STT 端点候选提交等待（秒）。
+# 类型: float
+# 识别到静音端点后不会立刻提交，而是等待一个短窗口。
+# 如果用户继续说话，会合并为同一句，避免“我给你 / 我说 / 给你安装”被拆成多轮。
+stt_utterance_commit_seconds = 0.55
+
+# 短句额外等待时间（秒）。
+# 类型: float
+# 短片段更可能是半句话，提交前额外等待，提升自然对话稳定性。
+stt_short_utterance_extra_seconds = 1.4
+
+# 触发短句额外等待的最大字符数。
+# 类型: int
+stt_short_utterance_max_chars = 8
+
+# 用户轮次合并窗口（秒）。
+# 类型: float
+# ConversationManager 可能因为识别器状态提前吐出短片段；
+# CLI 会先把多个短片段合并，窗口结束后才真正触发 dialogue。
+stt_turn_merge_seconds = 1.4
+
+# 是否启用 Dialogue 统一处理 STT 池。
+# 类型: bool (true/false)
+# true: STT 只累积文本；明显停顿后由 Dialogue LLM 一次决定 wait/speak、提炼用户内容并生成回复。
+# false: 使用旧路径，合并窗口结束后直接把文本作为用户输入交给 dialogue。
+stt_dialogue_pool_enabled = true
 
 # 重叠（同时说话）分类模型。
 # 类型: string（Ollama 模型名）
@@ -382,6 +411,29 @@ eval_interval = 2
 eval_model = ""
 
 # ===========================================================================
+# 内在叙事流 — 自我表达连续性
+# ===========================================================================
+# 由 LLM 维护一段自然语言内在连续性，用于让角色在对话中保留自己的
+# 注意、判断、表达惯性和话题耐心。程序只读写和注入文本，不解析为规则。
+
+[inner_stream]
+# 是否启用内在叙事流。
+# 类型: bool
+enabled = true
+
+# 更新内在叙事流使用的模型。留空则使用 llm_model。
+# 类型: string
+model = ""
+
+# 保存并注入的最大字符数。
+# 类型: int
+max_chars = 1200
+
+# 单次更新最大生成 token。
+# 类型: int
+max_tokens = 700
+
+# ===========================================================================
 # 立绘覆盖层
 # ===========================================================================
 # 透明立绘窗口（PySide6），显示角色立绘表情。由 overlay_slideshow.py 实现。
@@ -406,7 +458,7 @@ portrait_decision_interval = 0.0
 # 推荐范围: 30 ~ 120。太短会频繁跳回平静，太长会在不该平静时还保持表情。
 portrait_decay_seconds = 60.0
 
-# 立绘窗口上叠加显示调度器的冲动值调试信息。
+# 立绘窗口上叠加显示调度状态调试信息。
 # 类型: bool (true/false)
 # 调试用。如果不需要看到驱动值数字可关闭。
 portrait_debug_overlay = false
@@ -535,7 +587,7 @@ request_timeout = 3.0
 # 屏幕监控 — 周期性截图 + 视觉分析
 # ===========================================================================
 # 由 cli.py 启动的后台线程，定时截图并通过视觉 API 分析内容，
-# 判断是否有趣、是否隐私。结果用于 SCREEN 主动搭话和对话历史注入。
+# 判断是否有趣、是否隐私。结果作为主动对话候选缓存和对话历史注入。
 
 [screen_watch]
 # 是否开启持续屏幕截图分析。
@@ -553,8 +605,8 @@ watch_interval = 3.0
 
 # 内容兴趣度最低分数（0-100）。
 # 类型: float
-# 视觉 API 对截图打分的兴趣度达到此值才触发 SCREEN 冲动值增加。
-# 越高：只有非常有趣的内容才会触发搭话。
+# 视觉 API 对截图打分的兴趣度达到此值才会进入主动对话候选。
+# 越高：只有非常有趣的内容才会成为候选。
 # 越低：微小变化也可能触发（可能话多）。
 # 推荐范围: 50 ~ 80。
 interest_threshold = 70.0
@@ -567,54 +619,26 @@ vision_timeout = 45
 
 
 # ===========================================================================
-# 主动语音调度器 v2 — LLM 规划式
+# 主动对话调度
 # ===========================================================================
-# 基于 LLM 规划的主动搭话机制，替代旧的冲动值累积式调度器。
-# 每次对话结束后：截图 → 视觉分析 → 记忆匹配 → LLM 规划 → 生成计划表 →
-# 按计划表在空闲时依次搭话。每次搭话后重新规划，形成持续的主动对话循环。
-# 用户一旦开口说话，所有待执行计划项自动作废。
+# 空闲时允许 DialogueOrchestrator 根据屏幕/网页缓存判断是否主动开口。
+# 用户一旦开口说话，待执行的延迟对话计划会自动作废。
 
-[impulse]
-# 是否启用 impulse 规划式主动搭话。
+[proactive]
+# 是否启用主动对话。
 # 类型: bool (true/false)
 enabled = true
 
-# 计划表最大容量（条）。
-# 类型: int
-# LLM 单次规划最多产出的计划项数。
-# 推荐范围: 3 ~ 8。
-max_plans = 5
-
-# 计划表最小容量（条）。
-# 类型: int
-# LLM 规划时至少应产出的计划项数（如果确实有值得说的话）。
-# 推荐范围: 0 ~ 3。
-min_plans = 1
-
-# 规划用模型名。留空则使用默认对话模型。
+# 主动/空闲调度使用的 planner 模型。留空则使用默认 LLM 模型。
 # 类型: string
-# 规划不需要很强的模型，可以用小模型节省开销。
-planning_model = "deepseek-v4-flash"
+planning_model = ""
 
-# 规划时的屏幕分析超时（秒）。
-# 类型: int
-# 推荐 30 ~ 60。
-screen_timeout = 45
+# ===========================================================================
+# 主动对话记忆提示
+# ===========================================================================
+# 空闲时定期检查日期事件和长期记忆，作为候选上下文交给对话调度器。
 
-# 计划表为空时，等待多少秒后重新读取屏幕并再次规划。
-# 类型: float
-# 设得太低会增加视觉和规划模型调用频率。推荐 30 ~ 120。
-empty_plan_retry_seconds = 10.0
-
-# 是否在控制台输出计划表内容（调试用）。
-# 类型: bool
-log_plan_table = true
-
-# 是否允许旧 impulse planner 直接读取屏幕/网页缓存作为主动搭话依据。
-# 默认关闭；屏幕/网页是否值得讨论由 DialogueOrchestrator 统一决定。
-# 类型: bool
-use_screen_context = false
-use_edge_page_context = false
+[proactive_memory]
 
 # 同一记忆事件的冷却时间（秒）。
 # 类型: float
@@ -622,14 +646,12 @@ use_edge_page_context = false
 # 默认 21600 秒 = 6 小时。
 memory_cooldown_seconds = 21600.0  # 6 小时
 
-# 日期匹配的记忆事件触发后注入的基础冲动值。
+# 日期匹配的记忆事件参考分数。
 # 类型: float
-# 值越高，日期纪念日越容易触发主动搭话。
 memory_date_score = 50.0
 
-# 定期记忆查询返回结果时注入的基础冲动值。
+# 定期记忆查询返回结果的参考分数。
 # 类型: float
-# 值越高，定期记忆查询结果越容易触发主动搭话。
 memory_lookup_score = 70.0
 
 # 用于定期记忆查询的 LLM 提示语。
@@ -653,7 +675,7 @@ memory_check_interval = 300.0
 #   date  - 月-日格式，每年匹配
 #   label - 事件名称（显示和去重用）
 #   note  - 给 LLM 的提醒（如何/何时提起）
-# [[impulse.memory_date_events]]
+# [[proactive_memory.memory_date_events]]
 # date = "05-04"
 # label = "Alice project anniversary"
 # note = "Mention it only if the user seems idle and the mood is relaxed."
@@ -662,7 +684,7 @@ memory_check_interval = 300.0
 # Bilibili 直播间弹幕 — 读取弹幕并回复
 # ===========================================================================
 # 由 bilibili_live.py 实现。后台线程维护 WebSocket 连接，
-# 在空闲时根据弹幕内容触发角色主动搭话。
+# 在空闲时根据弹幕内容触发角色主动对话。
 
 [bilibili_live]
 # 总开关。设为 false 时完全不连接 Bilibili。
@@ -747,13 +769,19 @@ enabled = true
 
 # 启用的工具列表。
 # 类型: string 数组
-# 可选: "look_at_screen", "search_memory", "get_current_time", "get_current_app", "save_to_memory"
+# 可选: "look_at_screen", "search_memory", "get_current_time", "get_current_app",
+#        "save_to_memory", "claude_code_exec", "check_task_progress",
+#        "list_active_tasks", "cancel_task"
 tools = [
   "look_at_screen",
   "search_memory",
   "get_current_time",
   "get_current_app",
   "save_to_memory",
+  "claude_code_exec",
+  "check_task_progress",
+  "list_active_tasks",
+  "cancel_task",
 ]
 
 # 单次对话中工具调用的最大循环次数（防止死循环）。
@@ -763,3 +791,31 @@ max_iterations = 5
 # 单次工具调用超时（秒）。
 # 类型: float
 tool_timeout = 45.0
+
+
+# ===========================================================================
+# 智能体 (Agent) — Claude Code 外部工具
+# ===========================================================================
+# AI 角色可以通过 claude_code_exec 工具调用 Claude Code 来执行文件操作、
+# 代码编写、文本处理等任务。任务在后台执行，AI 角色可以查询进度。
+
+[agent]
+# 总开关。设为 false 时禁用智能体调用。
+# 类型: bool (true/false)
+enabled = true
+
+# Claude Code 可执行文件路径。留空则自动在 PATH 中查找。
+# 类型: string（文件路径）
+# 如果通过 npm 全局安装，一般会自动找到。
+# Windows 常见路径: "C:/Users/<用户名>/AppData/Roaming/npm/claude"
+# macOS/Linux: 通常已在 PATH 中
+claude_code_path = ""
+
+# 智能体任务超时（秒）。
+# 类型: float
+# 超过此时间未完成的任务将被强制终止。
+timeout = 120.0
+
+# 默认工作目录。留空使用项目根目录。
+# 类型: string（目录路径）
+working_dir = ""

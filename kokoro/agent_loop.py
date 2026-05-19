@@ -176,6 +176,12 @@ def _agent_chat_impl(
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
+        payload = llm_client.build_payload(model, working_messages, stream=True, tools=tool_schemas)
+        print(f"\n  [agent] iteration={iteration}, tools_in_payload={'tools' in payload and bool(payload['tools'])}")
+        if payload.get("tools"):
+            print(f"  [agent] tool_names={[t.get('function',{}).get('name','?') for t in payload['tools']]}")
+        print(f"  [agent] messages={len(working_messages)} (system={sum(1 for m in working_messages if m['role']=='system')}, hist={sum(1 for m in working_messages if m['role']!='system')})")
+
         resp = requests.post(
             f"{base_url}/chat/completions",
             json=llm_client.build_payload(model, working_messages, stream=True, tools=tool_schemas),
@@ -227,10 +233,17 @@ def _agent_chat_impl(
         final_reply += iteration_reply
 
         if not had_tool_calls or not pending_completed:
+            finish_reason = chunk.finish_reason if chunk else "no_chunk"
+            print(f"  [agent] no tool calls (finish={finish_reason}, had_tool_calls={had_tool_calls}, pending={len(pending_completed)})")
+            if iteration_reply:
+                print(f"  [agent] text_reply={iteration_reply[:80]}")
             if usage_callback and (total_prompt or total_completion):
                 usage_callback({"prompt_tokens": total_prompt, "completion_tokens": total_completion})
             return AgentResult(reply=final_reply, cancelled=False, tool_calls_made=total_tool_calls)
 
+        print(f"  [agent] TOOL CALLS: {len(pending_completed)}")
+        for tc in pending_completed:
+            print(f"  [agent]   -> {tc.name}({json.dumps(tc.arguments, ensure_ascii=False)[:120]})")
         # Build assistant message with tool_calls
         assistant_tool_calls = []
         for tc in pending_completed:

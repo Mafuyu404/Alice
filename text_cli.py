@@ -23,6 +23,7 @@ from kokoro import memory as mem_mod
 from kokoro import multi_chat
 from kokoro import text_cli_tools
 from kokoro import token_usage
+from kokoro import task_manager as task_manager_mod
 
 
 CONFIG = cfg.load()
@@ -47,7 +48,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--multi", default=None, help="Multi-character mode: comma-separated IDs, e.g. 'alice,penglai'")
     parser.add_argument("--auto", type=int, default=3, help="Auto follow-up turns after each user turn in multi-character mode")
     parser.add_argument("--no-memory", action="store_true", help="Disable memory backend for this run")
-    parser.add_argument("--no-tools", action="store_true", help="Disable agent file tools")
+    parser.add_argument("--tools", action="store_true", help="Enable agent file tools")
     parser.add_argument("--read-only-tools", action="store_true", help="Enable file tools without write access")
     parser.add_argument("--max-history", type=int, default=40, help="Conversation history messages to keep")
     parser.add_argument("--no-store", action="store_true", help="Do not store turns into memory")
@@ -86,6 +87,7 @@ def main() -> None:
         session.summary = ""
         session.cognition = _NullLayer()
         session.emotion = _NullLayer()
+        session.inner_stream = _NullLayer()
         session.memory_events = None
     model = args.model or session.character_config.get("llm_model") or cfg.llm_model()
     dialogue = dialogue_mod.DialogueOrchestrator(
@@ -97,7 +99,9 @@ def main() -> None:
 
     agent_config = None
     registry = None
-    if not args.no_tools:
+    _task_manager = task_manager_mod.TaskManager()
+    tools_enabled = bool(args.tools or args.read_only_tools)
+    if tools_enabled:
         registry = text_cli_tools.ProjectFileRegistry(allow_write=not args.read_only_tools)
         agent_config = agent_loop.AgentConfig(
             tools=registry.enabled_schemas(),
@@ -113,7 +117,7 @@ def main() -> None:
     print(f"  Memory: {not args.no_memory}")
     print(f"  Store turns: {not args.no_store}")
     print(f"  Cognition eval: {not args.no_cognition}")
-    print(f"  File tools: {bool(agent_config)} (write={not args.read_only_tools and not args.no_tools})")
+    print(f"  File tools: {bool(agent_config)} (write={bool(args.tools and not args.read_only_tools)})")
     print("  Commands: /exit, /usage")
     print("=" * 50)
 
@@ -139,7 +143,7 @@ def main() -> None:
     transcript.write(f"- Memory: {not args.no_memory}\n")
     transcript.write(f"- Store turns: {not args.no_store}\n")
     transcript.write(f"- Cognition eval: {not args.no_cognition}\n")
-    transcript.write(f"- File tools: {bool(agent_config)} (write={not args.read_only_tools and not args.no_tools})\n\n")
+    transcript.write(f"- File tools: {bool(agent_config)} (write={bool(args.tools and not args.read_only_tools)})\n\n")
 
     try:
         turn_iter = iter(input_turns) if input_turns is not None else None
@@ -210,6 +214,7 @@ def main() -> None:
                     session=session,
                     memory_backend=memory_backend,
                     character_id=session.character_id,
+                    task_manager=_task_manager,
                 )
             except requests.exceptions.ConnectionError:
                 message = f"[connection failed] Cannot connect to {llm_client.api_base_for(model)}"
@@ -238,6 +243,7 @@ def main() -> None:
                 continue
 
             reply = result.reply.strip()
+            reply = dialogue_mod.clean_generated_reply(reply, session.character_name)
             if transcript:
                 transcript.write(f"{session.character_name}: {reply}\n\n")
             if reply and not args.no_store:

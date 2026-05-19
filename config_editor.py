@@ -167,7 +167,7 @@ def _comment(text: str) -> str:
 SECTIONS = [
     "llm", "tts", "stt", "aec", "memory", "portrait_overlay",
     "subtitle", "subtitle_stt", "vision", "edge_page_cache",
-    "scene", "screen_watch", "impulse", "bilibili_live", "mem0_llm",
+    "scene", "screen_watch", "proactive", "proactive_memory", "inner_stream", "bilibili_live", "mem0_llm",
     "mem0_embedder", "mem0_lifecycle", "tool_calling",
 ]
 
@@ -201,7 +201,7 @@ def toml_tts(cfg: dict) -> str:
         _comment('TTS 后端。可选: "minimax", "cartesia"'),
         f"tts_backend = {_toml_val(c.get('tts_backend', 'minimax'))}\n",
         _comment("TTS 播放音量倍率 (0.0 ~ 2.0)。1.0 = 原始音量"),
-        f"tts_volume = {_toml_val(c.get('tts_volume', 1.0))}\n",
+        f"tts_volume = {_toml_val(c.get('tts_volume', 1.25))}\n",
         _comment("── Cartesia 配置 ──"),
         f"cartesia_api_key = {_toml_val(c.get('cartesia_api_key', ''))}\n",
         f"tts_voice_id = {_toml_val(c.get('tts_voice_id', ''))}\n",
@@ -234,9 +234,10 @@ def toml_aec(cfg: dict) -> str:
         _comment("启用回声消除"),
         f"enabled = {_toml_val(c.get('enabled', False))}\n",
         _comment("麦克风到扬声器的预估延迟 (ms)。建议从 50 开始调试。"),
-        f"delay_ms = {_toml_val(c.get('delay_ms', 50))}\n",
+        f"delay_ms = {_toml_val(c.get('delay_ms', 85))}\n",
         _comment("噪声抑制等级 (0 ~ 4)。2 = 中等推荐"),
-        f"ns_level = {_toml_val(c.get('ns_level', 2))}\n",
+        f"ns_level = {_toml_val(c.get('ns_level', 3))}\n",
+        f"auto_reset_on_tts_done = {_toml_val(c.get('auto_reset_on_tts_done', True))}\n",
     ]
     return "".join(lines)
 
@@ -273,7 +274,17 @@ def toml_stt(cfg: dict) -> str:
         _comment('STT 精炼模式: "separate", "inline", "none"'),
         f"stt_refine_mode = {_toml_val(c.get('stt_refine_mode', 'inline'))}\n",
         _comment("STT 文本稳定判定间隔 (秒)。推荐 1.0 ~ 2.0"),
-        f"stt_refine_stable_seconds = {_toml_val(c.get('stt_refine_stable_seconds', 0.7))}\n",
+        f"stt_refine_stable_seconds = {_toml_val(c.get('stt_refine_stable_seconds', 0.9))}\n",
+        _comment("端点候选提交等待 (秒)。继续说话会合并为同一句"),
+        f"stt_utterance_commit_seconds = {_toml_val(c.get('stt_utterance_commit_seconds', 0.55))}\n",
+        _comment("短句额外等待 (秒)，避免半句话被过早提交"),
+        f"stt_short_utterance_extra_seconds = {_toml_val(c.get('stt_short_utterance_extra_seconds', 1.4))}\n",
+        _comment("触发短句额外等待的最大字符数"),
+        f"stt_short_utterance_max_chars = {_toml_val(c.get('stt_short_utterance_max_chars', 8))}\n",
+        _comment("用户轮次合并窗口 (秒)，窗口结束后才触发 dialogue"),
+        f"stt_turn_merge_seconds = {_toml_val(c.get('stt_turn_merge_seconds', 1.4))}\n",
+        _comment("启用 Dialogue 统一处理 STT 池"),
+        f"stt_dialogue_pool_enabled = {_toml_val(c.get('stt_dialogue_pool_enabled', True))}\n",
         _comment("对话池轮询间隔 (秒)。建议保持 0.05"),
         f"stt_pool_tick_seconds = {_toml_val(c.get('stt_pool_tick_seconds', 0.05))}\n",
         _comment("STT 精炼最大 token 数。64 ~ 128 足够"),
@@ -311,7 +322,7 @@ def toml_portrait(cfg: dict) -> str:
         f"portrait_decision_interval = {_toml_val(c.get('portrait_decision_interval', 0.0))}\n",
         _comment("对话结束后多少秒恢复平静表情。推荐 30 ~ 120"),
         f"portrait_decay_seconds = {_toml_val(c.get('portrait_decay_seconds', 60.0))}\n",
-        _comment("立绘窗口显示冲动值调试信息"),
+        _comment("立绘窗口显示调度状态调试信息"),
         f"portrait_debug_overlay = {_toml_val(c.get('portrait_debug_overlay', False))}\n",
         _comment("鼠标点击穿透立绘窗口"),
         f"portrait_click_through = {_toml_val(c.get('portrait_click_through', False))}\n",
@@ -408,30 +419,30 @@ def toml_screen_watch(cfg: dict) -> str:
     return "".join(lines)
 
 
-def toml_impulse(cfg: dict) -> str:
-    c = cfg.get("impulse", {})
+def toml_proactive(cfg: dict) -> str:
+    c = cfg.get("proactive", {})
     lines = [
-        _comment("主动语音调度器 v2 — LLM 规划式"),
-        _comment("基于 LLM 规划的主动搭话机制。"),
-        f"\n[impulse]\n",
+        _comment("主动对话调度"),
+        _comment("空闲时允许 DialogueOrchestrator 根据屏幕/网页缓存决定是否主动开口。"),
+        f"\n[proactive]\n",
         f"enabled = {_toml_val(c.get('enabled', True))}\n",
-        _comment("计划表最大容量。推荐 3 ~ 8"),
-        f"max_plans = {_toml_val(c.get('max_plans', 5))}\n",
-        _comment("计划表最小容量。推荐 0 ~ 3"),
-        f"min_plans = {_toml_val(c.get('min_plans', 1))}\n",
-        _comment("规划用模型名。留空则使用默认对话模型"),
-        f"planning_model = {_toml_val(c.get('planning_model', 'deepseek-v4-flash'))}\n",
-        _comment("规划时屏幕分析超时 (秒)。推荐 30 ~ 60"),
-        f"screen_timeout = {_toml_val(c.get('screen_timeout', 45))}\n",
-        _comment("计划表为空时重试等待秒数。推荐 30 ~ 120"),
-        f"empty_plan_retry_seconds = {_toml_val(c.get('empty_plan_retry_seconds', 10.0))}\n",
-        _comment("控制台输出计划表内容（调试）"),
-        f"log_plan_table = {_toml_val(c.get('log_plan_table', True))}\n",
+        _comment("主动/空闲调度使用的 planner 模型。留空则使用默认 LLM 模型。"),
+        f"planning_model = {_toml_val(c.get('planning_model', ''))}\n",
+    ]
+    return "".join(lines)
+
+
+def toml_proactive_memory(cfg: dict) -> str:
+    c = cfg.get("proactive_memory", {})
+    lines = [
+        _comment("主动对话记忆提示"),
+        _comment("在空闲时定期检查日期事件和长期记忆，作为候选上下文交给对话调度器。"),
+        f"\n[proactive_memory]\n",
         _comment("同一记忆事件冷却时间 (秒)。默认 6 小时"),
         f"memory_cooldown_seconds = {_toml_val(c.get('memory_cooldown_seconds', 21600.0))}\n",
-        _comment("日期匹配记忆事件注入的基础冲动值"),
+        _comment("日期匹配记忆事件的参考分数"),
         f"memory_date_score = {_toml_val(c.get('memory_date_score', 50.0))}\n",
-        _comment("记忆查询结果注入的基础冲动值"),
+        _comment("记忆查询结果的参考分数"),
         f"memory_lookup_score = {_toml_val(c.get('memory_lookup_score', 70.0))}\n",
         _comment("记忆查询 LLM 提示语"),
         f"memory_lookup_query = {_toml_val(c.get('memory_lookup_query', 'recent important user preferences, plans, dates, anniversaries, goals'))}\n",
@@ -439,6 +450,23 @@ def toml_impulse(cfg: dict) -> str:
         f"memory_events_enabled = {_toml_val(c.get('memory_events_enabled', True))}\n",
         _comment("记忆事件轮询间隔 (秒)。推荐 120 ~ 600"),
         f"memory_check_interval = {_toml_val(c.get('memory_check_interval', 300.0))}\n",
+    ]
+    return "".join(lines)
+
+
+def toml_inner_stream(cfg: dict) -> str:
+    c = cfg.get("inner_stream", {})
+    lines = [
+        _comment("内在叙事流 — 自我表达连续性"),
+        _comment("由 LLM 维护一段自然语言内在连续性；程序只读写和注入，不解析为规则。"),
+        f"\n[inner_stream]\n",
+        f"enabled = {_toml_val(c.get('enabled', True))}\n",
+        _comment("更新内在叙事流使用的模型。留空则使用 llm_model"),
+        f"model = {_toml_val(c.get('model', ''))}\n",
+        _comment("保存并注入的最大字符数"),
+        f"max_chars = {_toml_val(c.get('max_chars', 1200))}\n",
+        _comment("单次更新最大生成 token"),
+        f"max_tokens = {_toml_val(c.get('max_tokens', 700))}\n",
     ]
     return "".join(lines)
 
@@ -551,7 +579,9 @@ def write_config_toml(path: Path, cfg: dict) -> None:
         toml_subtitle_stt(cfg),
         toml_edge_cache(cfg),
         toml_screen_watch(cfg),
-        toml_impulse(cfg),
+        toml_proactive(cfg),
+        toml_proactive_memory(cfg),
+        toml_inner_stream(cfg),
         toml_bilibili(cfg),
         toml_mem0_llm(cfg),
         toml_mem0_embedder(cfg),
@@ -824,6 +854,7 @@ def build_aec_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
         BoolField("enabled", QCheckBox("启用回声消除"), "aec"),
         IntField("delay_ms", QSpinBox(), mini=0, maxi=500, section="aec"),
         IntField("ns_level", QSpinBox(), mini=0, maxi=4, section="aec"),
+        BoolField("auto_reset_on_tts_done", QCheckBox("TTS done reset AEC"), "aec"),
     ]
     for f in fields:
         f.set_value(section.get(f.key))
@@ -841,6 +872,11 @@ def build_stt_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
         StringField("emotion_model", QLineEdit()),
         ChoiceField("stt_refine_mode", QComboBox(), ["separate", "inline", "none"]),
         FloatField("stt_refine_stable_seconds", QDoubleSpinBox(), mini=0.1, maxi=10.0, step=0.1, decimals=1),
+        FloatField("stt_utterance_commit_seconds", QDoubleSpinBox(), mini=0.0, maxi=5.0, step=0.05, decimals=2),
+        FloatField("stt_short_utterance_extra_seconds", QDoubleSpinBox(), mini=0.0, maxi=5.0, step=0.05, decimals=2),
+        IntField("stt_short_utterance_max_chars", QSpinBox(), mini=0, maxi=50),
+        FloatField("stt_turn_merge_seconds", QDoubleSpinBox(), mini=0.0, maxi=5.0, step=0.05, decimals=2),
+        BoolField("stt_dialogue_pool_enabled", QCheckBox("Dialogue 统一处理 STT 池")),
         FloatField("stt_pool_tick_seconds", QDoubleSpinBox(), mini=0.01, maxi=1.0, step=0.01, decimals=3),
         IntField("stt_refine_max_tokens", QSpinBox(), mini=16, maxi=1024),
         BoolField("stt_skip_short_refine", QCheckBox("跳过短文本精炼")),
@@ -873,7 +909,7 @@ def build_portrait_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
         IntField("portrait_overlay_port", QSpinBox(), mini=1024, maxi=65535),
         FloatField("portrait_decision_interval", QDoubleSpinBox(), mini=0.0, maxi=60.0, step=0.5, decimals=1),
         FloatField("portrait_decay_seconds", QDoubleSpinBox(), mini=0.0, maxi=600.0, step=5.0, decimals=0),
-        BoolField("portrait_debug_overlay", QCheckBox("显示冲动值调试信息")),
+        BoolField("portrait_debug_overlay", QCheckBox("显示调度状态调试信息")),
         BoolField("portrait_click_through", QCheckBox("鼠标点击穿透")),
         StringField("portrait_model", QLineEdit()),
     ]
@@ -972,26 +1008,45 @@ def build_screen_watch_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
     return page, fields
 
 
-def build_impulse_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
-    section = cfg.get("impulse", {})
+def build_proactive_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
+    section = cfg.get("proactive", {})
     fields = [
-        BoolField("enabled", QCheckBox("启用主动搭话"), "impulse"),
-        IntField("max_plans", QSpinBox(), mini=1, maxi=20, section="impulse"),
-        IntField("min_plans", QSpinBox(), mini=0, maxi=10, section="impulse"),
-        StringField("planning_model", QLineEdit(), "impulse"),
-        IntField("screen_timeout", QSpinBox(), mini=5, maxi=300, section="impulse"),
-        FloatField("empty_plan_retry_seconds", QDoubleSpinBox(), mini=1.0, maxi=600.0, step=5.0, decimals=0, section="impulse"),
-        BoolField("log_plan_table", QCheckBox("控制台输出计划表"), "impulse"),
-        FloatField("memory_cooldown_seconds", QDoubleSpinBox(), mini=0.0, maxi=86400.0, step=300.0, decimals=0, section="impulse"),
-        FloatField("memory_date_score", QDoubleSpinBox(), mini=0.0, maxi=100.0, step=5.0, decimals=0, section="impulse"),
-        FloatField("memory_lookup_score", QDoubleSpinBox(), mini=0.0, maxi=100.0, step=5.0, decimals=0, section="impulse"),
-        StringField("memory_lookup_query", QLineEdit(), "impulse"),
-        BoolField("memory_events_enabled", QCheckBox("开启周期性记忆事件轮询"), "impulse"),
-        FloatField("memory_check_interval", QDoubleSpinBox(), mini=10.0, maxi=3600.0, step=30.0, decimals=0, section="impulse"),
+        BoolField("enabled", QCheckBox("启用主动对话"), "proactive"),
+        StringField("planning_model", QLineEdit(), "proactive"),
     ]
     for f in fields:
         f.set_value(section.get(f.key))
-    page = make_section_page("主动搭话调度器 (Impulse)", fields, note="LLM 规划式主动搭话机制。")
+    page = make_section_page("主动对话", fields, note="空闲时由统一对话调度器决定是否开口。")
+    return page, fields
+
+
+def build_proactive_memory_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
+    section = cfg.get("proactive_memory", {})
+    fields = [
+        FloatField("memory_cooldown_seconds", QDoubleSpinBox(), mini=0.0, maxi=86400.0, step=300.0, decimals=0, section="proactive_memory"),
+        FloatField("memory_date_score", QDoubleSpinBox(), mini=0.0, maxi=100.0, step=5.0, decimals=0, section="proactive_memory"),
+        FloatField("memory_lookup_score", QDoubleSpinBox(), mini=0.0, maxi=100.0, step=5.0, decimals=0, section="proactive_memory"),
+        StringField("memory_lookup_query", QLineEdit(), "proactive_memory"),
+        BoolField("memory_events_enabled", QCheckBox("开启周期性记忆提示轮询"), "proactive_memory"),
+        FloatField("memory_check_interval", QDoubleSpinBox(), mini=10.0, maxi=3600.0, step=30.0, decimals=0, section="proactive_memory"),
+    ]
+    for f in fields:
+        f.set_value(section.get(f.key))
+    page = make_section_page("主动记忆提示", fields, note="日期和长期记忆的空闲候选上下文。")
+    return page, fields
+
+
+def build_inner_stream_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
+    section = cfg.get("inner_stream", {})
+    fields = [
+        BoolField("enabled", QCheckBox("启用内在叙事流"), "inner_stream"),
+        StringField("model", QLineEdit(), "inner_stream"),
+        IntField("max_chars", QSpinBox(), mini=200, maxi=4000, section="inner_stream"),
+        IntField("max_tokens", QSpinBox(), mini=100, maxi=1600, section="inner_stream"),
+    ]
+    for f in fields:
+        f.set_value(section.get(f.key))
+    page = make_section_page("内在叙事流", fields, note="由 LLM 维护的自我表达连续性文本。")
     return page, fields
 
 
@@ -1537,7 +1592,9 @@ class ConfigEditorWindow(QMainWindow):
             ("Edge缓存", "edge_cache", build_edge_cache_page),
             ("场景", "scene", build_scene_page),
             ("屏幕监控", "screen_watch", build_screen_watch_page),
-            ("主动搭话", "impulse", build_impulse_page),
+            ("主动对话", "proactive", build_proactive_page),
+            ("主动记忆", "proactive_memory", build_proactive_memory_page),
+            ("内在叙事", "inner_stream", build_inner_stream_page),
             ("B站直播", "bilibili", build_bilibili_page),
             ("Mem0", "mem0", build_mem0_page),
             ("工具调用", "tool_calling", build_tool_calling_page),
@@ -1575,7 +1632,7 @@ class ConfigEditorWindow(QMainWindow):
             elif page_id == "per_char_config":
                 page, fields = builder()
             elif page_id in ("subtitle", "subtitle_stt", "edge_cache", "screen_watch",
-                             "impulse", "bilibili", "tool_calling", "aec"):
+                             "proactive", "proactive_memory", "inner_stream", "bilibili", "tool_calling", "aec"):
                 page, fields = builder(self.toml_cfg)
             else:
                 page, fields = builder(self.merged_cfg)
@@ -1639,7 +1696,7 @@ class ConfigEditorWindow(QMainWindow):
 
         results = {}
         tomli_keys = {"subtitle", "subtitle_stt", "edge_cache", "screen_watch",
-                      "impulse", "bilibili", "tool_calling", "aec"}
+                      "proactive", "proactive_memory", "inner_stream", "bilibili", "tool_calling", "aec"}
         for f in fields:
             val = f.get_value()
             # Map mem0 fields back into sub-dicts
@@ -1661,7 +1718,7 @@ class ConfigEditorWindow(QMainWindow):
             toml_sections = {
                 "llm", "tts", "stt", "aec", "memory", "portrait",
                 "subtitle", "subtitle_stt", "vision", "edge_cache",
-                "screen_watch", "impulse", "bilibili", "tool_calling",
+                "screen_watch", "proactive", "proactive_memory", "inner_stream", "bilibili", "tool_calling",
             }
 
             for pid in toml_sections:

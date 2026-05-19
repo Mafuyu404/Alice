@@ -1,7 +1,7 @@
 """Cognition layer: stable perceptions about people, relationships, and things.
 
 Full data lives in ``characters/{id}/cognition.json``. Runtime cache is a
-small, locally selected subset that is injected into chat and impulse prompts.
+small, locally selected subset that is injected into chat and dialogue prompts.
 """
 
 from __future__ import annotations

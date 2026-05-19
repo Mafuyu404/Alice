@@ -38,6 +38,7 @@ class ChatSession:
     # Three-layer personality system
     cognition: object = field(default=None)   # CognitionStore instance
     emotion: object = field(default=None)      # EmotionState instance
+    inner_stream: object = field(default=None)  # InnerStream instance
     # Periodic cognition evaluation (every N conversation turns)
     cognition_eval_interval: int = 5
     _cognition_turn_counter: int = 0
@@ -59,11 +60,14 @@ class ChatSession:
     def __post_init__(self) -> None:
         from kokoro.cognition import CognitionStore
         from kokoro.emotion import EmotionState
+        from kokoro.inner_stream import InnerStream
         from kokoro.memory_events import MemoryEventStore
         if self.cognition is None:
             self.cognition = CognitionStore(self.character_id, self.character_data)
         if self.emotion is None:
             self.emotion = EmotionState(self.character_id)
+        if self.inner_stream is None:
+            self.inner_stream = InnerStream(self.character_id, self.character_data)
         if self.memory_events is None:
             self.memory_events = MemoryEventStore(self.memory_backend, self.character_id)
         if self._scene is None:
@@ -86,6 +90,7 @@ class ChatSession:
     @property
     def scene_guidance(self) -> str:
         """Scene guidance block describing information sources."""
+        from kokoro import config as _cfg
         return scene_mod.guidance_text(self._scene, self.user_name, self.character_name, _cfg.load())
 
     @property
@@ -163,10 +168,10 @@ class ChatSession:
         if cognition_ctx:
             messages.append({"role": "system", "content": cognition_ctx})
 
-        # Emotion layer — shallow tone and mid-term motivation (optional)
-        emotion_ctx = self.emotion.get_context()
-        if emotion_ctx:
-            messages.append({"role": "system", "content": emotion_ctx})
+        # Inner stream — plain-text continuity for self-expression.
+        inner_ctx = self.inner_stream.get_context()
+        if inner_ctx:
+            messages.append({"role": "system", "content": inner_ctx})
 
         if stt_refine_inline:
             inline_prompt = prompts.get("stt_refine_inline.system", "")
@@ -232,6 +237,9 @@ class ChatSession:
             args=(user_text, assistant_text, self.character_name, self.user_name),
             daemon=True,
         ).start()
+
+        # Inner stream updates synchronously so the next turn immediately sees it.
+        self._eval_inner_stream_async(user_text, assistant_text)
 
         # Periodic cognition evaluation (every N turns, independent of summary)
         self._cognition_turn_counter += 1
@@ -299,6 +307,35 @@ class ChatSession:
             )
         except Exception as exc:
             logger.warning("periodic cognition evaluation failed: %s", exc)
+
+    def _eval_inner_stream_async(self, user_text: str, assistant_text: str) -> None:
+        try:
+            recent = _format_recent_history(
+                self.history[-10:],
+                user_name=self.user_name,
+                character_name=self.character_name,
+            )
+            try:
+                memories = self.memory_backend.get_context_multi(
+                    f"{user_text} {assistant_text}"[:500],
+                    memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
+                )
+            except Exception:
+                memories = ""
+            self.inner_stream.evaluate(
+                user_text=user_text,
+                assistant_text=assistant_text,
+                character_name=self.character_name,
+                user_name=self.user_name,
+                summary=self.summary or "",
+                recent_history=recent,
+                cognition_context=self.cognition.get_context() if self.cognition else "",
+                emotion_context=self.emotion.get_context() if self.emotion else "",
+                memory_context=memories or "",
+                scene_context=self.scene_guidance or "",
+            )
+        except Exception as exc:
+            logger.warning("inner stream evaluation failed: %s", exc)
 
     def _call_summary_llm(self, existing_summary: str, conversation: str) -> str | None:
         prompt = prompts.format_prompt(
@@ -412,6 +449,22 @@ def last_user_text(messages: list[dict]) -> str:
         if msg.get("role") == "user":
             return msg.get("content", "")
     return ""
+
+
+def _format_recent_history(messages: list[dict], *, user_name: str, character_name: str) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "")
+        if role == "user":
+            speaker = user_name
+        elif role == "assistant":
+            speaker = character_name
+        else:
+            speaker = "system"
+        content = str(msg.get("content", "") or "").strip()
+        if content:
+            lines.append(f"{speaker}：{content[:500]}")
+    return "\n".join(lines)
 
 
 def store_memory_async(memory_backend: object, user_text: str, assistant_text: str, user_id: str) -> None:

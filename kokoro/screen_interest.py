@@ -1,4 +1,4 @@
-"""Screen interest detection for impulse screen context.
+"""Screen interest detection for proactive dialogue context.
 
 Instead of a generic "is this interesting?" check, this module analyzes the
 foreground window content — extracting readable text and describing the visual

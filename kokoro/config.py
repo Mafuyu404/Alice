@@ -72,15 +72,6 @@ def dialogue_model() -> str:
     return get("dialogue_model", llm_model())
 
 
-def impulse_model() -> str:
-    section = get("impulse", {})
-    if isinstance(section, dict):
-        value = str(section.get("model", "") or "").strip()
-        if value:
-            return value
-    return get("impulse_model", "deepseek-v4-flash")
-
-
 def memory_backend() -> str:
     return get("memory_backend", "mem0")
 
@@ -152,6 +143,26 @@ def stt_pause_during_tts() -> bool:
 
 def stt_refine_stable_seconds() -> float:
     return float(get("stt_refine_stable_seconds", 1.5))
+
+
+def stt_utterance_commit_seconds() -> float:
+    return float(get("stt_utterance_commit_seconds", 0.55))
+
+
+def stt_short_utterance_extra_seconds() -> float:
+    return float(get("stt_short_utterance_extra_seconds", 1.4))
+
+
+def stt_short_utterance_max_chars() -> int:
+    return int(get("stt_short_utterance_max_chars", 8))
+
+
+def stt_turn_merge_seconds() -> float:
+    return float(get("stt_turn_merge_seconds", 1.4))
+
+
+def stt_dialogue_pool_enabled() -> bool:
+    return bool(get("stt_dialogue_pool_enabled", True))
 
 
 def stt_pool_tick_seconds() -> float:
@@ -273,13 +284,20 @@ def tool_timeout() -> float:
     return float(section.get("tool_timeout", 45.0))
 
 
-# ── impulse ──────────────────────────────────────────────────────────────────
+# ── proactive dialogue ───────────────────────────────────────────────────────
 
-def impulse_enabled() -> bool:
-    section = get("impulse", {})
+def proactive_enabled() -> bool:
+    section = get("proactive", {})
     if not isinstance(section, dict):
         return False
     return bool(section.get("enabled", False))
+
+
+def inner_stream_config() -> dict:
+    section = get("inner_stream", {})
+    if not isinstance(section, dict):
+        section = {}
+    return section
 
 
 # ── bilibili_live ────────────────────────────────────────────────────────────
@@ -311,3 +329,33 @@ def bilibili_live_room_id() -> int:
 def bilibili_live_buffer_max_age() -> float:
     section = get("bilibili_live", {})
     return float(section.get("buffer_max_age", 120.0))
+
+
+# ── agent (Claude Code) ────────────────────────────────────────────────────
+
+def agent_enabled() -> bool:
+    section = get("agent", {})
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("enabled", False))
+
+
+def agent_claude_code_path() -> str:
+    section = get("agent", {})
+    if not isinstance(section, dict):
+        return ""
+    return str(section.get("claude_code_path", ""))
+
+
+def agent_timeout() -> float:
+    section = get("agent", {})
+    if not isinstance(section, dict):
+        return 120.0
+    return float(section.get("timeout", 120.0))
+
+
+def agent_working_dir() -> str:
+    section = get("agent", {})
+    if not isinstance(section, dict):
+        return ""
+    return str(section.get("working_dir", ""))

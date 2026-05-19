@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
-import time
+import os
+import subprocess
 import threading
+import time
 
 from kokoro import prompts
 from kokoro import screen_interest
@@ -174,3 +176,175 @@ def handle_vts_expression(arguments: dict, **context) -> str:
         return f"表情设置失败：{exc}"
 
     return f"已切换表情为 {expr}"
+
+
+def _find_claude_code() -> str:
+    """Locate the claude executable. Returns path or raises FileNotFoundError."""
+    candidates = ["claude", "claude.exe"]
+    for c in candidates:
+        try:
+            import shutil
+            path = shutil.which(c)
+            if path:
+                return path
+        except Exception:
+            pass
+    # Fallback: common install locations
+    fallbacks = [
+        os.path.expanduser("~/.npm-global/bin/claude"),
+        os.path.expanduser("~/.npm/bin/claude"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "npm", "claude"),
+        "/usr/local/bin/claude",
+    ]
+    for fb in fallbacks:
+        if os.path.isfile(fb):
+            return fb
+    raise FileNotFoundError("Claude Code 未找到。请确保已安装 npm install -g @anthropic-ai/claude-code")
+
+
+def _run_claude_code_sync(
+    task: str,
+    working_dir: str | None = None,
+    timeout: float = 120.0,
+) -> tuple[str, str | None]:
+    """Run claude -p synchronously. Returns (output, error)."""
+    try:
+        exe = _find_claude_code()
+    except FileNotFoundError as exc:
+        return "", str(exc)
+
+    cmd = [exe, "-p", task]
+    env = os.environ.copy()
+    if working_dir:
+        cwd = working_dir
+    else:
+        from pathlib import Path
+        cwd = str(Path(__file__).resolve().parent.parent)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+            cwd=cwd,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        output = output.strip()
+        if result.returncode != 0:
+            return output[:3000], f"Claude Code 退出码 {result.returncode}"
+        return output[:3000], None
+    except subprocess.TimeoutExpired:
+        return "", f"任务执行超时（{timeout}秒）"
+    except FileNotFoundError:
+        return "", "Claude Code 未安装或不在 PATH 中"
+    except Exception as exc:
+        return "", f"执行失败：{type(exc).__name__}: {exc}"
+
+
+def _background_worker(
+    task_id: str,
+    task: str,
+    working_dir: str | None,
+    manager: object,
+    timeout: float,
+) -> None:
+    """Run Claude Code in background thread, updating task state."""
+    manager.update(task_id, status="running", progress="正在启动 Claude Code...")
+    try:
+        output, error = _run_claude_code_sync(task, working_dir, timeout)
+        if error:
+            manager.update(task_id, status="failed", error=error, progress="")
+        else:
+            manager.update(task_id, status="completed", result=output, progress="已完成")
+    except Exception as exc:
+        manager.update(task_id, status="failed", error=f"{type(exc).__name__}: {exc}", progress="")
+
+
+def handle_claude_code_exec(arguments: dict, **context) -> str:
+    """Execute a task via Claude Code in the background."""
+    task = arguments.get("task", "").strip()
+    if not task:
+        return "任务描述为空，请提供要完成的目标。"
+
+    working_dir = arguments.get("working_dir", "").strip() or None
+
+    task_manager = context.get("task_manager")
+    if task_manager is None:
+        return "任务管理系统未初始化。"
+
+    task_obj = task_manager.create(description=task)
+    task_manager.update(task_obj.id, status="pending", progress="队列中")
+
+    timeout = context.get("tool_timeout", 120.0)
+
+    thread = threading.Thread(
+        target=_background_worker,
+        args=(task_obj.id, task, working_dir, task_manager, timeout),
+        daemon=True,
+    )
+    thread.start()
+
+    return (
+        f"任务已创建，ID: {task_obj.id}\n"
+        f"描述：{task}\n"
+        f"正在后台处理中，处理完成后我会告诉你结果。"
+        f"你也可以随时问我「好了吗」来查询进度。"
+    )
+
+
+def handle_check_task_progress(arguments: dict, **context) -> str:
+    """Query the status of one or all tasks."""
+    task_id = arguments.get("task_id", "").strip()
+    task_manager = context.get("task_manager")
+    if task_manager is None:
+        return "任务管理系统未初始化。"
+
+    if task_id:
+        task = task_manager.get(task_id)
+        if task is None:
+            return f"未找到任务 {task_id}。"
+        return task.to_result()
+
+    active = task_manager.list_active()
+    if not active:
+        return "当前没有进行中的任务。"
+    return "进行中的任务：\n" + "\n".join(t.to_prompt_line() for t in active)
+
+
+def handle_list_active_tasks(arguments: dict, **context) -> str:
+    """List all active agent tasks."""
+    task_manager = context.get("task_manager")
+    if task_manager is None:
+        return "任务管理系统未初始化。"
+
+    active = task_manager.list_active()
+    if not active:
+        return "当前没有进行中的任务。"
+
+    lines = [f"共有 {len(active)} 个进行中的任务："]
+    for t in active:
+        lines.append(t.to_prompt_line())
+    return "\n".join(lines)
+
+
+def handle_cancel_task(arguments: dict, **context) -> str:
+    """Cancel a pending or running task."""
+    task_id = arguments.get("task_id", "").strip()
+    if not task_id:
+        return "请提供要取消的任务ID。"
+
+    task_manager = context.get("task_manager")
+    if task_manager is None:
+        return "任务管理系统未初始化。"
+
+    task = task_manager.get(task_id)
+    if task is None:
+        return f"未找到任务 {task_id}。"
+
+    if task.is_terminal:
+        return f"任务 {task_id} 已经处于 {task.status} 状态，无需取消。"
+
+    task_manager.update(task_id, status="cancelled", progress="已取消")
+    return f"任务 {task_id} 已取消。"

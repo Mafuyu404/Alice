@@ -43,6 +43,9 @@ class ConversationManager:
         on_partial: Optional[Callable[[str], None]] = None,
         sample_rate: int = 16000,
         silence_endpoint_delay: float = 2.0,
+        commit_delay: Optional[float] = None,
+        short_extra_delay: Optional[float] = None,
+        short_max_chars: Optional[int] = None,
     ):
         self._recognizer = recognizer
         self._machine = machine
@@ -62,10 +65,18 @@ class ConversationManager:
 
         # ── silence-based endpoint ────────────────────────────────────────────
         self._silence_endpoint_delay = silence_endpoint_delay
+        self._commit_delay = float(commit_delay if commit_delay is not None else cfg.stt_utterance_commit_seconds())
+        self._short_extra_delay = float(
+            short_extra_delay if short_extra_delay is not None else cfg.stt_short_utterance_extra_seconds()
+        )
+        self._short_max_chars = int(short_max_chars if short_max_chars is not None else cfg.stt_short_utterance_max_chars())
         self._silence_since: float = 0.0  # time.monotonic when text last changed
         self._last_voice_at: float = 0.0  # time.monotonic when mic energy last looked like speech
         self._had_partial = False         # True once we've seen any non-empty text
         self._last_delivery_time: float = 0.0  # cooldown to prevent double-delivery
+        self._pending_text = ""
+        self._pending_ready_at: float = 0.0
+        self._pending_reason = ""
 
         # Set by cli.py after callback returns, tells cli.py which interrupt was used
         self.last_reason: str = "endpoint"
@@ -82,6 +93,7 @@ class ConversationManager:
             self._stream.accept_waveform(self._sr, chunk)
 
             if not self._recognizer.is_ready(self._stream):
+                self._maybe_deliver_pending(now)
                 return
 
             self._recognizer.decode_stream(self._stream)
@@ -98,6 +110,7 @@ class ConversationManager:
                     if self._on_partial:
                         self._on_partial(text)
                     self._check_overlap(text)
+                    self._cancel_pending_if_continued(text)
 
                 # Silence-based endpoint: text unchanged for delay → utterance done
                 if (
@@ -107,7 +120,8 @@ class ConversationManager:
                     and (now - self._silence_since) >= self._silence_endpoint_delay
                     and (now - self._last_delivery_time) >= 1.5  # cooldown: no double-delivery
                 ):
-                    self._deliver(text, "endpoint:silence")
+                    self._stage_delivery(text, "endpoint:silence", now)
+                self._maybe_deliver_pending(now)
 
             elif self._had_partial and not self._delivered:
                 # Recognizer returned empty (e.g. stream reset internally).
@@ -115,7 +129,10 @@ class ConversationManager:
                 if self._has_real_silence(now) and (now - self._silence_since) >= self._silence_endpoint_delay:
                     last = self._last_partial.strip()
                     if len(last) >= 2 and (now - self._last_delivery_time) >= 1.5:
-                        self._deliver(last, "endpoint:silence")
+                        self._stage_delivery(last, "endpoint:silence", now)
+                self._maybe_deliver_pending(now)
+            else:
+                self._maybe_deliver_pending(now)
 
     def reset_stream(self) -> None:
         """Reset the STT stream.  Call after barge-in or utterance delivery."""
@@ -128,6 +145,9 @@ class ConversationManager:
             self._last_voice_at = 0.0
             self._had_partial = False
             self._last_delivery_time = 0.0
+            self._pending_text = ""
+            self._pending_ready_at = 0.0
+            self._pending_reason = ""
 
     def update_ai_context(self, text: str) -> None:
         """Feed back what the AI is currently saying (for overlap context)."""
@@ -195,14 +215,58 @@ class ConversationManager:
     def _deliver(self, text: str, reason: str) -> None:
         """Deliver user text to the conversation layer."""
         self._delivered = True
+        self._pending_text = ""
+        self._pending_ready_at = 0.0
+        self._pending_reason = ""
         self._last_delivery_time = time.monotonic()
         self.last_reason = reason
         stripped = text.strip()
         if stripped and self._on_user_utterance:
             self._on_user_utterance(stripped)
+        self._reset_after_delivery()
+
+    def _stage_delivery(self, text: str, reason: str, now: float) -> None:
+        stripped = text.strip()
+        if not stripped:
+            return
+        delay = self._commit_delay
+        if len(stripped) <= self._short_max_chars:
+            delay += self._short_extra_delay
+        ready_at = now + max(0.0, delay)
+        if stripped == self._pending_text:
+            return
+        self._pending_text = stripped
+        self._pending_reason = reason
+        self._pending_ready_at = ready_at
+
+    def _maybe_deliver_pending(self, now: float) -> None:
+        if self._delivered or not self._pending_text:
+            return
+        if now < self._pending_ready_at:
+            return
+        if not self._has_real_silence(now):
+            return
+        self._deliver(self._pending_text, self._pending_reason or "endpoint:silence")
+
+    def _cancel_pending_if_continued(self, text: str) -> None:
+        if not self._pending_text:
+            return
+        stripped = text.strip()
+        if not stripped or stripped == self._pending_text:
+            return
+        self._pending_text = ""
+        self._pending_ready_at = 0.0
+        self._pending_reason = ""
 
     def _reset_after_delivery(self) -> None:
         """Reset STT stream after a delivery, ready for the next utterance."""
         self._stream = self._recognizer.create_stream()
         self._last_partial = ""
         self._delivered = False
+        self._partial_count = 0
+        self._silence_since = 0.0
+        self._last_voice_at = 0.0
+        self._had_partial = False
+        self._pending_text = ""
+        self._pending_ready_at = 0.0
+        self._pending_reason = ""

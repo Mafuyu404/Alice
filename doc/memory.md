@@ -34,7 +34,7 @@ memory_backend = "mem0"
 
 - 记忆层存事件
 - cognition 层存稳定印象
-- emotion 层存当前情绪状态
+- inner stream 层吸收当前情绪、短期动机和表达连续性
 
 ## memory_events
 

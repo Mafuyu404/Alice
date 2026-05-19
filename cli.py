@@ -44,6 +44,7 @@ from kokoro import bilibili_live as bilibili_live_mod
 from kokoro import edge_cache as edge_cache_mod
 from kokoro import token_usage
 from kokoro import tool_registry as tool_registry_mod
+from kokoro import task_manager as task_manager_mod
 from kokoro import vts_controller as vts_mod
 
 
@@ -126,7 +127,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--model", default=None, help="Chat model")
     parser.add_argument("--no-tts", action="store_true", help="Disable speech output")
     parser.add_argument("--no-portrait", action="store_true", help="Disable portrait overlay")
-    parser.add_argument("--no-impulse", action="store_true", help="Disable impulse planner")
+    parser.add_argument("--no-proactive", action="store_true", help="Disable proactive dialogue")
     parser.add_argument("--no-screen-watch", action="store_true", help="Disable screen context watcher")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
     parser.add_argument("--bilibili-room", type=int, default=None, help="Bilibili live room ID (overrides config)")
@@ -142,6 +143,31 @@ def get_args() -> argparse.Namespace:
 def display_user(text: str) -> None:
     sys.stdout.write(f"\r\033[K[User] {text}\n")
     sys.stdout.flush()
+
+
+def merge_stt_text(prev: str, new: str) -> str:
+    prev = (prev or "").strip()
+    new = (new or "").strip()
+    if not prev:
+        return new
+    if not new:
+        return prev
+    if new in prev:
+        return prev
+    if prev in new:
+        return new
+    max_overlap = min(len(prev), len(new))
+    for n in range(max_overlap, 0, -1):
+        if prev[-n:] == new[:n]:
+            return prev + new[n:]
+    return prev + new
+
+
+def stt_turn_deadline_delay(text: str) -> float:
+    delay = cfg.stt_turn_merge_seconds()
+    if len((text or "").strip()) <= cfg.stt_short_utterance_max_chars():
+        delay += cfg.stt_short_utterance_extra_seconds()
+    return delay
 
 
 def chat_stream(
@@ -289,7 +315,6 @@ def main() -> None:
     session.load_summary()
 
     dialogue_model = args.model or session.character_config.get("llm_model") or cfg.dialogue_model()
-    impulse_model = cfg.impulse_model()
     tts_engine = create_tts_engine(not args.no_tts, session.character_data.get("tts_voice_id"))
 
     # ── AEC (Acoustic Echo Cancellation) ────────────────────────────────────────
@@ -416,6 +441,7 @@ def main() -> None:
     # ── tool calling ──────────────────────────────────────────────────────────
     _agent_config: agent_loop.AgentConfig | None = None
     _tool_enabled = cfg.tool_enabled() and not args.no_tools
+    _task_manager = task_manager_mod.TaskManager()
     if _tool_enabled:
         _tool_list = cfg.tool_list()
         _tool_timeout = cfg.tool_timeout()
@@ -484,7 +510,7 @@ def main() -> None:
                     return True
         return False
 
-    # ── Bilibili live manager (connection only, impulse drives replies) ────
+    # ── Bilibili live manager (connection only; dialogue planner drives replies) ────
     _bilibili_manager: bilibili_live_mod.BilibiliLiveManager | None = None
     _bilibili_room_id_raw = args.bilibili_room if args.bilibili_room is not None else cfg.bilibili_live_room_id()
     _bilibili_enabled = cfg.bilibili_live_enabled() and _bilibili_room_id_raw > 0
@@ -499,7 +525,7 @@ def main() -> None:
         print(f"  [bilibili] Room {_bilibili_room_id_raw} set but bilibili_live.enabled = false in config")
         _bilibili_enabled = False
 
-    # ── impulse planner ─────────────────────────────────────────────────────
+    # ── dialogue planner ────────────────────────────────────────────────────
     _stt_refine_mode = cfg.stt_refine_mode()
     _stt_refine_inline = _stt_refine_mode == "inline"
     _dialogue = dialogue_mod.DialogueOrchestrator(
@@ -508,8 +534,41 @@ def main() -> None:
         model=dialogue_model,
         memory_backend=memory_backend,
     )
-    _use_impulse = cfg.impulse_enabled() and not args.no_impulse
-    machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_impulse else sm.ProactiveState.DISABLED)
+    _use_proactive = cfg.proactive_enabled() and not args.no_proactive
+    machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_proactive else sm.ProactiveState.DISABLED)
+    _pending_user_turn = {"text": "", "deadline": 0.0, "reason": "endpoint"}
+    _pending_user_lock = threading.Lock()
+
+    def _maybe_flush_user_turn(force: bool = False) -> None:
+        with _pending_user_lock:
+            deadline = float(_pending_user_turn.get("deadline", 0.0) or 0.0)
+            if not force and (not deadline or time.monotonic() < deadline):
+                return
+            text = _pending_user_turn["text"].strip()
+            _pending_user_turn["text"] = ""
+            _pending_user_turn["deadline"] = 0.0
+            _pending_user_turn["reason"] = "endpoint"
+        if not text:
+            return
+        if not cfg.stt_dialogue_pool_enabled():
+            if _stt_subtitle_client:
+                _stt_subtitle_client.clear()
+            display_user(text)
+            _dialogue.cancel_plans()
+            if not machine.emit(sm.SystemEvent.STT_REFINED):
+                return
+            conversation.reset_stream()
+            threading.Thread(
+                target=_handle_conversation,
+                args=(text,),
+                daemon=True,
+            ).start()
+            return
+        threading.Thread(
+            target=_handle_stt_pool_turn,
+            args=(text,),
+            daemon=True,
+        ).start()
     # ── conversation handler (fast path: in STT thread, must not block) ─────
     def on_user_utterance(text: str) -> None:
         if is_probable_tts_echo(text):
@@ -519,11 +578,6 @@ def main() -> None:
             conversation.reset_stream()
             machine.set_stt_state(sm.STTState.LISTENING)
             return
-        if _stt_subtitle_client:
-            _stt_subtitle_client.clear()
-        display_user(text)
-        _dialogue.cancel_plans()
-
         reason = getattr(conversation, 'last_reason', 'endpoint')
         is_overlap = machine.tts_state in (sm.TTSState.STREAMING, sm.TTSState.DRAINING)
 
@@ -544,19 +598,150 @@ def main() -> None:
             machine.emit(sm.SystemEvent.USER_SPEECH_START)
             machine.set_stt_state(sm.STTState.LISTENING)
 
-        if not machine.emit(sm.SystemEvent.STT_REFINED):
-            return
-
-        conversation.reset_stream()
-
-        # Spawn a worker for the heavy work (LLM, TTS) so STT thread stays free
-        threading.Thread(
-            target=_handle_conversation,
-            args=(text,),
-            daemon=True,
-        ).start()
+        with _pending_user_lock:
+            _pending_user_turn["text"] = merge_stt_text(_pending_user_turn["text"], text)
+            _pending_user_turn["reason"] = reason
+            _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
 
     # ── conversation worker (runs in its own thread, may block) ────────────
+    def _handle_stt_pool_turn(pool_text: str) -> None:
+        cancel_event = threading.Event()
+        _current_cancel[0] = cancel_event
+        try:
+            if not machine.emit(sm.SystemEvent.STT_REFINED):
+                with _pending_user_lock:
+                    _pending_user_turn["text"] = merge_stt_text(pool_text, _pending_user_turn["text"])
+                    _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
+                return
+
+            decision = _dialogue.decide_stt_pool_turn(pool_text=pool_text)
+            if cancel_event.is_set():
+                return
+
+            if decision.action == "wait":
+                with _pending_user_lock:
+                    _pending_user_turn["text"] = merge_stt_text(decision.remaining_text or pool_text, _pending_user_turn["text"])
+                    _pending_user_turn["deadline"] = time.monotonic() + max(2.5, stt_turn_deadline_delay(_pending_user_turn["text"]))
+                machine.emit(sm.SystemEvent.LLM_DONE)
+                machine.set_tts_state(sm.TTSState.IDLE)
+                machine.emit(sm.SystemEvent.TTS_DONE)
+                machine.reset_error_count()
+                machine.set_stt_state(sm.STTState.LISTENING)
+                return
+
+            consumed = decision.consumed_text.strip() or pool_text.strip()
+            remaining = decision.remaining_text.strip()
+            if remaining:
+                with _pending_user_lock:
+                    _pending_user_turn["text"] = merge_stt_text(remaining, _pending_user_turn["text"])
+                    _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
+
+            if _stt_subtitle_client:
+                _stt_subtitle_client.clear()
+            display_user(consumed)
+            _dialogue.cancel_plans()
+            machine.emit(sm.SystemEvent.LLM_DONE)
+
+            # ── tool-calling path: route through agent loop ────────────────
+            if _agent_config is not None and consumed:
+                tool_names = [s.get("function", {}).get("name", "?") for s in (_agent_config.tools or [])]
+                print(f"\n  [stt_pool] tool path: {len(tool_names)} tools registered in agent_config")
+                print(f"  [stt_pool] tools: {', '.join(tool_names)}")
+                msg_decision = dialogue_mod.DialogueDecision(
+                    action="speak",
+                    intent=str(decision.notes or "")[:80],
+                )
+                messages = _dialogue.build_reply_messages(
+                    user_text=consumed,
+                    decision=msg_decision,
+                )
+                try:
+                    result, cancelled = chat_stream(
+                        messages, session.character_name, dialogue_model, tts_engine,
+                        cancel_event=cancel_event,
+                        character_config=session.character_config,
+                        agent_config=_agent_config,
+                        usage_callback=token_usage.make_callback(dialogue_model, "stt_pool"),
+                        tool_context=dict(
+                            session=session,
+                            memory_backend=memory_backend,
+                            character_id=session.character_id,
+                            vts_controller=_vts_controller,
+                            vts_arbiter=_vts_arbiter,
+                            event_loop=_vts_loop,
+                            task_manager=_task_manager,
+                        ),
+                        subtitle_client=_subtitle_client,
+                    )
+                except requests.exceptions.ConnectionError:
+                    print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
+                    machine.emit_error("stt_pool_connection")
+                    return
+                except Exception as exc:
+                    print(f"\n[error] stt_pool agent: {type(exc).__name__}: {exc}")
+                    machine.emit_error("stt_pool_agent")
+                    return
+
+                if cancelled:
+                    return
+                reply = dialogue_mod.clean_generated_reply(result, session.character_name)
+                if reply:
+                    remember_tts_text(reply)
+                if tts_engine and reply:
+                    machine.set_tts_state(sm.TTSState.STREAMING)
+                    _tts_say(tts_engine, reply, wait=False)
+                    while tts_engine.is_playing and not cancel_event.is_set():
+                        time.sleep(0.1)
+                    if cancel_event.is_set():
+                        return
+                    if _aec_processor is not None and cfg.aec_auto_reset_on_tts_done():
+                        _aec_processor.reset()
+                    tts_engine.prepare()
+                session.remember(consumed, reply, async_store=True)
+                if portrait_worker:
+                    portrait_worker.submit(consumed, reply)
+                machine.set_tts_state(sm.TTSState.IDLE)
+                machine.emit(sm.SystemEvent.TTS_DONE)
+                machine.reset_error_count()
+                machine.set_stt_state(sm.STTState.LISTENING)
+                if _subtitle_client:
+                    _subtitle_client.clear()
+                return
+
+            # ── legacy path: direct reply from planner ─────────────────────
+            reply = dialogue_mod.clean_generated_reply(decision.reply, session.character_name)
+            if reply:
+                remember_tts_text(reply)
+                print(f"\n{session.character_name}: {reply}")
+            if tts_engine:
+                machine.set_tts_state(sm.TTSState.STREAMING)
+            session.remember(consumed, reply, async_store=True)
+            if portrait_worker:
+                portrait_worker.submit(consumed, reply)
+
+            if tts_engine and reply:
+                _tts_say(tts_engine, reply, wait=False)
+                while tts_engine.is_playing and not cancel_event.is_set():
+                    time.sleep(0.1)
+                if cancel_event.is_set():
+                    return
+                if _aec_processor is not None and cfg.aec_auto_reset_on_tts_done():
+                    _aec_processor.reset()
+                tts_engine.prepare()
+
+            machine.set_tts_state(sm.TTSState.IDLE)
+            machine.emit(sm.SystemEvent.TTS_DONE)
+            machine.reset_error_count()
+            machine.set_stt_state(sm.STTState.LISTENING)
+            if _subtitle_client:
+                _subtitle_client.clear()
+        except Exception as exc:
+            print(f"\n[error] _handle_stt_pool_turn: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            machine.emit_error("_handle_stt_pool_turn")
+        finally:
+            _current_cancel[0] = None
+
     def _handle_conversation(text: str) -> None:
         cancel_event = threading.Event()
         _current_cancel[0] = cancel_event
@@ -670,6 +855,7 @@ def main() -> None:
                     vts_controller=_vts_controller,
                     vts_arbiter=_vts_arbiter,
                     event_loop=_vts_loop,
+                    task_manager=_task_manager,
                 ), subtitle_client=_subtitle_client)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
@@ -686,6 +872,7 @@ def main() -> None:
                 _current_cancel[0] = None
                 return
 
+            reply = dialogue_mod.clean_generated_reply(reply, session.character_name)
             machine.emit(sm.SystemEvent.LLM_DONE)
             if reply:
                 remember_tts_text(reply)
@@ -773,6 +960,7 @@ def main() -> None:
                         vts_controller=_vts_controller,
                         vts_arbiter=_vts_arbiter,
                         event_loop=_vts_loop,
+                        task_manager=_task_manager,
                     ),
                     subtitle_client=_subtitle_client,
                 )
@@ -788,11 +976,10 @@ def main() -> None:
             if cancelled:
                 return
 
+            reply = dialogue_mod.clean_generated_reply(reply, session.character_name)
             if reply:
-                with session._summarize_lock:
-                    session.history.append({"role": "assistant", "content": reply})
-                    if len(session.history) > session.max_history * 2:
-                        session.history[:] = session.history[-session.max_history * 2:]
+                memory_trigger = "【主动对话】" + (decision.topic or decision.intent or "空闲时自然开口")
+                session.remember(memory_trigger, reply, async_store=True)
                 if portrait_worker:
                     portrait_worker.submit("", reply)
 
@@ -813,7 +1000,7 @@ def main() -> None:
                 _subtitle_client.clear()
         finally:
             _current_cancel[0] = None
-            machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_impulse else sm.ProactiveState.DISABLED)
+            machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_proactive else sm.ProactiveState.DISABLED)
 
     _dialogue_executor_stop = threading.Event()
     _dialogue.start_plan_executor(
@@ -824,7 +1011,7 @@ def main() -> None:
     def _dialogue_context_worker() -> None:
         while not machine.is_shutting_down:
             time.sleep(_dialogue.idle_context_interval_seconds)
-            if not _use_impulse:
+            if not _use_proactive:
                 continue
             if not machine.can_start_conversation:
                 continue
@@ -873,6 +1060,10 @@ def main() -> None:
         on_user_utterance=on_user_utterance,
         on_partial=_on_stt_partial,
         sample_rate=stt_mod.SAMPLE_RATE,
+        silence_endpoint_delay=cfg.stt_refine_stable_seconds(),
+        commit_delay=cfg.stt_utterance_commit_seconds(),
+        short_extra_delay=cfg.stt_short_utterance_extra_seconds(),
+        short_max_chars=cfg.stt_short_utterance_max_chars(),
     )
 
     print()
@@ -880,12 +1071,11 @@ def main() -> None:
     print("  Alice CLI")
     print(f"  Character: {session.character_name}")
     print(f"  Dialogue model: {dialogue_model}")
-    print(f"  Impulse model: {impulse_model}")
     print(f"  Microphone: [{device}]")
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
     print(f"  VTS: {_vts_controller is not None}")
-    print(f"  Impulse: {_use_impulse}")
+    print(f"  Proactive dialogue: {_use_proactive}")
     print(f"  Tool calling: {_tool_enabled}")
     print(f"  Screen watch: {screen_watch_enabled}")
     print(f"  Edge page cache: {edge_cache_config.enabled}")
@@ -930,11 +1120,12 @@ def main() -> None:
                     continue
 
                 if _aec_processor is not None:
-                    mono = _aec_processor.process(chunk[:, 0])
+                    mono = stt_mod.denoise(_aec_processor.process(chunk[:, 0]))
                 else:
                     mono = stt_mod.denoise(chunk[:, 0])
 
                 conversation.feed_audio(mono)
+                _maybe_flush_user_turn()
         except Exception as exc:
             print(f"\n[STT error] {exc}")
             traceback.print_exc()
@@ -970,7 +1161,7 @@ def main() -> None:
                 time.sleep(5.0)
                 continue
 
-            # Always update cache (impulse reads from here)
+            # Always update cache; the dialogue planner reads from here.
             sc.put(result)
 
             # Keep this as cache only. DialogueOrchestrator decides whether
@@ -1056,8 +1247,6 @@ def main() -> None:
 
     error_thread = threading.Thread(target=error_recovery_worker, daemon=True)
     error_thread.start()
-
-    # ── first impulse trigger (system is idle, start planning) ────────────
 
     # ── main loop ──────────────────────────────────────────────────────────
     try:
@@ -1350,11 +1539,18 @@ def _run_multi_cli(args):
         for cid, cname, reply in orch.user_turn(text):
             do_turn(cid, cname, reply, prefetch=args.watch if prefetch is None else prefetch)
 
-    def on_user_utterance(text: str) -> None:
-        conversation.reset_stream()
-        if is_probable_tts_echo(text):
-            safe_print("\n  [stt] dropped probable tts echo")
-            machine.set_stt_state(sm.STTState.LISTENING)
+    _pending_user_turn = {"text": "", "deadline": 0.0}
+    _pending_user_lock = threading.Lock()
+
+    def maybe_flush_user_turn(force: bool = False) -> None:
+        with _pending_user_lock:
+            deadline = float(_pending_user_turn.get("deadline", 0.0) or 0.0)
+            if not force and (not deadline or time.monotonic() < deadline):
+                return
+            text = _pending_user_turn["text"].strip()
+            _pending_user_turn["text"] = ""
+            _pending_user_turn["deadline"] = 0.0
+        if not text:
             return
         machine.emit(sm.SystemEvent.STT_REFINED)
         hold_auto_turns(2.0)
@@ -1362,6 +1558,16 @@ def _run_multi_cli(args):
             _aec_processor.reset()
         handle_user_text(text, prefetch=args.watch)
         machine.set_stt_state(sm.STTState.LISTENING)
+
+    def on_user_utterance(text: str) -> None:
+        if is_probable_tts_echo(text):
+            conversation.reset_stream()
+            safe_print("\n  [stt] dropped probable tts echo")
+            machine.set_stt_state(sm.STTState.LISTENING)
+            return
+        with _pending_user_lock:
+            _pending_user_turn["text"] = merge_stt_text(_pending_user_turn["text"], text)
+            _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
 
     def _on_stt_partial(text: str) -> None:
         with io_lock:
@@ -1391,6 +1597,9 @@ def _run_multi_cli(args):
         on_partial=_on_stt_partial,
         sample_rate=stt_mod.SAMPLE_RATE,
         silence_endpoint_delay=cfg.stt_refine_stable_seconds(),
+        commit_delay=cfg.stt_utterance_commit_seconds(),
+        short_extra_delay=cfg.stt_short_utterance_extra_seconds(),
+        short_max_chars=cfg.stt_short_utterance_max_chars(),
     )
 
     # In multi-character voice chat, pausing STT during TTS makes the user
@@ -1424,10 +1633,11 @@ def _run_multi_cli(args):
                     continue
 
                 if _aec_processor is not None:
-                    mono = _aec_processor.process(chunk[:, 0])
+                    mono = stt_mod.denoise(_aec_processor.process(chunk[:, 0]))
                 else:
                     mono = stt_mod.denoise(chunk[:, 0])
                 conversation.feed_audio(mono)
+                maybe_flush_user_turn()
         except Exception as exc:
             safe_print(f"\n[STT error] {exc}")
             traceback.print_exc()

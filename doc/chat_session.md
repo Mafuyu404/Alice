@@ -7,7 +7,8 @@
 - 组装 system prompt
 - 维护历史摘要
 - 注入长期记忆
-- 注入 cognition / emotion
+- 注入 cognition / inner stream
+- 注入 inner stream
 - 在回复后触发记忆写入
 
 ## 输入材料
@@ -16,7 +17,7 @@
 - 最近历史
 - 长期记忆
 - cognition
-- emotion
+- inner stream
 - 屏幕/网页上下文（由调度器决定是否注入）
 
 ## 输出

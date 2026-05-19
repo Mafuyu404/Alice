@@ -122,6 +122,83 @@ VTS_EXPRESSION = {
     },
 }
 
+CLAUDE_CODE_EXEC = {
+    "type": "function",
+    "function": {
+        "name": "claude_code_exec",
+        "description": "调用智能体（Claude Code）执行文件操作、代码编写、文本处理、搜索分析等"
+                       "需要计算机操作的任务。当你意识到用户需要读写文件、整理笔记、搜索或修改代码、"
+                       "或者任何需要操作计算机来完成的事情时使用。调用前先向用户确认你要做什么。"
+                       "任务会在后台执行，你可以用 check_task_progress 查询进度。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "要完成的目标描述，越清晰越好。包含目标、要写入的内容、文件路径、格式要求等具体信息。",
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "工作目录路径，留空使用项目根目录。",
+                },
+            },
+            "required": ["task"],
+        },
+    },
+}
+
+CHECK_TASK_PROGRESS = {
+    "type": "function",
+    "function": {
+        "name": "check_task_progress",
+        "description": "查询正在进行的智能体任务的最新状态和进度。当用户问「好了吗」「还没好吗」「进度如何」"
+                       "时使用。也用于你自己主动检查长时间运行的task是否已完成。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "任务的ID（创建任务时返回的8位ID）。留空则返回所有活跃任务。",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+LIST_ACTIVE_TASKS = {
+    "type": "function",
+    "function": {
+        "name": "list_active_tasks",
+        "description": "列出当前所有活跃（进行中、等待中）的智能体任务。当你想了解自己还有哪些任务在"
+                       "后台运行时使用。",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+}
+
+CANCEL_TASK = {
+    "type": "function",
+    "function": {
+        "name": "cancel_task",
+        "description": "取消一个正在运行或等待中的智能体任务。当用户说「不用了」「取消吧」或者你判断该"
+                       "任务已不再需要时使用。已完成的或已失败的任务不能取消。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "要取消的任务ID。",
+                },
+            },
+            "required": ["task_id"],
+        },
+    },
+}
+
 ALL_TOOLS: list[dict] = [
     LOOK_AT_SCREEN,
     SEARCH_MEMORY,
@@ -129,6 +206,10 @@ ALL_TOOLS: list[dict] = [
     GET_CURRENT_APP,
     SAVE_TO_MEMORY,
     VTS_EXPRESSION,
+    CLAUDE_CODE_EXEC,
+    CHECK_TASK_PROGRESS,
+    LIST_ACTIVE_TASKS,
+    CANCEL_TASK,
 ]
 
 ALL_TOOLS_BY_NAME: dict[str, dict] = {
@@ -142,4 +223,8 @@ DEFAULT_ENABLED_TOOLS: set[str] = {
     "get_current_app",
     "save_to_memory",
     "vts_expression",
+    "claude_code_exec",
+    "check_task_progress",
+    "list_active_tasks",
+    "cancel_task",
 }

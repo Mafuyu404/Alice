@@ -1,4 +1,4 @@
-"""Memory/date event detector for impulse planning context."""
+"""Memory/date event detector for proactive dialogue context."""
 
 from __future__ import annotations
 
@@ -103,8 +103,17 @@ class MemoryEventDetector:
         return time.monotonic() - last >= self.config.cooldown_seconds
 
 
+def _compact_context(context: str, max_chars: int = 600) -> str:
+    if not context:
+        return ""
+    context = context.strip()
+    if len(context) <= max_chars:
+        return context
+    return context[:max_chars] + "\n...（已截断）"
+
+
 def from_config(config: dict, memory_backend: object, user_id: str) -> MemoryEventDetector:
-    section = config.get("impulse", {})
+    section = config.get("proactive_memory", {})
     if not isinstance(section, dict):
         section = {}
 

@@ -25,6 +25,9 @@ from kokoro import scene as scene_mod
 from kokoro import screen_interest
 from kokoro import token_usage
 
+_AGENT_CAPABILITY_CACHE: str = ""
+_AGENT_CAPABILITY_LOCK = threading.Lock()
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +39,42 @@ SUPPORTED_ACTIONS = {
     "observe",
     "cancel_plan",
 }
+
+
+@dataclass
+class STTPoolTurnDecision:
+    action: str = "wait"
+    consumed_text: str = ""
+    remaining_text: str = ""
+    reply: str = ""
+    notes: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict, *, fallback_pool: str = "") -> "STTPoolTurnDecision":
+        action = str(data.get("action", "wait") or "wait").strip().lower()
+        if action not in {"wait", "backchannel", "speak"}:
+            action = "wait"
+        consumed = str(data.get("consumed_text", "") or "").strip()
+        remaining = str(data.get("remaining_text", "") or "").strip()
+        reply = str(data.get("reply", "") or "").strip()
+        if action == "wait":
+            consumed = ""
+            reply = ""
+            remaining = remaining or fallback_pool
+        if action in {"speak", "backchannel"} and not consumed:
+            consumed = fallback_pool.strip()
+            remaining = ""
+        if action in {"speak", "backchannel"} and not reply:
+            action = "wait"
+            remaining = fallback_pool.strip()
+            consumed = ""
+        return cls(
+            action=action,
+            consumed_text=consumed,
+            remaining_text=remaining,
+            reply=reply,
+            notes=str(data.get("notes", "") or "").strip(),
+        )
 
 
 @dataclass
@@ -67,7 +106,7 @@ class DialogueDecision:
             delay = float(data.get("delay_seconds", 0) or 0)
         except (TypeError, ValueError):
             delay = 0.0
-        return cls(
+        result = cls(
             action=action,
             delay_seconds=max(0.0, delay),
             intent=str(data.get("intent", "") or "").strip(),
@@ -77,6 +116,9 @@ class DialogueDecision:
             memory_policy=str(data.get("memory_policy", "normal") or "normal").strip(),
             notes=str(data.get("notes", "") or "").strip(),
         )
+        if result.utterance_mode == "silent" and result.action in {"speak", "backchannel"}:
+            result.action = "silence"
+        return result
 
 
 @dataclass
@@ -105,15 +147,14 @@ class DialogueOrchestrator:
         section = config.get("dialogue", {})
         if not isinstance(section, dict):
             section = {}
-        impulse_section = config.get("impulse", {})
-        if not isinstance(impulse_section, dict):
-            impulse_section = {}
+        proactive_section = config.get("proactive", {})
+        if not isinstance(proactive_section, dict):
+            proactive_section = {}
 
         self.enabled = bool(section.get("enabled", True))
         self.planning_model = str(
             section.get("planning_model")
-            or impulse_section.get("planning_model")
-            or cfg.impulse_model()
+            or proactive_section.get("planning_model")
             or cfg.llm_model()
         )
         self.log_decisions = bool(section.get("log_decisions", True))
@@ -168,6 +209,34 @@ class DialogueOrchestrator:
             )
             if decision.notes:
                 print(f"  [dialogue] notes={decision.notes[:180]}")
+        return decision
+
+    def decide_stt_pool_turn(self, *, pool_text: str, extra_context: str = "") -> STTPoolTurnDecision:
+        """Let the dialogue model decide whether an accumulated STT pool is ready."""
+        pool_text = str(pool_text or "").strip()
+        if not pool_text:
+            return STTPoolTurnDecision(action="wait")
+
+        system_prompt = _stt_pool_system_prompt()
+        user_prompt = self._build_stt_pool_user_prompt(pool_text=pool_text, extra_context=extra_context)
+        try:
+            raw = self._call_planner(system_prompt, user_prompt)
+            data = _extract_json_object(raw)
+            if not data:
+                raise ValueError("stt pool planner did not return JSON object")
+            decision = STTPoolTurnDecision.from_dict(data, fallback_pool=pool_text)
+        except Exception as exc:
+            logger.warning("stt pool dialogue decision failed: %s", exc)
+            decision = STTPoolTurnDecision(action="wait", remaining_text=pool_text, notes=type(exc).__name__)
+
+        if self.log_decisions:
+            print(f"\n  [dialogue-pool] action={decision.action}")
+            if decision.consumed_text:
+                print(f"  [dialogue-pool] consumed={decision.consumed_text[:120]}")
+            if decision.remaining_text:
+                print(f"  [dialogue-pool] remaining={decision.remaining_text[:120]}")
+            if decision.notes:
+                print(f"  [dialogue-pool] notes={decision.notes[:180]}")
         return decision
 
     def add_plan(self, decision: DialogueDecision, created_from: str = "") -> DialoguePlan:
@@ -273,6 +342,12 @@ class DialogueOrchestrator:
             messages.append({"role": "system", "content": cache_context})
         if extra_context:
             messages.append({"role": "system", "content": extra_context})
+        agent_cap = _get_agent_capability_prompt()
+        if agent_cap:
+            messages.append({"role": "system", "content": agent_cap})
+        inner_stream = _safe_context(getattr(self.session, "inner_stream", None))
+        if inner_stream:
+            messages.append({"role": "system", "content": inner_stream})
         messages.extend(_filter_prompt_history(self.session.history[-recent_count:]))
         messages.append({"role": "user", "content": user_text})
         return messages
@@ -376,7 +451,7 @@ class DialogueOrchestrator:
         )
         summary = self.session.summary or "无"
         cognition = _safe_context(getattr(self.session, "cognition", None))
-        emotion = _safe_context(getattr(self.session, "emotion", None))
+        inner_stream = _safe_context(getattr(self.session, "inner_stream", None))
         plans = self._plans_for_prompt()
 
         return prompts.format_prompt(
@@ -393,8 +468,37 @@ class DialogueOrchestrator:
             summary=summary,
             recent_history=recent or "无",
             cognition_context=cognition or "无",
-            emotion_context=emotion or "无",
+            inner_stream_context=inner_stream or "无",
             pending_plans=plans or "无",
+        )
+
+    def _build_stt_pool_user_prompt(self, *, pool_text: str, extra_context: str = "") -> str:
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        recent = _format_history(
+            self.session.history[-self.max_recent_messages:],
+            user_name=getattr(self.session, "user_name", "对方"),
+            character_name=self.session.character_name,
+        )
+        character = self.session.character_data
+        profile_parts = []
+        for key in ("name", "description", "personality", "relationship"):
+            value = str(character.get(key, "") or "").strip()
+            if value:
+                profile_parts.append(f"{key}: {value[:self.max_profile_field_chars]}")
+        profile = "\n\n".join(profile_parts) or "无"
+        cognition = _safe_context(getattr(self.session, "cognition", None)) or "无"
+        inner_stream = _safe_context(getattr(self.session, "inner_stream", None)) or "无"
+        return (
+            f"当前时间：\n{now}\n\n"
+            f"场景：\n这是{self.session.user_name}和{self.session.character_name}的一对一角色对话。"
+            f"STT 池是{self.session.user_name}刚才连续说出的语音识别文本，可能包含半句话、停顿、错字、重复或多个话题。\n\n"
+            f"角色资料：\n{profile}\n\n"
+            f"最近对话：\n{recent or '无'}\n\n"
+            f"认知上下文：\n{cognition}\n\n"
+            f"内在叙事流：\n{inner_stream}\n\n"
+            f"额外上下文：\n{extra_context or '无'}\n\n"
+            f"当前 STT 池：\n{pool_text}\n\n"
+            "请只返回一个 JSON 对象。"
         )
 
     def _cache_overview_for_planner(self) -> str:
@@ -529,6 +633,33 @@ def _safe_context(obj) -> str:
         return ""
 
 
+def _stt_pool_system_prompt() -> str:
+    configured = prompts.get("dialogue_orchestrator.stt_pool_system", "")
+    if configured:
+        return configured
+    return (
+        "你是双人角色对话的同一个 Dialogue LLM。你要一次完成发言时机判断、用户语音池提炼、"
+        "以及目标角色的回复生成。\n"
+        "这不是用户/助手问答，而是两个角色在自然聊天。STT 池可能只是半句话、数字测试、改口、"
+        "口吃、重复或多个话题。没有足够可回应内容时必须 wait，不要礼貌性抢话。\n\n"
+        "输出 JSON 字段：\n"
+        "{\n"
+        '  "action": "wait|backchannel|speak",\n'
+        '  "consumed_text": "本次真正要回应并写入对话历史的用户内容；wait 时为空",\n'
+        '  "remaining_text": "还没有回应、需要留在 STT 池继续等待的文本；没有则为空",\n'
+        '  "reply": "目标角色此刻会直接说出口的话；wait 时为空",\n'
+        '  "notes": "简短判断理由"\n'
+        "}\n\n"
+        "规则：\n"
+        "- 如果 STT 池明显没说完、只是开头、只是短片段、或用户像是在继续组织语言，action=wait。\n"
+        "- 如果 STT 池已经形成可回应内容，action=speak，并生成自然回复。\n"
+        "- 如果只适合轻轻应一声且不会打断后续，action=backchannel；但不要滥用 backchannel。\n"
+        "- consumed_text 必须是对 STT 池的提炼，不要编造池外内容。\n"
+        "- remaining_text 用于保留尚未回应的后半段或不确定片段，避免丢话。\n"
+        "- reply 只写角色会说出口的话，不写动作描写，不提 JSON、调度器、STT。"
+    )
+
+
 def _compact_character_prompt(character: dict, user_name: str, character_name: str) -> str:
     name = character_name
     personality = str(character.get("personality", "") or "").strip()
@@ -538,6 +669,35 @@ def _compact_character_prompt(character: dict, user_name: str, character_name: s
         name=name,
         personality=personality[:900],
     )
+
+
+def clean_generated_reply(text: str, character_name: str = "") -> str:
+    """Remove common roleplay artifacts from generated dialogue text."""
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    names = [character_name, character_name.split("·")[0] if character_name else ""]
+    for name in [n for n in names if n]:
+        cleaned = re.sub(rf"^\s*{re.escape(name)}\s*[：:]\s*", "", cleaned)
+    cleaned = re.sub(r"^\s*(?:台词|回复|回答)\s*[：:]\s*", "", cleaned)
+    lines: list[str] = []
+    action_markers = (
+        "微微", "轻轻", "抬头", "低头", "偏过头", "歪了歪头", "看着", "望着",
+        "沉默", "停了一拍", "没有出声", "目光", "笑了笑",
+    )
+    for raw in cleaned.splitlines():
+        line = raw.strip()
+        if not line:
+            if lines and lines[-1]:
+                lines.append("")
+            continue
+        if line.startswith(("---", "——")) and len(line) <= 6:
+            continue
+        if any(marker in line for marker in action_markers) and not any(ch in line for ch in "？?"):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines).strip()
+    return cleaned
 
 
 def _filter_prompt_history(messages: list[dict]) -> list[dict]:
@@ -566,7 +726,7 @@ def _looks_like_system_design_topic(user_text: str, decision: DialogueDecision) 
         "模型",
         "小模型",
         "planner",
-        "impulse",
+        "proactive",
         "schedule",
         "prompt",
         "llm",
@@ -603,6 +763,30 @@ def _format_history(messages: list[dict], *, user_name: str, character_name: str
     return "\n".join(lines)
 
 
+def _get_agent_capability_prompt() -> str:
+    """Return agent capability prompt if agent tools are enabled."""
+    global _AGENT_CAPABILITY_CACHE
+    with _AGENT_CAPABILITY_LOCK:
+        if _AGENT_CAPABILITY_CACHE != "":
+            return _AGENT_CAPABILITY_CACHE
+
+    section = cfg.get("agent", {})
+    if not isinstance(section, dict) or not section.get("enabled", False):
+        with _AGENT_CAPABILITY_LOCK:
+            _AGENT_CAPABILITY_CACHE = ""
+        return ""
+
+    prompt_text = prompts.get("tool_calling.agent_capability", "")
+    if not prompt_text:
+        return ""
+
+    suffix = prompts.get("tool_calling.system_suffix", "")
+    result = f"{prompt_text}\n\n{suffix}" if suffix else prompt_text
+    with _AGENT_CAPABILITY_LOCK:
+        _AGENT_CAPABILITY_CACHE = result
+    return result
+
+
 def _extract_json_object(text: str) -> dict | None:
     stripped = text.strip()
     if not stripped:
@@ -616,15 +800,28 @@ def _extract_json_object(text: str) -> dict | None:
         value = json.loads(stripped)
         return value if isinstance(value, dict) else None
     except json.JSONDecodeError:
-        pass
+        repaired = _repair_json_object_text(stripped)
+        if repaired:
+            try:
+                value = json.loads(repaired)
+                return value if isinstance(value, dict) else None
+            except json.JSONDecodeError:
+                pass
 
     code_match = re.search(r"```(?:json)?\s*\n?(.*?)```", stripped, re.DOTALL)
     if code_match:
+        block = code_match.group(1).strip()
         try:
-            value = json.loads(code_match.group(1).strip())
+            value = json.loads(block)
             return value if isinstance(value, dict) else None
         except json.JSONDecodeError:
-            pass
+            repaired = _repair_json_object_text(block)
+            if repaired:
+                try:
+                    value = json.loads(repaired)
+                    return value if isinstance(value, dict) else None
+                except json.JSONDecodeError:
+                    pass
 
     start = stripped.find("{")
     if start < 0:
@@ -642,5 +839,32 @@ def _extract_json_object(text: str) -> dict | None:
                     value = json.loads(candidate)
                     return value if isinstance(value, dict) else None
                 except json.JSONDecodeError:
+                    repaired = _repair_json_object_text(candidate)
+                    if repaired:
+                        try:
+                            value = json.loads(repaired)
+                            return value if isinstance(value, dict) else None
+                        except json.JSONDecodeError:
+                            pass
                     return None
     return None
+
+
+def _repair_json_object_text(text: str) -> str:
+    candidate = text.strip()
+    if not candidate:
+        return ""
+    candidate = candidate.replace("\u201c", '"').replace("\u201d", '"')
+    candidate = candidate.replace("\u2018", "'").replace("\u2019", "'")
+    candidate = candidate.replace("\uff1a", ":").replace("\uff0c", ",")
+    candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start >= 0 and end > start:
+        candidate = candidate[start:end + 1]
+    else:
+        return ""
+    if "'" in candidate and '"' not in candidate:
+        candidate = re.sub(r"(?<!\\)'([^'\\]*(?:\\.[^'\\]*)*)'", r'"\1"', candidate)
+    candidate = re.sub(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)', r'\1"\2"\3', candidate)
+    return candidate

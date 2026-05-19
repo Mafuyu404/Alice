@@ -2,7 +2,7 @@
 
 Connects to Bilibili live room via WebSocket, receives danmaku,
 prints each one to console, and stores them in a buffer for the
-impulse planner to consume during live mode.
+proactive dialogue planner to consume during live mode.
 """
 
 from __future__ import annotations
@@ -283,7 +283,7 @@ class BilibiliLiveManager:
     def is_connected(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    # ── public API for impulse planner ───────────────────────────────────
+    # ── public API for proactive dialogue ────────────────────────────────
 
     def drain_danmaku(self) -> list[DanmakuEntry]:
         """Drain and return all buffered danmaku."""
