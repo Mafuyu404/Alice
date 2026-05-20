@@ -257,6 +257,8 @@ auto_reset_on_tts_done = true
 # STT — 语音转文字
 # ===========================================================================
 
+[stt]
+
 # 流式 ASR 模型的存放目录。
 # 类型: string（目录路径）
 # 程序首次运行会自动下载模型到此目录。
@@ -304,18 +306,20 @@ stt_refine_mode = "inline"
 # 太短：用户话没说完就推送，对话不完整。
 # 太长：响应迟钝，需要等待更久。
 # 根据用户说话习惯调整。一般 0.8 ~ 2.0 秒。
-stt_refine_stable_seconds = 0.9
+stt_refine_stable_seconds = 0.6
 
 # STT 端点候选提交等待（秒）。
 # 类型: float
 # 识别到静音端点后不会立刻提交，而是等待一个短窗口。
-# 如果用户继续说话，会合并为同一句，避免“我给你 / 我说 / 给你安装”被拆成多轮。
-stt_utterance_commit_seconds = 0.55
+# 如果用户继续说话，会合并为同一句，避免”我给你 / 我说 / 给你安装”被拆成多轮。
+# 注意: 此值 + stt_refine_stable_seconds 构成端点检测的总等待。
+#       stt_turn_merge_seconds 是 CLI 层额外的小合并窗口。
+stt_utterance_commit_seconds = 0.15
 
 # 短句额外等待时间（秒）。
 # 类型: float
 # 短片段更可能是半句话，提交前额外等待，提升自然对话稳定性。
-stt_short_utterance_extra_seconds = 1.4
+stt_short_utterance_extra_seconds = 0.5
 
 # 触发短句额外等待的最大字符数。
 # 类型: int
@@ -323,15 +327,17 @@ stt_short_utterance_max_chars = 8
 
 # 用户轮次合并窗口（秒）。
 # 类型: float
-# ConversationManager 可能因为识别器状态提前吐出短片段；
-# CLI 会先把多个短片段合并，窗口结束后才真正触发 dialogue。
-stt_turn_merge_seconds = 1.4
+# ConversationManager 端点检测完成并 dispatch 后，CLI 层保留一个短窗口
+# 以便合并紧急打断等场景下连续到达的短片段。
+# 减小此值可减少从说话结束到 AI 响应的延迟。
+# 设为 0.0 则 ConversationManager 检测完毕后立即 dispatch。
+stt_turn_merge_seconds = 0.0
 
 # 是否启用 Dialogue 统一处理 STT 池。
 # 类型: bool (true/false)
 # true: STT 只累积文本；明显停顿后由 Dialogue LLM 一次决定 wait/speak、提炼用户内容并生成回复。
 # false: 使用旧路径，合并窗口结束后直接把文本作为用户输入交给 dialogue。
-stt_dialogue_pool_enabled = true
+stt_dialogue_pool_enabled = false
 
 # 重叠（同时说话）分类模型。
 # 类型: string（Ollama 模型名）
@@ -790,7 +796,7 @@ max_iterations = 5
 
 # 单次工具调用超时（秒）。
 # 类型: float
-tool_timeout = 45.0
+tool_timeout = 180.0
 
 
 # ===========================================================================

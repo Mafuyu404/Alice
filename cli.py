@@ -164,10 +164,15 @@ def merge_stt_text(prev: str, new: str) -> str:
 
 
 def stt_turn_deadline_delay(text: str) -> float:
-    delay = cfg.stt_turn_merge_seconds()
-    if len((text or "").strip()) <= cfg.stt_short_utterance_max_chars():
-        delay += cfg.stt_short_utterance_extra_seconds()
-    return delay
+    # 注意: stt_short_utterance_extra_seconds 已在 ConversationManager._stage_delivery
+    # 中应用过，这里不再重复加。只保留合并窗口即可。
+    return cfg.stt_turn_merge_seconds()
+
+
+def _is_complete_utterance(text: str) -> bool:
+    """简单规则代替 LLM planner 的 wait/speak 判断。"""
+    text = (text or "").strip()
+    return len(text) >= 2
 
 
 def chat_stream(
@@ -181,6 +186,7 @@ def chat_stream(
     tool_context: dict | None = None,
     usage_callback=None,
     subtitle_client=None,
+    trace_t0: float | None = None,
 ) -> tuple[str, bool]:
     """Stream LLM response. Returns (reply_text, was_cancelled)."""
     print(f"\n{char_name}: ", end="", flush=True)
@@ -197,6 +203,8 @@ def chat_stream(
     if agent_config is not None:
         # Tool-calling path: agent loop handles streaming + tools
         t0 = time.perf_counter()
+        if trace_t0 is not None:
+            print(f"\n  [trace] agent_request +{t0 - trace_t0:.2f}s model={model} messages={len(messages)}")
         result = agent_loop.agent_chat(
             messages, model,
             agent_config=agent_config,
@@ -211,16 +219,26 @@ def chat_stream(
         if not result.cancelled:
             print()
             print(f"  [latency] llm_done {time.perf_counter() - t0:.2f}s")
+            if trace_t0 is not None:
+                print(
+                    f"  [trace] agent_done +{time.perf_counter() - trace_t0:.2f}s "
+                    f"reply={len(result.reply)}ch tools={result.tool_calls_made}"
+                )
             if result.tool_calls_made > 0:
                 print(f"  [tool] total tool calls: {result.tool_calls_made}")
         reply = _strip_parens(result.reply)
         if reply and tts_engine and not result.cancelled:
-            tts_engine.end_sentence()
+            try:
+                tts_engine.end_sentence(wait=False)
+            except TypeError:
+                tts_engine.end_sentence()
         return reply, result.cancelled
 
     # Legacy path: plain streaming
     reply = ""
     t0 = time.perf_counter()
+    if trace_t0 is not None:
+        print(f"\n  [trace] llm_request +{t0 - trace_t0:.2f}s model={model} messages={len(messages)}")
     first_token_at = 0.0
     paren_filter = _ParenFilter()
     cancelled = False
@@ -238,6 +256,8 @@ def chat_stream(
         if not first_token_at:
             first_token_at = time.perf_counter()
             print(f"\n  [latency] llm_first_token {first_token_at - t0:.2f}s")
+            if trace_t0 is not None:
+                print(f"  [trace] llm_first_token +{first_token_at - trace_t0:.2f}s")
             print(f"{char_name}: ", end="", flush=True)
         print(content, end="", flush=True)
         reply += content
@@ -253,9 +273,14 @@ def chat_stream(
         print()
     reply = _strip_parens(reply)
     if reply and tts_engine and not cancelled:
-        tts_engine.end_sentence()
+        try:
+            tts_engine.end_sentence(wait=False)
+        except TypeError:
+            tts_engine.end_sentence()
     if not cancelled:
         print(f"  [latency] llm_done {time.perf_counter() - t0:.2f}s")
+        if trace_t0 is not None:
+            print(f"  [trace] llm_done +{time.perf_counter() - trace_t0:.2f}s reply={len(reply)}ch")
     return reply, cancelled
 
 
@@ -316,6 +341,15 @@ def main() -> None:
 
     dialogue_model = args.model or session.character_config.get("llm_model") or cfg.dialogue_model()
     tts_engine = create_tts_engine(not args.no_tts, session.character_data.get("tts_voice_id"))
+
+    # ── TTS warmup: 提前建立 WebSocket 连接，避免第一句的冷启动延迟 ──────────
+    if tts_engine is not None:
+        try:
+            t0 = time.perf_counter()
+            if tts_engine.prepare():
+                print(f"  [tts] websocket ready ({time.perf_counter() - t0:.1f}s)")
+        except Exception as exc:
+            print(f"  [tts] warmup failed: {exc}")
 
     # ── AEC (Acoustic Echo Cancellation) ────────────────────────────────────────
     _aec_processor = None
@@ -538,18 +572,25 @@ def main() -> None:
     machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_proactive else sm.ProactiveState.DISABLED)
     _pending_user_turn = {"text": "", "deadline": 0.0, "reason": "endpoint"}
     _pending_user_lock = threading.Lock()
+    _pool_turn_lock = threading.Lock()  # 防止并发 dispatch 覆盖池数据
 
     def _maybe_flush_user_turn(force: bool = False) -> None:
+        now = time.monotonic()
         with _pending_user_lock:
             deadline = float(_pending_user_turn.get("deadline", 0.0) or 0.0)
-            if not force and (not deadline or time.monotonic() < deadline):
+            if not force and (not deadline or now < deadline):
                 return
             text = _pending_user_turn["text"].strip()
+            reason = str(_pending_user_turn.get("reason", "endpoint") or "endpoint")
             _pending_user_turn["text"] = ""
             _pending_user_turn["deadline"] = 0.0
             _pending_user_turn["reason"] = "endpoint"
         if not text:
             return
+        print(
+            f"\n  [trace] cli_flush force={force} reason={reason} text={len(text)}ch "
+            f"merge_wait={(max(0.0, now - (deadline or now))):.2f}s"
+        )
         if not cfg.stt_dialogue_pool_enabled():
             if _stt_subtitle_client:
                 _stt_subtitle_client.clear()
@@ -601,10 +642,24 @@ def main() -> None:
         with _pending_user_lock:
             _pending_user_turn["text"] = merge_stt_text(_pending_user_turn["text"], text)
             _pending_user_turn["reason"] = reason
-            _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
+            delay = stt_turn_deadline_delay(_pending_user_turn["text"])
+            _pending_user_turn["deadline"] = time.monotonic() + delay
+            print(
+                f"\n  [trace] cli_queue reason={reason} text={len(_pending_user_turn['text'])}ch "
+                f"merge_delay={delay:.2f}s"
+            )
 
     # ── conversation worker (runs in its own thread, may block) ────────────
     def _handle_stt_pool_turn(pool_text: str) -> None:
+        t_dispatch = time.perf_counter()
+        # 防止并发：已有 dispatch 在处理时，新文本直接放回池
+        if not _pool_turn_lock.acquire(blocking=False):
+            with _pending_user_lock:
+                _pending_user_turn["text"] = merge_stt_text(pool_text, _pending_user_turn["text"])
+                if not _pending_user_turn.get("deadline"):
+                    _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
+            return
+
         cancel_event = threading.Event()
         _current_cancel[0] = cancel_event
         try:
@@ -614,14 +669,23 @@ def main() -> None:
                     _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
                 return
 
+            # LLM 一次完成：提取已说完的句子 + 生成回复 + 返回未完成部分
             decision = _dialogue.decide_stt_pool_turn(pool_text=pool_text)
             if cancel_event.is_set():
                 return
 
             if decision.action == "wait":
+                # wait 时不用 LLM 的 remaining（不可靠），直接用原始池文本。
+                # 但如果 LLM 执行期间 on_user_utterance 已合并了新文本，则保留新文本不覆盖。
                 with _pending_user_lock:
-                    _pending_user_turn["text"] = merge_stt_text(decision.remaining_text or pool_text, _pending_user_turn["text"])
-                    _pending_user_turn["deadline"] = time.monotonic() + max(2.5, stt_turn_deadline_delay(_pending_user_turn["text"]))
+                    current_pool = _pending_user_turn["text"]
+                    if current_pool:
+                        # 已有新文本进来，旧 pool_text 已过时，只延 deadline
+                        _pending_user_turn["deadline"] = time.monotonic() + max(2.5, stt_turn_deadline_delay(current_pool))
+                    else:
+                        # 没有新文本，写回继续等
+                        _pending_user_turn["text"] = pool_text
+                        _pending_user_turn["deadline"] = time.monotonic() + max(2.5, stt_turn_deadline_delay(pool_text))
                 machine.emit(sm.SystemEvent.LLM_DONE)
                 machine.set_tts_state(sm.TTSState.IDLE)
                 machine.emit(sm.SystemEvent.TTS_DONE)
@@ -633,8 +697,11 @@ def main() -> None:
             remaining = decision.remaining_text.strip()
             if remaining:
                 with _pending_user_lock:
-                    _pending_user_turn["text"] = merge_stt_text(remaining, _pending_user_turn["text"])
-                    _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
+                    current_pool = _pending_user_turn["text"]
+                    if not current_pool:
+                        # 只有池中无新文本时才写回 remaining
+                        _pending_user_turn["text"] = remaining
+                        _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(remaining)
 
             if _stt_subtitle_client:
                 _stt_subtitle_client.clear()
@@ -642,92 +709,35 @@ def main() -> None:
             _dialogue.cancel_plans()
             machine.emit(sm.SystemEvent.LLM_DONE)
 
-            # ── tool-calling path: route through agent loop ────────────────
-            if _agent_config is not None and consumed:
-                tool_names = [s.get("function", {}).get("name", "?") for s in (_agent_config.tools or [])]
-                print(f"\n  [stt_pool] tool path: {len(tool_names)} tools registered in agent_config")
-                print(f"  [stt_pool] tools: {', '.join(tool_names)}")
-                msg_decision = dialogue_mod.DialogueDecision(
-                    action="speak",
-                    intent=str(decision.notes or "")[:80],
-                )
-                messages = _dialogue.build_reply_messages(
-                    user_text=consumed,
-                    decision=msg_decision,
-                )
-                try:
-                    result, cancelled = chat_stream(
-                        messages, session.character_name, dialogue_model, tts_engine,
-                        cancel_event=cancel_event,
-                        character_config=session.character_config,
-                        agent_config=_agent_config,
-                        usage_callback=token_usage.make_callback(dialogue_model, "stt_pool"),
-                        tool_context=dict(
-                            session=session,
-                            memory_backend=memory_backend,
-                            character_id=session.character_id,
-                            vts_controller=_vts_controller,
-                            vts_arbiter=_vts_arbiter,
-                            event_loop=_vts_loop,
-                            task_manager=_task_manager,
-                        ),
-                        subtitle_client=_subtitle_client,
-                    )
-                except requests.exceptions.ConnectionError:
-                    print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
-                    machine.emit_error("stt_pool_connection")
-                    return
-                except Exception as exc:
-                    print(f"\n[error] stt_pool agent: {type(exc).__name__}: {exc}")
-                    machine.emit_error("stt_pool_agent")
-                    return
-
-                if cancelled:
-                    return
-                reply = dialogue_mod.clean_generated_reply(result, session.character_name)
-                if reply:
-                    remember_tts_text(reply)
-                if tts_engine and reply:
-                    machine.set_tts_state(sm.TTSState.STREAMING)
-                    _tts_say(tts_engine, reply, wait=False)
-                    while tts_engine.is_playing and not cancel_event.is_set():
-                        time.sleep(0.1)
-                    if cancel_event.is_set():
-                        return
-                    if _aec_processor is not None and cfg.aec_auto_reset_on_tts_done():
-                        _aec_processor.reset()
-                    tts_engine.prepare()
-                session.remember(consumed, reply, async_store=True)
-                if portrait_worker:
-                    portrait_worker.submit(consumed, reply)
-                machine.set_tts_state(sm.TTSState.IDLE)
-                machine.emit(sm.SystemEvent.TTS_DONE)
-                machine.reset_error_count()
-                machine.set_stt_state(sm.STTState.LISTENING)
-                if _subtitle_client:
-                    _subtitle_client.clear()
-                return
-
-            # ── legacy path: direct reply from planner ─────────────────────
+            # 直接用 planner 的回复（一次 LLM 调用完成全部，不走第二次 chat_stream）
             reply = dialogue_mod.clean_generated_reply(decision.reply, session.character_name)
+            t_reply_ready = time.perf_counter()
+            print(f"  [trace] llm {t_reply_ready - t_dispatch:.1f}s  text={len(reply or '')}ch")
             if reply:
                 remember_tts_text(reply)
                 print(f"\n{session.character_name}: {reply}")
+            t_text_printed = time.perf_counter()
             if tts_engine:
                 machine.set_tts_state(sm.TTSState.STREAMING)
-            session.remember(consumed, reply, async_store=True)
             if portrait_worker:
                 portrait_worker.submit(consumed, reply)
 
             if tts_engine and reply:
                 _tts_say(tts_engine, reply, wait=False)
+                t_tts_say_done = time.perf_counter()
+                print(f"  [trace] tts_say {t_tts_say_done - t_text_printed:.1f}s")
+                session.remember(consumed, reply, async_store=True)
                 while tts_engine.is_playing and not cancel_event.is_set():
                     time.sleep(0.1)
+                t_play_done = time.perf_counter()
+                print(f"  [trace] tts_play {t_play_done - t_tts_say_done:.1f}s  total {t_play_done - t_dispatch:.1f}s")
                 if cancel_event.is_set():
                     return
                 if _aec_processor is not None and cfg.aec_auto_reset_on_tts_done():
                     _aec_processor.reset()
                 tts_engine.prepare()
+            else:
+                session.remember(consumed, reply, async_store=True)
 
             machine.set_tts_state(sm.TTSState.IDLE)
             machine.emit(sm.SystemEvent.TTS_DONE)
@@ -741,8 +751,11 @@ def main() -> None:
             machine.emit_error("_handle_stt_pool_turn")
         finally:
             _current_cancel[0] = None
+            _pool_turn_lock.release()
 
     def _handle_conversation(text: str) -> None:
+        trace_t0 = time.perf_counter()
+        print(f"\n  [trace] handler_start text={len(text)}ch")
         cancel_event = threading.Event()
         _current_cancel[0] = cancel_event
 
@@ -809,33 +822,15 @@ def main() -> None:
             elif _bilibili_enabled and _bilibili_live_mode:
                 command_context = bilibili_ctx
 
-            event = dialogue_mod.DialogueEvent(
-                type="user_utterance",
-                text=text,
-                source="user",
-                extra_context=command_context or "",
+            # 用户直接说话时跳过 planner，默认 speak
+            decision = dialogue_mod.DialogueDecision(
+                action="speak",
+                intent="回应",
+                utterance_mode="normal",
+                context_use="none",
             )
-            decision = _dialogue.decide(event)
 
-            if decision.action in ("silence", "observe", "cancel_plan"):
-                if decision.action == "cancel_plan":
-                    _dialogue.cancel_plans()
-                _dialogue.record_user_observation(text, decision)
-                machine.emit(sm.SystemEvent.LLM_DONE)
-                machine.set_tts_state(sm.TTSState.IDLE)
-                machine.emit(sm.SystemEvent.TTS_DONE)
-                machine.reset_error_count()
-                return
-
-            if decision.action == "schedule":
-                _dialogue.record_user_observation(text, decision)
-                _dialogue.add_plan(decision, created_from=text)
-                machine.emit(sm.SystemEvent.LLM_DONE)
-                machine.set_tts_state(sm.TTSState.IDLE)
-                machine.emit(sm.SystemEvent.TTS_DONE)
-                machine.reset_error_count()
-                return
-
+            t_build0 = time.perf_counter()
             messages = _dialogue.build_reply_messages(
                 user_text=text,
                 decision=decision,
@@ -846,6 +841,11 @@ def main() -> None:
                 inline_prompt = prompts.get("stt_refine_inline.system", "")
                 if inline_prompt:
                     messages.insert(-1, {"role": "system", "content": inline_prompt})
+            t_build1 = time.perf_counter()
+            print(
+                f"  [trace] prompt_built +{t_build1 - trace_t0:.2f}s "
+                f"build={t_build1 - t_build0:.2f}s messages={len(messages)}"
+            )
 
             try:
                 reply, cancelled = chat_stream(messages, session.character_name, dialogue_model, tts_engine, cancel_event=cancel_event, character_config=session.character_config, agent_config=_agent_config, usage_callback=token_usage.make_callback(dialogue_model, "chat"), tool_context=dict(
@@ -856,7 +856,7 @@ def main() -> None:
                     vts_arbiter=_vts_arbiter,
                     event_loop=_vts_loop,
                     task_manager=_task_manager,
-                ), subtitle_client=_subtitle_client)
+                ), subtitle_client=_subtitle_client, trace_t0=trace_t0)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
                 machine.emit_error("llm_connection")
@@ -874,6 +874,7 @@ def main() -> None:
 
             reply = dialogue_mod.clean_generated_reply(reply, session.character_name)
             machine.emit(sm.SystemEvent.LLM_DONE)
+            print(f"  [trace] reply_clean +{time.perf_counter() - trace_t0:.2f}s reply={len(reply)}ch")
             if reply:
                 remember_tts_text(reply)
 
@@ -885,8 +886,14 @@ def main() -> None:
                 portrait_worker.submit(text, reply)
 
             if tts_engine:
+                t_wait_tts0 = time.perf_counter()
                 while tts_engine.is_playing and not cancel_event.is_set():
                     time.sleep(0.1)
+                t_wait_tts1 = time.perf_counter()
+                print(
+                    f"  [trace] tts_wait +{t_wait_tts1 - trace_t0:.2f}s "
+                    f"wait={t_wait_tts1 - t_wait_tts0:.2f}s"
+                )
                 if cancel_event.is_set():
                     _current_cancel[0] = None
                     return
@@ -1288,6 +1295,15 @@ def main() -> None:
                 pass
         if _vts_loop:
             _vts_loop.call_soon_threadsafe(_vts_loop.stop)
+        # ── Write chat log to file ───────────────────────────────────────────────
+        if session is not None and session.history:
+            try:
+                log_path = session.write_chat_log_to_file()
+                if log_path:
+                    print(f"  [chat_log] saved to {log_path}")
+            except Exception as exc:
+                print(f"  [chat_log] failed: {exc}")
+
         # ── Flush cached memory events to vector store ────────────────────────────
         if session is not None and hasattr(session, 'memory_events') and session.memory_events is not None:
             session.memory_events.flush_all(
@@ -1737,6 +1753,12 @@ def _run_multi_cli(args):
                     clear_prediction()
                     run_auto_turns(n, sleep_between=True)
                     continue
+                if raw == "/save":
+                    for cid, c_session in orch.sessions.items():
+                        path = c_session.write_chat_log_to_file()
+                        if path:
+                            print(f"  [chat log saved] {path}")
+                    continue
                 handle_user_text(raw, prefetch=False)
         except KeyboardInterrupt:
             pass
@@ -1758,6 +1780,14 @@ def _run_multi_cli(args):
             orch.close()
         except Exception:
             pass
+        # ── Write multi-character chat logs ──────────────────────────────────
+        for cid, c_session in getattr(orch, 'sessions', {}).items():
+            try:
+                path = c_session.write_chat_log_to_file()
+                if path:
+                    print(f"  [chat_log] {c_session.character_name} saved to {path}")
+            except Exception as exc:
+                print(f"  [chat_log] {cid} failed: {exc}")
 
 
 

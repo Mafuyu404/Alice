@@ -176,12 +176,12 @@ class ConversationManager:
             user_text=text,
             ai_context=self._ai_context,
         )
+        print(f"\n  [trace] overlap decision={decision} text={text[:40]}")
 
         if decision == "continue":
             return
 
         if decision == "soft_break":
-            self._deliver(text, "overlap:soft_break")
             return
 
         self._deliver(text, "overlap:hard_break")
@@ -214,13 +214,21 @@ class ConversationManager:
 
     def _deliver(self, text: str, reason: str) -> None:
         """Deliver user text to the conversation layer."""
+        now = time.monotonic()
         self._delivered = True
         self._pending_text = ""
         self._pending_ready_at = 0.0
         self._pending_reason = ""
-        self._last_delivery_time = time.monotonic()
+        self._last_delivery_time = now
         self.last_reason = reason
         stripped = text.strip()
+        if stripped:
+            since_partial = (now - self._silence_since) if self._silence_since else 0.0
+            since_voice = (now - self._last_voice_at) if self._last_voice_at else 0.0
+            print(
+                f"\n  [trace] stt_deliver reason={reason} text={len(stripped)}ch "
+                f"since_partial={since_partial:.2f}s since_voice={since_voice:.2f}s"
+            )
         if stripped and self._on_user_utterance:
             self._on_user_utterance(stripped)
         self._reset_after_delivery()
@@ -229,6 +237,15 @@ class ConversationManager:
         stripped = text.strip()
         if not stripped:
             return
+        if self._machine.tts_state in (sm.TTSState.STREAMING, sm.TTSState.DRAINING):
+            decision = self._classifier.classify(
+                user_text=stripped,
+                ai_context=self._ai_context,
+            )
+            print(f"\n  [trace] overlap_endpoint decision={decision} text={stripped[:40]}")
+            if decision != "hard_break":
+                return
+            reason = "overlap:hard_break"
         delay = self._commit_delay
         if len(stripped) <= self._short_max_chars:
             delay += self._short_extra_delay
@@ -238,6 +255,10 @@ class ConversationManager:
         self._pending_text = stripped
         self._pending_reason = reason
         self._pending_ready_at = ready_at
+        print(
+            f"\n  [trace] stt_stage reason={reason} text={len(stripped)}ch "
+            f"commit_delay={delay:.2f}s endpoint_wait={self._silence_endpoint_delay:.2f}s"
+        )
 
     def _maybe_deliver_pending(self, now: float) -> None:
         if self._delivered or not self._pending_text:
