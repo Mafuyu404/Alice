@@ -25,9 +25,9 @@ MINIMAX_MODEL = cfg.minimax_model()
 SAMPLE_RATE = int(cfg.get("minimax_sample_rate", 32000))
 TTS_VOLUME = cfg.tts_volume()
 WS_URL = "wss://api.minimax.io/ws/v1/t2a_v2"
-WS_OPEN_TIMEOUT = 10
+WS_OPEN_TIMEOUT = 3
 WS_CLOSE_TIMEOUT = 1
-TASK_STARTED_TIMEOUT = 10
+TASK_STARTED_TIMEOUT = 3
 FAST_FAIL_TIMEOUT = 1.5
 FAST_FAIL_RESET_SECONDS = 20.0
 FAST_FAIL_AFTER_FAILURES = 2
@@ -381,6 +381,10 @@ class StreamingTTS:
 
     def push(self, text: str) -> None:
         """Accumulate text; send complete sentences when WS is available."""
+        if self._prepare_fail_count >= FAST_FAIL_AFTER_FAILURES and (
+            time.monotonic() - self._last_prepare_fail_at <= FAST_FAIL_RESET_SECONDS
+        ):
+            return
         if text and not self._llm_text_started_at:
             self._llm_text_started_at = time.perf_counter()
         self._buf.append(text)
@@ -410,12 +414,18 @@ class StreamingTTS:
             else:
                 break  # WS down, retry on next push() or end_sentence()
 
-    def end_sentence(self) -> None:
-        """Flush remaining text, then finish the session."""
-        if not self._buf and self._pending_count == 0 and not self._ws_started.is_set():
-            self._session_done = True
+    def end_sentence(self, wait: bool = True) -> None:
+        """Flush remaining text, then wait for audio to complete.
+
+        Keeps the WebSocket alive for reuse on the next utterance,
+        avoiding a 4-5s cold-start reconnect."""
+        if self._prepare_fail_count >= FAST_FAIL_AFTER_FAILURES and (
+            time.monotonic() - self._last_prepare_fail_at <= FAST_FAIL_RESET_SECONDS
+        ):
+            self._buf = []
             return
-        # Keep trying to send remaining text until WS is available and it goes through
+        if not self._buf and self._pending_count == 0 and not self._ws_started.is_set():
+            return
         deadline = time.perf_counter() + 30
         while True:
             remaining = "".join(self._buf).strip()
@@ -436,14 +446,9 @@ class StreamingTTS:
                 break
             time.sleep(0.1)
 
-        # Wait for all pending sentences to finish
-        self._all_done.wait(timeout=30)
-        self._session_done = True
-        if self._ws and self._ws_started.is_set():
-            try:
-                self._ws.send(json.dumps({"event": "task_finish"}))
-            except Exception:
-                pass
+        if wait:
+            # Wait for all pending sentences to finish
+            self._all_done.wait(timeout=30)
 
     def flush(self) -> None:
         self.end_sentence()
@@ -553,7 +558,16 @@ class StreamingTTS:
                     elif event == "task_finished":
                         self._audio_queue.put(None)
                         self._ws_started.clear()
-                        return
+                        with self._pending_lock:
+                            self._pending_count = 0
+                            self._inflight_texts.clear()
+                            self._all_done.set()
+                        # Keep connection alive: start next task immediately
+                        try:
+                            self._ws.send(json.dumps(_task_start(self._voice_id, self._speed)))
+                        except Exception:
+                            break
+                        continue
                     elif event == "task_failed":
                         logger.warning(
                             "MiniMax TTS task_failed: %s",

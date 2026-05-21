@@ -60,6 +60,22 @@ def get(key: str, default: Any = None) -> Any:
     return load().get(key, default)
 
 
+def section_get(section: str, key: str, default: Any = None) -> Any:
+    data = load()
+    section_data = data.get(section, {})
+    if isinstance(section_data, dict) and key in section_data:
+        return section_data[key]
+    if key in data:
+        return data[key]
+    # Compatibility for older config.toml files where STT keys appeared after
+    # [aec] without a new table header.
+    if section == "stt":
+        aec_data = data.get("aec", {})
+        if isinstance(aec_data, dict) and key in aec_data:
+            return aec_data[key]
+    return default
+
+
 def llm_url() -> str:
     return get("llm_url", "http://127.0.0.1:11434")
 
@@ -130,51 +146,51 @@ def user_name() -> str:
 
 
 def stt_refine_model() -> str:
-    return get("stt_refine_model", "qwen2.5:1.5b")
+    return section_get("stt", "stt_refine_model", "qwen2.5:1.5b")
 
 
 def stt_refine_mode() -> str:
-    return get("stt_refine_mode", "separate")
+    return section_get("stt", "stt_refine_mode", "separate")
 
 
 def stt_pause_during_tts() -> bool:
-    return bool(get("stt_pause_during_tts", False))
+    return bool(section_get("stt", "stt_pause_during_tts", False))
 
 
 def stt_refine_stable_seconds() -> float:
-    return float(get("stt_refine_stable_seconds", 1.5))
+    return float(section_get("stt", "stt_refine_stable_seconds", 1.5))
 
 
 def stt_utterance_commit_seconds() -> float:
-    return float(get("stt_utterance_commit_seconds", 0.55))
+    return float(section_get("stt", "stt_utterance_commit_seconds", 0.55))
 
 
 def stt_short_utterance_extra_seconds() -> float:
-    return float(get("stt_short_utterance_extra_seconds", 1.4))
+    return float(section_get("stt", "stt_short_utterance_extra_seconds", 1.4))
 
 
 def stt_short_utterance_max_chars() -> int:
-    return int(get("stt_short_utterance_max_chars", 8))
+    return int(section_get("stt", "stt_short_utterance_max_chars", 8))
 
 
 def stt_turn_merge_seconds() -> float:
-    return float(get("stt_turn_merge_seconds", 1.4))
+    return float(section_get("stt", "stt_turn_merge_seconds", 1.4))
 
 
 def stt_dialogue_pool_enabled() -> bool:
-    return bool(get("stt_dialogue_pool_enabled", True))
+    return bool(section_get("stt", "stt_dialogue_pool_enabled", True))
 
 
 def stt_pool_tick_seconds() -> float:
-    return float(get("stt_pool_tick_seconds", 0.05))
+    return float(section_get("stt", "stt_pool_tick_seconds", 0.05))
 
 
 def stt_refine_max_tokens() -> int:
-    return int(get("stt_refine_max_tokens", 128))
+    return int(section_get("stt", "stt_refine_max_tokens", 128))
 
 
 def stt_skip_short_refine() -> bool:
-    return bool(get("stt_skip_short_refine", True))
+    return bool(section_get("stt", "stt_skip_short_refine", True))
 
 
 def stt_skip_short_refine_max_chars() -> int:
@@ -282,6 +298,15 @@ def tool_timeout() -> float:
     if not isinstance(section, dict):
         return 45.0
     return float(section.get("tool_timeout", 45.0))
+
+
+def tool_router_model() -> str:
+    section = get("tool_calling", {})
+    if isinstance(section, dict):
+        value = str(section.get("router_model", "") or "").strip()
+        if value:
+            return value
+    return ""
 
 
 # ── proactive dialogue ───────────────────────────────────────────────────────

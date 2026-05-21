@@ -21,6 +21,7 @@ from typing import Callable, Optional
 import requests
 
 from kokoro import config as cfg
+from kokoro import agent_guard
 from kokoro import llm_client
 from kokoro.tool_parser import (
     CompletedToolCall,
@@ -163,6 +164,95 @@ def _agent_chat_impl(
     working_messages = list(messages)
     paren_filter = _ParenFilter()
 
+    available_tool_names = [
+        str(t.get("function", {}).get("name") or "")
+        for t in tool_schemas
+        if t.get("function", {}).get("name")
+    ]
+    router_messages = list(working_messages)
+    task_manager = tool_context.get("task_manager")
+    if task_manager is not None and hasattr(task_manager, "list_active"):
+        try:
+            active_tasks = task_manager.list_active()
+        except Exception:
+            active_tasks = []
+        if active_tasks:
+            router_messages.append({
+                "role": "system",
+                "content": (
+                    "【当前正在执行的智能体任务】\n"
+                    + "\n".join(t.to_prompt_line() for t in active_tasks[:5])
+                    + "\n如果用户只是在催促、表达着急、询问好了没有、问为什么有多个任务，"
+                    "应优先调用 check_task_progress，不要重复启动相同任务。"
+                ),
+            })
+    route_model = cfg.tool_router_model() or model
+    route = agent_guard.AgentRouter(
+        model=route_model,
+        api_base_url=api_base_url,
+        api_key=api_key,
+    ).decide(router_messages, available_tool_names)
+    print(
+        f"  [agent-router] call_tool={route.call_tool} "
+        f"tool={route.tool_name or '-'} model={route_model} reason={route.reason or '-'}"
+    )
+    def _execute_routed_tool(route_to_execute: agent_guard.AgentRouteDecision) -> AgentResult:
+        args = dict(route_to_execute.arguments)
+        if route_to_execute.tool_name == "claude_code_exec" and args.get("task"):
+            args["task"] = _enrich_agent_task(str(args["task"]), messages)
+            route_to_execute.task = args["task"]
+        if on_tool_call:
+            on_tool_call(route_to_execute.tool_name, args)
+        print(f"\n  [tool] {route_to_execute.tool_name} {json.dumps(args, ensure_ascii=False)[:240]}")
+        t0 = time.perf_counter()
+        result = registry.execute(route_to_execute.tool_name, args, **tool_context)
+        elapsed = time.perf_counter() - t0
+        print(f"  [tool] {route_to_execute.tool_name} done ({elapsed:.1f}s)")
+        if result:
+            print(f"  [tool] {route_to_execute.tool_name} result={result[:160]}")
+        result_text = str(result)
+        is_pending_result = any(marker in result_text for marker in ("后台处理中", "任务已创建", "pending", "running"))
+        is_failed_result = any(marker in result_text.lower() for marker in ("failed", "失败", "错误", "error", "退出码"))
+        followup_messages = list(messages)
+        followup_messages.append({
+            "role": "system",
+            "content": (
+                "【智能体调用结果】\n"
+                f"你刚刚已经通过自己的智能体能力调用了 {route_to_execute.tool_name}。"
+                "这不是别人替你做事，也不是传话；这是你通过系统拥有的真实电脑操作能力的一部分。"
+                "你应该把它理解为自己能够做的事：决定、执行、等待结果、核对结果，然后对用户负责。\n"
+                f"任务描述：{route_to_execute.task}\n"
+                f"工具返回：{result}\n\n"
+                "请基于这个事实自然回应用户。不要说自己只是传话或让别人去做；"
+                + (
+                    "强约束：工具返回显示任务失败或出错。你必须承认没有完成，并简短说明错误；"
+                    "禁止说已经完成、已经创建、已经保存、弄好了。\n"
+                    if is_failed_result else ""
+                )
+                + (
+                    "强约束：工具只返回了任务已创建/后台处理中，任务还没有完成。"
+                    "你必须说正在做、正在处理或等完成后确认，禁止说已经完成、已经创建、已经保存、弄好了。\n"
+                    if is_pending_result else ""
+                )
+                + "如果工具返回只是任务已创建/后台处理中，就只能说正在处理或正在查看进度；"
+                "不要声称任务已经最终完成，除非工具返回明确说明 completed 或成功结果。"
+            ),
+        })
+        reply, cancelled = _simple_stream(
+            followup_messages,
+            model,
+            cancel_event=cancel_event,
+            tts_engine=tts_engine,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            usage_callback=usage_callback,
+            subtitle_client=subtitle_client,
+        )
+        return AgentResult(reply=reply, cancelled=cancelled, tool_calls_made=1)
+
+    if route.call_tool:
+        return _execute_routed_tool(route)
+
     for iteration in range(max_iter):
         accumulator = ToolCallAccumulator()
         iteration_reply = ""
@@ -212,12 +302,7 @@ def _agent_chat_impl(
                     content = paren_filter.filter(chunk.content)
                     if not content:
                         continue
-                    print(content, end="", flush=True)
                     iteration_reply += content
-                    if tts_engine:
-                        tts_engine.push(content)
-                    if subtitle_client:
-                        subtitle_client.push_text(content, mode="append")
 
                 if chunk.tool_call_deltas:
                     had_tool_calls = True
@@ -237,6 +322,24 @@ def _agent_chat_impl(
             print(f"  [agent] no tool calls (finish={finish_reason}, had_tool_calls={had_tool_calls}, pending={len(pending_completed)})")
             if iteration_reply:
                 print(f"  [agent] text_reply={iteration_reply[:80]}")
+            if total_tool_calls == 0 and iteration_reply:
+                audit = agent_guard.AgentRouter(
+                    model=route_model,
+                    api_base_url=api_base_url,
+                    api_key=api_key,
+                ).audit_reply(working_messages, iteration_reply, total_tool_calls, available_tool_names)
+                print(
+                    f"  [agent-audit] call_tool={audit.call_tool} "
+                    f"tool={audit.tool_name or '-'} reason={audit.reason or '-'}"
+                )
+                if audit.call_tool:
+                    return _execute_routed_tool(audit)
+            if iteration_reply:
+                print(iteration_reply, end="", flush=True)
+                if tts_engine:
+                    tts_engine.push(iteration_reply)
+                if subtitle_client:
+                    subtitle_client.push_text(iteration_reply, mode="append")
             if usage_callback and (total_prompt or total_completion):
                 usage_callback({"prompt_tokens": total_prompt, "completion_tokens": total_completion})
             return AgentResult(reply=final_reply, cancelled=False, tool_calls_made=total_tool_calls)
@@ -284,6 +387,26 @@ def _agent_chat_impl(
     if usage_callback and (total_prompt or total_completion):
         usage_callback({"prompt_tokens": total_prompt, "completion_tokens": total_completion})
     return AgentResult(reply=final_reply, cancelled=False, tool_calls_made=total_tool_calls)
+
+
+def _enrich_agent_task(task: str, messages: list[dict]) -> str:
+    recent = []
+    for msg in messages:
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        speaker = "用户" if role == "user" else "角色"
+        recent.append(f"{speaker}: {content[:800]}")
+    recent_text = "\n".join(recent[-12:])
+    return (
+        f"{task}\n\n"
+        "执行时请参考下面最近对话。如果任务要求写入聊天记录、整理刚才内容、继续处理“这个文件”等，"
+        "必须从这里提取实际内容和目标文件，不要把占位符或函数名当成任务本身。\n"
+        f"【最近对话】\n{recent_text}"
+    )
 
 
 def _simple_stream(

@@ -8,6 +8,7 @@ import os
 import threading
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Callable, Optional
 
 from kokoro import character
@@ -105,6 +106,44 @@ class ChatSession:
 
     def set_memory_counterpart(self, name: str) -> None:
         self.memory_counterpart = str(name or "").strip()
+
+    def write_chat_log_to_file(self, filepath: str | None = None) -> str:
+        """Write the conversation history to a log file and return the path."""
+        if not self.history:
+            logger.info("write_chat_log_to_file: no history to write")
+            return ""
+        if filepath is None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            filepath = os.path.join(log_dir, f"chat-{self.character_id}-{stamp}.log")
+        lines: list[str] = []
+        lines.append(f"# Chat Log — {self.character_name} ({self.character_id})")
+        lines.append(f"# User: {self.user_name}")
+        lines.append(f"# Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        if self.summary:
+            lines.append(f"# Summary: {self.summary}")
+        lines.append("")
+
+        for msg in self.history:
+            role = msg.get("role", "")
+            content = str(msg.get("content", "") or "").strip()
+            if not content:
+                continue
+            # Skip system messages in the log
+            if role in ("system", "tool"):
+                continue
+            speaker = self.character_name if role == "assistant" else self.user_name
+            lines.append(f"{speaker}：{content}")
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            logger.info("chat log written to %s (%d messages)", filepath, len([m for m in self.history if m.get("role") in ("user", "assistant")]))
+        except Exception as exc:
+            logger.warning("failed to write chat log: %s", exc)
+            return ""
+        return filepath
 
     def load_summary(self) -> None:
         if not self.summary_file:
@@ -238,8 +277,12 @@ class ChatSession:
             daemon=True,
         ).start()
 
-        # Inner stream updates synchronously so the next turn immediately sees it.
-        self._eval_inner_stream_async(user_text, assistant_text)
+        # Inner stream is continuity metadata; keep it off the response path.
+        threading.Thread(
+            target=self._eval_inner_stream_async,
+            args=(user_text, assistant_text),
+            daemon=True,
+        ).start()
 
         # Periodic cognition evaluation (every N turns, independent of summary)
         self._cognition_turn_counter += 1

@@ -6,6 +6,7 @@ import asyncio
 import datetime
 import logging
 import os
+from pathlib import Path
 import subprocess
 import threading
 import time
@@ -213,7 +214,6 @@ def _run_claude_code_sync(
     except FileNotFoundError as exc:
         return "", str(exc)
 
-    cmd = [exe, "-p", task]
     env = os.environ.copy()
     if working_dir:
         cwd = working_dir
@@ -221,11 +221,38 @@ def _run_claude_code_sync(
         from pathlib import Path
         cwd = str(Path(__file__).resolve().parent.parent)
 
+    desktop = _windows_desktop_dir()
+    system_prompt = (
+        "你是角色通过系统拥有的真实电脑操作能力，由角色自主决定调用。"
+        "你必须实际改变、检查或验证文件系统/系统状态，不要只描述做法，也不要在没有验证时声称成功。\n"
+        f"运行环境：\n- 操作系统：Windows\n- 项目工作目录：{cwd}\n- 用户桌面目录：{desktop}\n\n"
+        "如果任务提到 Desktop 或桌面，必须使用上面的用户桌面目录。"
+        "完成任务后，必须用真实的文件系统检查或命令输出验证结果。"
+        "最终回答必须包含实际创建/修改/检查的精确路径，以及验证是否通过。"
+        "如果验证失败，明确说失败并给出错误。"
+    )
+    user_prompt = (
+        "现在执行下面这个具体任务。不要复述这些说明，直接执行任务并验证结果。\n\n"
+        f"{task}"
+    )
+
+    cmd = [
+        exe,
+        "--permission-mode", "bypassPermissions",
+        "--no-session-persistence",
+        "--add-dir", str(desktop),
+        "--append-system-prompt", system_prompt,
+        "-p",
+    ]
+
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            input=user_prompt,
             timeout=timeout,
             env=env,
             cwd=cwd,
@@ -234,6 +261,8 @@ def _run_claude_code_sync(
         output = output.strip()
         if result.returncode != 0:
             return output[:3000], f"Claude Code 退出码 {result.returncode}"
+        if _looks_like_noop_claude_output(output):
+            return output[:3000], "Claude Code 没有执行请求的任务"
         return output[:3000], None
     except subprocess.TimeoutExpired:
         return "", f"任务执行超时（{timeout}秒）"
@@ -241,6 +270,22 @@ def _run_claude_code_sync(
         return "", "Claude Code 未安装或不在 PATH 中"
     except Exception as exc:
         return "", f"执行失败：{type(exc).__name__}: {exc}"
+
+
+def _looks_like_noop_claude_output(output: str) -> bool:
+    text = (output or "").strip().lower()
+    if not text:
+        return True
+    noop_markers = (
+        "i'm ready to operate",
+        "i am ready to operate",
+        "what do you need me to do",
+        "ready to help",
+        "我已准备好",
+        "我准备好",
+        "需要我做什么",
+    )
+    return any(marker in text for marker in noop_markers)
 
 
 def _background_worker(
@@ -252,14 +297,18 @@ def _background_worker(
 ) -> None:
     """Run Claude Code in background thread, updating task state."""
     manager.update(task_id, status="running", progress="正在启动 Claude Code...")
+    print(f"  [agent-task] {task_id} running task={task[:120]}")
     try:
         output, error = _run_claude_code_sync(task, working_dir, timeout)
         if error:
             manager.update(task_id, status="failed", error=error, progress="")
+            print(f"  [agent-task] {task_id} failed error={error} output={output[:300]}")
         else:
             manager.update(task_id, status="completed", result=output, progress="已完成")
+            print(f"  [agent-task] {task_id} completed result={output[:300]}")
     except Exception as exc:
         manager.update(task_id, status="failed", error=f"{type(exc).__name__}: {exc}", progress="")
+        print(f"  [agent-task] {task_id} failed exception={type(exc).__name__}: {exc}")
 
 
 def handle_claude_code_exec(arguments: dict, **context) -> str:
@@ -274,6 +323,14 @@ def handle_claude_code_exec(arguments: dict, **context) -> str:
     if task_manager is None:
         return "任务管理系统未初始化。"
 
+    if hasattr(task_manager, "list_active"):
+        active = task_manager.list_active()
+        if active:
+            return (
+                "已有智能体任务正在执行，未启动新的重复任务。\n"
+                + "\n".join(t.to_prompt_line() for t in active[:5])
+            )
+
     task_obj = task_manager.create(description=task)
     task_manager.update(task_obj.id, status="pending", progress="队列中")
 
@@ -286,12 +343,36 @@ def handle_claude_code_exec(arguments: dict, **context) -> str:
     )
     thread.start()
 
+    # Fast failures (CLI argument/auth/permission errors) often happen before
+    # the dialogue model speaks. Surface them immediately instead of returning
+    # a misleading "background task created" message.
+    thread.join(timeout=1.2)
+    current = task_manager.get(task_obj.id)
+    if current is not None and current.is_terminal:
+        return current.to_result()
+
     return (
         f"任务已创建，ID: {task_obj.id}\n"
         f"描述：{task}\n"
         f"正在后台处理中，处理完成后我会告诉你结果。"
         f"你也可以随时问我「好了吗」来查询进度。"
     )
+
+
+def _windows_desktop_dir() -> Path:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+        # CSIDL_DESKTOPDIRECTORY
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buf) == 0:
+            path = Path(buf.value)
+            if path:
+                return path
+    except Exception:
+        pass
+    return Path.home() / "Desktop"
 
 
 def handle_check_task_progress(arguments: dict, **context) -> str:
@@ -309,6 +390,10 @@ def handle_check_task_progress(arguments: dict, **context) -> str:
 
     active = task_manager.list_active()
     if not active:
+        if hasattr(task_manager, "list_all"):
+            recent = sorted(task_manager.list_all(), key=lambda t: t.created_at, reverse=True)[:5]
+            if recent:
+                return "最近的智能体任务：\n" + "\n\n".join(t.to_result() for t in recent)
         return "当前没有进行中的任务。"
     return "进行中的任务：\n" + "\n".join(t.to_prompt_line() for t in active)
 

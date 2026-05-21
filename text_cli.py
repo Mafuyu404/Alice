@@ -118,7 +118,7 @@ def main() -> None:
     print(f"  Store turns: {not args.no_store}")
     print(f"  Cognition eval: {not args.no_cognition}")
     print(f"  File tools: {bool(agent_config)} (write={bool(args.tools and not args.read_only_tools)})")
-    print("  Commands: /exit, /usage")
+    print("  Commands: /exit, /usage, /save")
     print("=" * 50)
 
     input_turns = None
@@ -167,6 +167,15 @@ def main() -> None:
                 transcript.write(f"You: {user_text}\n")
             if user_text in {"/exit", "/quit"}:
                 break
+            if user_text == "/save":
+                path = session.write_chat_log_to_file()
+                if path:
+                    print(f"\n[chat log saved] {path}")
+                    transcript.write(f"[chat log saved] {path}\n\n")
+                else:
+                    print("\n[chat log save failed]")
+                    transcript.write("[chat log save failed]\n\n")
+                continue
             if user_text == "/usage":
                 usage = token_usage.summary()
                 print(usage)
@@ -379,6 +388,14 @@ def _run_multi(args: argparse.Namespace) -> None:
                 usage = token_usage.summary()
                 print(usage)
                 transcript.write(f"```text\n{usage}\n```\n\n")
+                continue
+
+            if raw == "/save":
+                for cid, session_obj in orch.sessions.items():
+                    path = session_obj.write_chat_log_to_file()
+                    if path:
+                        print(f"[chat log saved] {path}")
+                        transcript.write(f"[chat log saved] {path}\n\n")
                 continue
 
             transcript.write(f"{user_name}: {raw}\n")
