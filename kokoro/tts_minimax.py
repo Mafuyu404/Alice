@@ -221,6 +221,7 @@ _SENTENCE_END = re.compile(r"[。！？?!；;，,：:、…~\-]")
 
 _SENTENCE_END = re.compile(r"[\u3002\uff01\uff1f?!\uff1b;\uff0c,\uff1a:\u3001\u2026~\-]")
 
+
 class StreamingTTS:
     """Streaming TTS with persistent WebSocket and automatic reconnect.
 
@@ -233,6 +234,7 @@ class StreamingTTS:
         self._voice_id = _resolve_voice(voice)
         self._speed = float(cfg.get("minimax_tts_speed", 1.0))
         self._buffer_samples = int(SAMPLE_RATE * float(cfg.get("minimax_tts_buffer_seconds", 0.3)))
+        self._write_buffer_samples = int(SAMPLE_RATE * float(cfg.get("minimax_tts_write_buffer_seconds", 0.08)))
         self._buf: list[str] = []
         self._is_playing = False
         self._should_stop = False
@@ -605,6 +607,36 @@ class StreamingTTS:
         stream = self._stream
         if stream is None:
             return
+        write_buf: list[np.ndarray] = []
+        write_buf_samples = 0
+
+        def write_audio(audio: np.ndarray) -> bool:
+            nonlocal write_buf, write_buf_samples
+            if len(audio) == 0:
+                return True
+            write_buf.append(audio)
+            write_buf_samples += len(audio)
+            if write_buf_samples < self._write_buffer_samples:
+                return True
+            return flush_write_buf()
+
+        def flush_write_buf() -> bool:
+            nonlocal write_buf, write_buf_samples
+            if not write_buf:
+                return True
+            chunk = np.concatenate(write_buf) if len(write_buf) > 1 else write_buf[0]
+            write_buf = []
+            write_buf_samples = 0
+            chunk = _apply_volume(chunk)
+            if self.on_audio_frame:
+                self.on_audio_frame(chunk)
+            try:
+                stream.write(chunk)
+                return True
+            except Exception:
+                self._should_stop = True
+                return False
+
         try:
             prebuf: list[np.ndarray] = []
             prebuf_samples = 0
@@ -615,6 +647,8 @@ class StreamingTTS:
                     self._soft_stop = False
                     prebuf = []
                     prebuf_samples = 0
+                    write_buf = []
+                    write_buf_samples = 0
                     started = False
                     with self._state_lock:
                         self._is_playing = False
@@ -624,6 +658,8 @@ class StreamingTTS:
                     audio = self._audio_queue.get(timeout=0.15)
                 except queue.Empty:
                     if started:
+                        if not flush_write_buf():
+                            return
                         with self._state_lock:
                             self._is_playing = False
                     continue
@@ -634,15 +670,13 @@ class StreamingTTS:
                             if self._soft_stop:
                                 self._soft_stop = False
                                 break
-                            chunk = _apply_volume(chunk)
-                            if self.on_audio_frame:
-                                self.on_audio_frame(chunk)
-                            try:
-                                stream.write(chunk)
-                            except Exception:
-                                self._should_stop = True
+                            if not write_audio(chunk):
                                 return
+                        if not flush_write_buf():
+                            return
                         prebuf = []
+                    elif not flush_write_buf():
+                        return
                     started = False
                     prebuf_samples = 0
                     with self._state_lock:
@@ -667,13 +701,7 @@ class StreamingTTS:
                                 self._soft_stop = False
                                 started = False
                                 break
-                            chunk = _apply_volume(chunk)
-                            if self.on_audio_frame:
-                                self.on_audio_frame(chunk)
-                            try:
-                                stream.write(chunk)
-                            except Exception:
-                                self._should_stop = True
+                            if not write_audio(chunk):
                                 return
                         prebuf = []
                     continue
@@ -681,22 +709,19 @@ class StreamingTTS:
                 # -- started is True, play individual chunks --
                 with self._state_lock:
                     self._is_playing = True
-                audio = _apply_volume(audio)
-                if self.on_audio_frame:
-                    self.on_audio_frame(audio)
-                try:
-                    stream.write(audio)
-                except Exception:
-                    self._should_stop = True
+                if not write_audio(audio):
                     return
                 if self._soft_stop:
                     self._soft_stop = False
+                    if not flush_write_buf():
+                        return
                     with self._state_lock:
                         self._is_playing = False
                     started = False
                     prebuf = []
                     prebuf_samples = 0
         finally:
+            flush_write_buf()
             with self._state_lock:
                 self._is_playing = False
 

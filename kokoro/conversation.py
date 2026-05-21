@@ -14,6 +14,7 @@ it calls ``on_user_utterance(text)`` — the CLI layer then handles LLM dispatch
 from __future__ import annotations
 
 import logging
+import re
 import time
 import threading
 from typing import Callable, Optional
@@ -25,6 +26,12 @@ from kokoro import overlap as overlap_mod
 from kokoro import state_machine as sm
 
 logger = logging.getLogger(__name__)
+
+_ECHO_TEXT_RE = re.compile(r"[\s\W_]+", re.UNICODE)
+
+
+def _normalize_echo_text(text: str) -> str:
+    return _ECHO_TEXT_RE.sub("", (text or "").lower())
 
 
 class ConversationManager:
@@ -238,6 +245,10 @@ class ConversationManager:
         if not stripped:
             return
         if self._machine.tts_state in (sm.TTSState.STREAMING, sm.TTSState.DRAINING):
+            if self._is_ai_context_echo(stripped):
+                print(f"\n  [trace] overlap_endpoint dropped_echo text={stripped[:40]}")
+                self._reset_after_delivery()
+                return
             decision = self._classifier.classify(
                 user_text=stripped,
                 ai_context=self._ai_context,
@@ -278,6 +289,18 @@ class ConversationManager:
         self._pending_text = ""
         self._pending_ready_at = 0.0
         self._pending_reason = ""
+
+    def _is_ai_context_echo(self, text: str) -> bool:
+        norm = _normalize_echo_text(text)
+        spoken = _normalize_echo_text(self._ai_context)
+        if len(norm) < 2 or not spoken:
+            return False
+        if len(norm) < 8:
+            return norm == spoken or spoken.startswith(norm) or spoken.endswith(norm)
+        if norm in spoken or spoken in norm:
+            return True
+        overlap = min(len(norm), len(spoken))
+        return overlap >= 6 and (norm[:overlap] == spoken[:overlap] or norm[-overlap:] == spoken[-overlap:])
 
     def _reset_after_delivery(self) -> None:
         """Reset STT stream after a delivery, ready for the next utterance."""

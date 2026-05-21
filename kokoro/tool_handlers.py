@@ -11,6 +11,7 @@ import subprocess
 import threading
 import time
 
+from kokoro import memory as memory_mod
 from kokoro import prompts
 from kokoro import screen_interest
 from kokoro import vision
@@ -52,7 +53,15 @@ def handle_search_memory(arguments: dict, **context) -> str:
 
     character_id = context.get("character_id", "default")
     try:
-        result = memory_backend.get_context(query, user_id=character_id)
+        session = context.get("session")
+        counterpart = getattr(session, "memory_counterpart", "") or getattr(session, "user_name", "")
+        if hasattr(memory_backend, "get_context_multi"):
+            result = memory_backend.get_context_multi(
+                query,
+                memory_mod.context_user_ids(character_id, counterpart),
+            )
+        else:
+            result = memory_backend.get_context(query, user_id=character_id)
     except Exception as exc:
         logger.warning("search_memory failed: %s", exc)
         return f"搜索记忆时出错：{exc}"
@@ -106,15 +115,35 @@ def handle_save_to_memory(arguments: dict, **context) -> str:
 
     importance = arguments.get("importance", "medium")
     character_id = context.get("character_id", "default")
+    session = context.get("session")
+    counterpart = getattr(session, "memory_counterpart", "") or ""
+    user_id = memory_mod.scoped_user_id(character_id, counterpart)
 
     stored = f"[{importance}] {content}"
     try:
-        memory_backend.store(stored, f"重要性: {importance}", user_id=character_id)
+        memory_backend.store(stored, f"重要性: {importance}", user_id=user_id)
     except Exception as exc:
         logger.warning("save_to_memory failed: %s", exc)
         return f"保存记忆时出错：{exc}"
 
     return f"已记住：{content}"
+
+
+def handle_send_qq_message(arguments: dict, **context) -> str:
+    message = str(arguments.get("message") or "").strip()
+    if not message:
+        return "QQ message is empty; nothing was sent."
+    conversation_id = str(arguments.get("conversation_id") or "").strip()
+    reason = str(arguments.get("reason") or "").strip() or "llm_decided"
+    sender = context.get("qq_send_message")
+    if not callable(sender):
+        return "QQ transport is not connected; message was not sent."
+    try:
+        result = sender(message, conversation_id=conversation_id, reason=reason)
+    except Exception as exc:
+        logger.warning("send_qq_message failed: %s", exc)
+        return f"QQ send failed: {type(exc).__name__}: {exc}"
+    return str(result or "QQ send returned no result.")
 
 
 def handle_vts_expression(arguments: dict, **context) -> str:
@@ -300,6 +329,10 @@ def _background_worker(
     print(f"  [agent-task] {task_id} running task={task[:120]}")
     try:
         output, error = _run_claude_code_sync(task, working_dir, timeout)
+        current = manager.get(task_id) if hasattr(manager, "get") else None
+        if current is not None and getattr(current, "status", "") == "cancelled":
+            print(f"  [agent-task] {task_id} cancelled; dropping result")
+            return
         if error:
             manager.update(task_id, status="failed", error=error, progress="")
             print(f"  [agent-task] {task_id} failed error={error} output={output[:300]}")

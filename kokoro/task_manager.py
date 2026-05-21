@@ -108,3 +108,15 @@ class TaskManager:
                     keep[tid] = task
             self._tasks = keep
         return removed
+
+    def cancel_all(self, reason: str = "shutdown") -> int:
+        """Mark every non-terminal task as cancelled."""
+        count = 0
+        with self._lock:
+            for task in self._tasks.values():
+                if task.status in ("pending", "running"):
+                    task.status = "cancelled"
+                    task.progress = reason
+                    task.completed_at = time.time()
+                    count += 1
+        return count

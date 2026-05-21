@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from kokoro import character
+from kokoro import input_events
 from kokoro import memory as memory_mod
 from kokoro import prompts
 from kokoro import scene as scene_mod
@@ -45,6 +46,9 @@ class ChatSession:
     _cognition_turn_counter: int = 0
     # Memory event store (structured event extraction)
     memory_events: object = field(default=None)  # MemoryEventStore
+    input_registry: object = field(default=None)  # InputTypeRegistry
+    event_bus: object = field(default=None)  # InputEventBus
+    inner_stream_loop: object = field(default=None)  # InnerStreamLoop
     # Scene type — determines information source layout and guidance prompt
     _scene: object = field(default=None)  # scene_mod.SceneType | None
     # Config overrides — applied on top of the per-character config.toml
@@ -61,7 +65,7 @@ class ChatSession:
     def __post_init__(self) -> None:
         from kokoro.cognition import CognitionStore
         from kokoro.emotion import EmotionState
-        from kokoro.inner_stream import InnerStream
+        from kokoro.inner_stream import InnerStream, InnerStreamLoop
         from kokoro.memory_events import MemoryEventStore
         if self.cognition is None:
             self.cognition = CognitionStore(self.character_id, self.character_data)
@@ -71,6 +75,22 @@ class ChatSession:
             self.inner_stream = InnerStream(self.character_id, self.character_data)
         if self.memory_events is None:
             self.memory_events = MemoryEventStore(self.memory_backend, self.character_id)
+        if self.input_registry is None:
+            self.input_registry = input_events.default_registry()
+        if self.event_bus is None:
+            self.event_bus = input_events.InputEventBus()
+        if self.inner_stream_loop is None:
+            section = _inner_stream_section()
+            self.inner_stream_loop = InnerStreamLoop(
+                stream=self.inner_stream,
+                context_provider=self._inner_stream_event_context,
+                event_delay_seconds=float(section.get("event_wakeup_delay_seconds", section.get("event_merge_seconds", 2.0)) or 2.0),
+                idle_interval_seconds=float(section.get("idle_interval_seconds", 240.0) or 240.0),
+                time_tick_interval_seconds=float(section.get("time_tick_interval_seconds", 900.0) or 900.0),
+                max_batch=int(section.get("event_max_batch", 16) or 16),
+            )
+            self.event_bus.subscribe(self.inner_stream_loop.submit)
+            self.inner_stream_loop.start()
         if self._scene is None:
             from kokoro import config as _cfg
             self._scene = scene_mod.resolve(_cfg.load())
@@ -277,12 +297,25 @@ class ChatSession:
             daemon=True,
         ).start()
 
-        # Inner stream is continuity metadata; keep it off the response path.
-        threading.Thread(
-            target=self._eval_inner_stream_async,
-            args=(user_text, assistant_text),
-            daemon=True,
-        ).start()
+        if str(user_text or "").startswith("【主动对话】"):
+            self.record_self_action(
+                f"我在没有新的直接发言时主动开口，并说了：{assistant_text}",
+                source="speech_output",
+                action="speak",
+                metadata={"reply": assistant_text, "trigger": user_text},
+            )
+        else:
+            self.record_input_event(
+                user_text,
+                source="speech",
+                metadata={"speaker": self.user_name, "path": "conversation"},
+            )
+            self.record_self_action(
+                f"我刚才选择回应，并说了：{assistant_text}",
+                source="speech_output",
+                action="speak",
+                metadata={"reply": assistant_text},
+            )
 
         # Periodic cognition evaluation (every N turns, independent of summary)
         self._cognition_turn_counter += 1
@@ -379,6 +412,110 @@ class ChatSession:
             )
         except Exception as exc:
             logger.warning("inner stream evaluation failed: %s", exc)
+
+    def record_input_event(
+        self,
+        content: str,
+        *,
+        source: str = "text",
+        event_type: str = "text",
+        metadata: dict | None = None,
+        priority: input_events.InputPriority = "normal",
+        lifetime: input_events.InputLifetime = "session",
+        privacy: input_events.PrivacyMark | dict | None = None,
+    ) -> input_events.InputEvent | None:
+        if not str(content or "").strip():
+            return None
+        try:
+            event = self.input_registry.create(
+                event_type,
+                content,
+                source=source,
+                metadata=metadata or {},
+                privacy=privacy,
+                priority=priority,
+                lifetime=lifetime,
+            )
+            self.event_bus.publish(event)
+            return event
+        except Exception as exc:
+            logger.warning("failed to publish input event: %s", exc)
+            return None
+
+    def record_self_action(
+        self,
+        content: str,
+        *,
+        source: str = "self",
+        action: str = "",
+        metadata: dict | None = None,
+        lifetime: input_events.InputLifetime = "session",
+    ) -> input_events.InputEvent | None:
+        if not str(content or "").strip():
+            return None
+        try:
+            event = input_events.build_self_action_event(
+                content,
+                source=source,
+                action=action,
+                metadata=metadata or {},
+                lifetime=lifetime,
+            )
+            self.event_bus.publish(event)
+            return event
+        except Exception as exc:
+            logger.warning("failed to publish self action event: %s", exc)
+            return None
+
+    def record_dialogue_observation(self, text: str, *, action: str = "silence", reason: str = "") -> None:
+        self.record_input_event(
+            text,
+            source="speech",
+            metadata={"speaker": self.user_name, "path": "dialogue_observation", "decision": action},
+            priority="normal",
+        )
+        content = reason or "我感知到这段话，但判断它更像背景、自言自语或暂时不需要打断当前活动，所以没有立刻回应。"
+        self.record_self_action(
+            content,
+            source="dialogue_orchestrator",
+            action=action,
+            metadata={"decision": action},
+        )
+
+    def flush_inner_stream_events(self) -> None:
+        loop = getattr(self, "inner_stream_loop", None)
+        if loop is not None and hasattr(loop, "flush"):
+            loop.flush()
+
+    def _inner_stream_event_context(self) -> dict:
+        recent = _format_recent_history(
+            self.history[-10:],
+            user_name=self.user_name,
+            character_name=self.character_name,
+        )
+        try:
+            query = " ".join(
+                msg.get("content", "")
+                for msg in self.history[-4:]
+                if isinstance(msg, dict)
+            )[:500]
+            memories = self.memory_backend.get_context_multi(
+                query,
+                memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
+            ) if query else ""
+        except Exception:
+            memories = ""
+        return {
+            "character_name": self.character_name,
+            "user_name": self.user_name,
+            "summary": self.summary or "",
+            "recent_history": recent,
+            "cognition_context": self.cognition.get_context() if self.cognition else "",
+            "emotion_context": self.emotion.get_context() if self.emotion else "",
+            "memory_context": memories or "",
+            "scene_context": self.scene_guidance or "",
+            "activity_context": "",
+        }
 
     def _call_summary_llm(self, existing_summary: str, conversation: str) -> str | None:
         prompt = prompts.format_prompt(
@@ -518,3 +655,10 @@ def store_memory_async(memory_backend: object, user_text: str, assistant_text: s
         args=(user_text, assistant_text, user_id),
         daemon=True,
     ).start()
+
+
+def _inner_stream_section() -> dict:
+    from kokoro import config as cfg
+
+    section = cfg.inner_stream_config()
+    return section if isinstance(section, dict) else {}

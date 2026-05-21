@@ -7,9 +7,13 @@ import argparse
 import html
 import json
 import os
+import pickle
+import re
+import sqlite3
 import threading
 import urllib.parse
 import webbrowser
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from kokoro import config as cfg
@@ -32,7 +36,18 @@ def _character_ids() -> list[str]:
     return sorted(ids) or ["default"]
 
 
+def _viewer_user_ids() -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    user_name = cfg.user_name()
+    for cid in _character_ids():
+        result.append((mem_mod.scoped_user_id(cid, user_name), f"{cid} / {user_name}"))
+        result.append((mem_mod.scoped_user_id(cid), f"{cid} / general"))
+        result.append((cid, f"{cid} / legacy"))
+    return result
+
+
 CHARACTER_IDS = _character_ids()
+VIEWER_USER_IDS = _viewer_user_ids()
 
 
 class MemoryViewerHandler(BaseHTTPRequestHandler):
@@ -53,14 +68,20 @@ class MemoryViewerHandler(BaseHTTPRequestHandler):
 
     def _api_memories(self, parsed) -> None:
         query = urllib.parse.parse_qs(parsed.query)
-        user_id = (query.get("user_id") or [CHARACTER_IDS[0]])[0]
+        default_user_id = VIEWER_USER_IDS[0][0] if VIEWER_USER_IDS else CHARACTER_IDS[0]
+        user_id = (query.get("user_id") or [default_user_id])[0]
         try:
             limit = int((query.get("limit") or ["200"])[0])
         except ValueError:
             limit = 200
         items = BACKEND.list_memories(user_id=user_id, limit=max(1, min(limit, 1000)))
+        fallback = False
+        if not items and not bool(getattr(BACKEND, "ready", False)):
+            items = _list_memories_sqlite_fallback(user_id, max(1, min(limit, 1000)))
+            fallback = bool(items)
         payload = {
-            "ready": bool(getattr(BACKEND, "ready", False)),
+            "ready": bool(getattr(BACKEND, "ready", False)) or fallback,
+            "fallback": fallback,
             "user_id": user_id,
             "count": len(items),
             "items": items,
@@ -77,8 +98,8 @@ class MemoryViewerHandler(BaseHTTPRequestHandler):
 
     def _html(self) -> None:
         options = "\n".join(
-            f'<option value="{html.escape(cid)}">{html.escape(cid)}</option>'
-            for cid in CHARACTER_IDS
+            f'<option value="{html.escape(uid)}">{html.escape(label)}</option>'
+            for uid, label in VIEWER_USER_IDS
         )
         page = f"""<!doctype html>
 <html lang="zh-CN">
@@ -144,7 +165,7 @@ class MemoryViewerHandler(BaseHTTPRequestHandler):
           meta.innerHTML = '<span class="error">记忆后端不可用。请确认 memory_backend = "mem0" 且 mem0 初始化成功。</span>';
           return;
         }}
-        meta.textContent = `${{data.user_id}}：${{data.count}} 条记忆`;
+        meta.textContent = `${{data.user_id}}：${{data.count}} 条记忆${{data.fallback ? '（只读 SQLite fallback）' : ''}}`;
         if (!data.items.length) {{
           list.innerHTML = '<div class="empty">没有记忆。</div>';
           return;
@@ -173,6 +194,43 @@ class MemoryViewerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+def _list_memories_sqlite_fallback(user_id: str, limit: int) -> list[dict]:
+    mem_cfg = CONFIG.get("mem0", {}) if isinstance(CONFIG, dict) else {}
+    embedder = mem_cfg.get("embedder", {}) if isinstance(mem_cfg, dict) else {}
+    provider = embedder.get("provider", "fastembed")
+    model = embedder.get("model", "BAAI/bge-small-zh-v1.5") if provider == "fastembed" else embedder.get("model", "bge-m3:latest")
+    dims = int(embedder.get("embedding_dims", 512 if provider == "fastembed" else 1024))
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(model).replace(":", "_")).strip("._-") or "default"
+    db = Path(__file__).resolve().parent / "mem0_data" / f"{slug}_{dims}d" / "collection" / f"mem0_{slug}_{dims}d" / "storage.sqlite"
+    if not db.exists():
+        return []
+    rows: list[dict] = []
+    try:
+        con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        cur = con.cursor()
+        for point_id, blob in cur.execute("select id, point from points"):
+            try:
+                point = pickle.loads(blob)
+            except Exception:
+                continue
+            payload = getattr(point, "payload", None) or {}
+            if payload.get("user_id") != user_id:
+                continue
+            rows.append({
+                "id": str(point_id),
+                "memory": payload.get("memory") or payload.get("data") or payload.get("text") or "",
+                "created_at": payload.get("created_at", ""),
+                "updated_at": payload.get("updated_at", ""),
+                "score": None,
+                "metadata": {k: v for k, v in payload.items() if k not in {"data", "memory", "text"}},
+            })
+        con.close()
+    except Exception:
+        return []
+    rows.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return rows[:limit]
 
 
 def main() -> None:

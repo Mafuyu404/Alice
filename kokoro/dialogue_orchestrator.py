@@ -283,6 +283,16 @@ class DialogueOrchestrator:
             self.session.cognition.refresh_cache(text, "")
         except Exception:
             pass
+        try:
+            reason = (
+                f"我感知到这段输入，快速反应路径选择了 {decision.action}。"
+                f"{decision.notes or decision.intent or ''}"
+            ).strip()
+            record = getattr(self.session, "record_dialogue_observation", None)
+            if callable(record):
+                record(text, action=decision.action, reason=reason)
+        except Exception:
+            pass
 
     def generator_context(self, decision: DialogueDecision) -> str:
         mode = decision.utterance_mode or decision.action
@@ -453,6 +463,10 @@ class DialogueOrchestrator:
         cognition = _safe_context(getattr(self.session, "cognition", None))
         inner_stream = _safe_context(getattr(self.session, "inner_stream", None))
         plans = self._plans_for_prompt()
+        extra_context = event.extra_context or "无"
+        autonomy_hint = self._autonomy_hint_for_event(event)
+        if autonomy_hint:
+            extra_context = f"{extra_context}\n\n{autonomy_hint}"
 
         return prompts.format_prompt(
             "dialogue_orchestrator.planner_user",
@@ -462,7 +476,7 @@ class DialogueOrchestrator:
             event_type=event.type,
             speaker=event.source,
             event_text=event.text or "空",
-            extra_context=event.extra_context or "无",
+            extra_context=extra_context,
             profile=profile,
             system_prompt=self.session.system_prompt[:self.max_character_prompt_chars] if self.max_character_prompt_chars else "已省略",
             summary=summary,
@@ -471,6 +485,20 @@ class DialogueOrchestrator:
             inner_stream_context=inner_stream or "无",
             pending_plans=plans or "无",
         )
+
+    def _autonomy_hint_for_event(self, event: DialogueEvent) -> str:
+        name = self.session.character_name
+        user_name = self.session.user_name
+        lines = [
+            "【自主性约束】",
+            f"- {user_name}不是场景中心，也不是{name}的调度者；{name}不是在等待指示的助手。",
+            "- 没有新的人类输入时，不要把沉默理由写成“等待对方下一步指示/等待对方开口”。",
+            "- 如果没有值得说的新内容，可以选择 observe 或 silence，但理由应来自角色自己的注意力、兴趣、疲惫、整理思绪、旁听群聊、观察环境或克制，而不是服务式等待。",
+            "- 如果内在叙事流、QQ环境、屏幕/网页缓存或时间变化里出现她真正感兴趣的东西，她可以主动开口；否则安静做自己的事。",
+        ]
+        if event.type == "context_cache":
+            lines.append("- 当前是空闲/缓存事件，不是对方在召唤她，也不是要求她汇报。")
+        return "\n".join(lines)
 
     def _build_stt_pool_user_prompt(self, *, pool_text: str, extra_context: str = "") -> str:
         now = time.strftime("%Y-%m-%d %H:%M:%S")

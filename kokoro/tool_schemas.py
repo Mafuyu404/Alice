@@ -87,6 +87,37 @@ SAVE_TO_MEMORY = {
     },
 }
 
+SEND_QQ_MESSAGE = {
+    "type": "function",
+    "function": {
+        "name": "send_qq_message",
+        "description": (
+            "Send one message through the connected QQ transport as the character. "
+            "Use only when the character herself decides this is the right action in the current scene, "
+            "for example she wants to participate in QQ, reply to a QQ context, or carry out a QQ-side social action. "
+            "Do not use for ordinary spoken replies."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The exact text to send to QQ, with no action narration.",
+                },
+                "conversation_id": {
+                    "type": "string",
+                    "description": "Optional target such as group:123 or private:456. Leave empty to use the most recent QQ conversation.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief private reason for why sending now is natural.",
+                },
+            },
+            "required": ["message"],
+        },
+    },
+}
+
 VTS_EXPRESSION = {
     "type": "function",
     "function": {
@@ -205,6 +236,7 @@ ALL_TOOLS: list[dict] = [
     GET_CURRENT_TIME,
     GET_CURRENT_APP,
     SAVE_TO_MEMORY,
+    SEND_QQ_MESSAGE,
     VTS_EXPRESSION,
     CLAUDE_CODE_EXEC,
     CHECK_TASK_PROGRESS,
@@ -222,6 +254,7 @@ DEFAULT_ENABLED_TOOLS: set[str] = {
     "get_current_time",
     "get_current_app",
     "save_to_memory",
+    "send_qq_message",
     "vts_expression",
     "claude_code_exec",
     "check_task_progress",

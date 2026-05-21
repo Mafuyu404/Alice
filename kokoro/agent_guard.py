@@ -15,6 +15,13 @@ from kokoro import token_usage
 logger = logging.getLogger(__name__)
 
 
+def _looks_like_qq_message_request(text: str) -> bool:
+    compact = re.sub(r"[\s\W_]+", "", text or "").lower()
+    if "qq" not in compact and "q" not in compact:
+        return False
+    return any(marker in text for marker in ("消息", "群", "聊天", "看", "收到", "发"))
+
+
 def _text(message: dict) -> str:
     return str(message.get("content") or "").strip()
 
@@ -83,7 +90,10 @@ class AgentRouter:
     def decide(self, messages: list[dict], available_tools: list[str]) -> AgentRouteDecision:
         if not self._model:
             return AgentRouteDecision(reason="no_router_model")
-        return self._decide_from_prompt(self._build_prompt(messages, available_tools), available_tools, "invalid_json")
+        tools = available_tools
+        if _looks_like_qq_message_request(_recent_dialogue(messages)) and "send_qq_message" in available_tools:
+            tools = ["send_qq_message"]
+        return self._decide_from_prompt(self._build_prompt(messages, tools), tools, "invalid_json")
 
     def audit_reply(
         self,
@@ -94,18 +104,21 @@ class AgentRouter:
     ) -> AgentRouteDecision:
         if not self._model:
             return AgentRouteDecision(reason="no_router_model")
+        tools = available_tools
+        if _looks_like_qq_message_request(_recent_dialogue(messages)) and "send_qq_message" in available_tools:
+            tools = ["send_qq_message"]
         prompt = (
             "你是工具完整性审核器。只输出 JSON，不要回答用户。\n"
             "如果最新用户要求真实电脑/文件操作，而候选回复在没有真实工具结果时声称已经完成，返回 call_tool=true。\n"
             "如果候选回复是在询问或声明已有后台任务状态，优先使用 check_task_progress，不要重新启动 claude_code_exec。\n"
             "JSON 格式：{\"call_tool\": boolean, \"tool_name\": string, \"arguments\": object, \"reason\": string}。\n\n"
-            f"可用工具：{', '.join(available_tools)}\n"
+            f"可用工具：{', '.join(tools)}\n"
             f"最近对话：\n{_recent_dialogue(messages)}\n\n"
             f"tool_calls_made: {tool_calls_made}\n"
             f"候选回复：{reply}\n"
             "JSON："
         )
-        return self._decide_from_prompt(prompt, available_tools, "audit_invalid_json")
+        return self._decide_from_prompt(prompt, tools, "audit_invalid_json")
 
     def _decision_from_json(self, data: dict[str, Any], available_tools: list[str]) -> AgentRouteDecision:
         call_tool = bool(data.get("call_tool", False))

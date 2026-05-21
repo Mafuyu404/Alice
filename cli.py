@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import sys
@@ -32,6 +33,7 @@ from kokoro import memory_events
 from kokoro import memory as mem_mod
 from kokoro import multi_chat as multi_chat_mod
 from kokoro import portrait_controller
+from kokoro import qq_input
 from kokoro import screen_interest
 from kokoro import scene as scene_mod
 from kokoro import state_machine as sm
@@ -130,6 +132,9 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no-proactive", action="store_true", help="Disable proactive dialogue")
     parser.add_argument("--no-screen-watch", action="store_true", help="Disable screen context watcher")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
+    parser.add_argument("--qq", action="store_true", help="Enable local QQ input WebSocket server for qq_client.py")
+    parser.add_argument("--qq-host", default=None, help="Local QQ input server host")
+    parser.add_argument("--qq-port", type=int, default=None, help="Local QQ input server port")
     parser.add_argument("--bilibili-room", type=int, default=None, help="Bilibili live room ID (overrides config)")
     parser.add_argument("--multi", default=None, help="Multi-character mode: comma-separated IDs, e.g. 'alice,penglai'")
     parser.add_argument("--auto", type=int, default=5, help="Auto rounds before interactive in --multi mode")
@@ -166,13 +171,29 @@ def merge_stt_text(prev: str, new: str) -> str:
 def stt_turn_deadline_delay(text: str) -> float:
     # 注意: stt_short_utterance_extra_seconds 已在 ConversationManager._stage_delivery
     # 中应用过，这里不再重复加。只保留合并窗口即可。
-    return cfg.stt_turn_merge_seconds()
+    stripped = (text or "").strip()
+    base = cfg.stt_turn_merge_seconds()
+    if len(stripped) <= 4 and not re.search(r"[。！？!?吗呢吧呀么]$", stripped):
+        return max(base, 1.2)
+    return base
 
 
 def _is_complete_utterance(text: str) -> bool:
     """简单规则代替 LLM planner 的 wait/speak 判断。"""
     text = (text or "").strip()
     return len(text) >= 2
+
+
+def _looks_like_qq_message_request(text: str) -> bool:
+    raw = text or ""
+    compact = _normalize_echo_text(raw)
+    if "qq" not in compact and "q" not in compact:
+        return False
+    return any(marker in raw for marker in ("消息", "群", "聊天", "看", "收到", "发"))
+
+
+def _qq_runtime_boundary_reply() -> str:
+    return "QQ 消息流还没接上，我现在不能真的发到群里。"
 
 
 def chat_stream(
@@ -542,6 +563,12 @@ def main() -> None:
                     continue
                 if norm in spoken or spoken in norm:
                     return True
+                overlap = min(len(norm), len(spoken))
+                if overlap >= 6 and (
+                    norm[:overlap] == spoken[:overlap]
+                    or norm[-overlap:] == spoken[-overlap:]
+                ):
+                    return True
         return False
 
     # ── Bilibili live manager ──────────────────────────────────────────────
@@ -568,6 +595,19 @@ def main() -> None:
         model=dialogue_model,
         memory_backend=memory_backend,
     )
+    qq_section = CONFIG.get("qq", {})
+    if not isinstance(qq_section, dict):
+        qq_section = {}
+    _qq_enabled = bool(args.qq or qq_section.get("enabled", False))
+    _qq_host = args.qq_host or str(qq_section.get("alice_host") or "127.0.0.1")
+    _qq_port = int(args.qq_port or qq_section.get("alice_port") or 58901)
+    _qq_runtime = qq_input.QQInputRuntime(
+        session=session,
+        model=str(qq_section.get("participation_model", "") or "").strip() or None,
+        config=qq_section,
+    ) if _qq_enabled else None
+    _qq_server_stop: threading.Event | None = threading.Event() if _qq_enabled else None
+    _qq_tool_sender: list[callable | None] = [None]
     _use_proactive = cfg.proactive_enabled() and not args.no_proactive
     machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_proactive else sm.ProactiveState.DISABLED)
     _pending_user_turn = {"text": "", "deadline": 0.0, "reason": "endpoint"}
@@ -760,6 +800,24 @@ def main() -> None:
         _current_cancel[0] = cancel_event
 
         try:
+            if _looks_like_qq_message_request(text):
+                reply = _qq_runtime_boundary_reply()
+                print(f"\n{session.character_name}: {reply}")
+                remember_tts_text(reply)
+                if tts_engine:
+                    machine.set_tts_state(sm.TTSState.STREAMING)
+                    _tts_say(tts_engine, reply, wait=False)
+                    while tts_engine.is_playing and not cancel_event.is_set():
+                        time.sleep(0.1)
+                    if _aec_processor is not None and cfg.aec_auto_reset_on_tts_done():
+                        _aec_processor.reset()
+                    tts_engine.prepare()
+                session.remember(text, reply, async_store=True)
+                machine.set_tts_state(sm.TTSState.IDLE)
+                machine.emit(sm.SystemEvent.TTS_DONE)
+                machine.reset_error_count()
+                return
+
             command_context = ""
             if not _tool_enabled:
                 command = user_commands.detect(text)
@@ -856,6 +914,7 @@ def main() -> None:
                     vts_arbiter=_vts_arbiter,
                     event_loop=_vts_loop,
                     task_manager=_task_manager,
+                    qq_send_message=_qq_tool_sender[0],
                 ), subtitle_client=_subtitle_client, trace_t0=trace_t0)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
@@ -968,6 +1027,7 @@ def main() -> None:
                         vts_arbiter=_vts_arbiter,
                         event_loop=_vts_loop,
                         task_manager=_task_manager,
+                        qq_send_message=_qq_tool_sender[0],
                     ),
                     subtitle_client=_subtitle_client,
                 )
@@ -1009,11 +1069,159 @@ def main() -> None:
             _current_cancel[0] = None
             machine.set_proactive_state(sm.ProactiveState.ACCRUING if _use_proactive else sm.ProactiveState.DISABLED)
 
+    def _start_qq_input_server() -> threading.Thread | None:
+        if not _qq_enabled or _qq_runtime is None or _qq_server_stop is None:
+            return None
+
+        def _run_server() -> None:
+            async def _serve() -> None:
+                from websockets.asyncio.server import serve
+
+                clients: set = set()
+                loop = asyncio.get_running_loop()
+                poll_lock = threading.Lock()
+
+                async def _send_action(ws, action: str, params: dict) -> None:
+                    await ws.send(json.dumps({"action": action, "params": params}, ensure_ascii=False))
+
+                def _send_qq_message_from_llm(
+                    message: str,
+                    *,
+                    conversation_id: str = "",
+                    reason: str = "llm_decided",
+                ) -> str:
+                    target_id = (conversation_id or "").strip()
+                    if not target_id:
+                        target_id = _qq_runtime.recent_conversation_id()
+                    if not target_id:
+                        return "QQ send failed: no recent QQ conversation is available."
+
+                    params = {"message": message}
+                    if target_id.startswith("group:"):
+                        params["message_type"] = "group"
+                        params["group_id"] = target_id.split(":", 1)[1]
+                    elif target_id.startswith("private:"):
+                        params["message_type"] = "private"
+                        params["user_id"] = target_id.split(":", 1)[1]
+                    else:
+                        return f"QQ send failed: unknown conversation_id {target_id!r}."
+
+                    decision = qq_input.QQParticipationDecision(
+                        action="say",
+                        conversation_id=target_id,
+                        message=message,
+                        reason=reason,
+                    )
+                    future = asyncio.run_coroutine_threadsafe(_send_action(ws, "send_msg", params), loop)
+                    try:
+                        future.result(timeout=5)
+                    except Exception as exc:
+                        return f"QQ send failed: {type(exc).__name__}: {exc}"
+                    _qq_runtime.record_sent(decision, nickname=session.character_name)
+                    print(f"\n[qq] tool say {target_id}: {message[:80]}")
+                    return f"QQ message sent to {target_id}: {message}"
+
+                def _poll_and_maybe_send(ws) -> None:
+                    if not poll_lock.acquire(blocking=False):
+                        return
+                    try:
+                        try:
+                            decision = _qq_runtime.poll()
+                        except Exception as exc:
+                            print(f"\n[qq] poll failed: {type(exc).__name__}: {exc}")
+                            return
+                        if decision.action != "say":
+                            if decision.reason:
+                                print(f"\n[qq] silent: {decision.reason}")
+                            return
+                        params = {"message": decision.message}
+                        if decision.conversation_id.startswith("group:"):
+                            params["message_type"] = "group"
+                            params["group_id"] = decision.conversation_id.split(":", 1)[1]
+                        elif decision.conversation_id.startswith("private:"):
+                            params["message_type"] = "private"
+                            params["user_id"] = decision.conversation_id.split(":", 1)[1]
+                        else:
+                            print(f"\n[qq] unknown conversation id: {decision.conversation_id}")
+                            return
+
+                        future = asyncio.run_coroutine_threadsafe(_send_action(ws, "send_msg", params), loop)
+
+                        def _log_send_result(done) -> None:
+                            try:
+                                done.result()
+                            except Exception as exc:
+                                print(f"\n[qq] send action failed: {type(exc).__name__}: {exc}")
+                                return
+                            _qq_runtime.record_sent(decision, nickname=session.character_name)
+                            print(f"\n[qq] say {decision.conversation_id}: {decision.message[:80]}")
+
+                        future.add_done_callback(_log_send_result)
+                    finally:
+                        poll_lock.release()
+
+                async def handler(ws) -> None:
+                    clients.add(ws)
+                    _qq_tool_sender[0] = _send_qq_message_from_llm
+                    print(f"\n[qq] transport connected: {ws.remote_address}")
+                    stop_client = asyncio.Event()
+
+                    async def periodic_poll() -> None:
+                        interval = max(0.5, min(2.0, float(getattr(_qq_runtime, "batch_quiet_seconds", 4.0)) / 2.0))
+                        while not stop_client.is_set() and not _qq_server_stop.is_set():
+                            await asyncio.sleep(interval)
+                            if stop_client.is_set() or _qq_server_stop.is_set():
+                                break
+                            threading.Thread(target=_poll_and_maybe_send, args=(ws,), daemon=True).start()
+
+                    poll_task = asyncio.create_task(periodic_poll())
+                    try:
+                        async for raw in ws:
+                            try:
+                                payload = json.loads(raw)
+                            except json.JSONDecodeError:
+                                continue
+                            event = payload.get("event") if isinstance(payload, dict) else None
+                            if not isinstance(event, dict):
+                                continue
+                            message = _qq_runtime.ingest_onebot_event(event)
+                            if message is not None:
+                                print(f"\n[qq] {message.conversation_id} {message.nickname}: {message.content[:80]}")
+                            threading.Thread(target=_poll_and_maybe_send, args=(ws,), daemon=True).start()
+                    finally:
+                        stop_client.set()
+                        poll_task.cancel()
+                        try:
+                            await poll_task
+                        except asyncio.CancelledError:
+                            pass
+                        clients.discard(ws)
+                        if not clients:
+                            _qq_tool_sender[0] = None
+                        print("\n[qq] transport disconnected")
+
+                async with serve(handler, _qq_host, _qq_port):
+                    print(f"  [qq] input server: ws://{_qq_host}:{_qq_port}")
+                    while not _qq_server_stop.is_set():
+                        await asyncio.sleep(0.2)
+                    for ws in list(clients):
+                        await ws.close()
+
+            try:
+                asyncio.run(_serve())
+            except Exception as exc:
+                print(f"\n[qq] input server stopped: {type(exc).__name__}: {exc}")
+
+        thread = threading.Thread(target=_run_server, daemon=True)
+        thread.start()
+        return thread
+
     _dialogue_executor_stop = threading.Event()
     _dialogue.start_plan_executor(
         execute_fn=_execute_dialogue_plan,
         cancel_event=_dialogue_executor_stop,
     )
+    _qq_server_thread = _start_qq_input_server()
 
     def _dialogue_context_worker() -> None:
         while not machine.is_shutting_down:
@@ -1263,8 +1471,19 @@ def main() -> None:
         print("\n\n[cli] Stopping...")
     finally:
         machine.emit(sm.SystemEvent.SHUTDOWN)
+        cancel = _current_cancel[0]
+        if cancel:
+            cancel.set()
+        if hasattr(_task_manager, "cancel_all"):
+            cancelled_count = _task_manager.cancel_all("shutdown")
+            if cancelled_count:
+                print(f"  [agent-task] cancelled {cancelled_count} active task(s)")
         if _bilibili_manager is not None:
             _bilibili_manager.stop()
+        if _qq_server_stop is not None:
+            _qq_server_stop.set()
+        if _qq_server_thread is not None:
+            _qq_server_thread.join(timeout=2)
         print()
         print(token_usage.summary())
         if portrait_worker:
