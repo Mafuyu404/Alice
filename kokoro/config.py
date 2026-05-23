@@ -325,6 +325,20 @@ def inner_stream_config() -> dict:
     return section
 
 
+def inner_stream_search_config() -> dict:
+    section = get("inner_stream_search", {})
+    if not isinstance(section, dict):
+        section = {}
+    return section
+
+
+def inner_memory_config() -> dict:
+    section = get("inner_memory", {})
+    if not isinstance(section, dict):
+        section = {}
+    return section
+
+
 # ── bilibili_live ────────────────────────────────────────────────────────────
 
 def bilibili_live_enabled() -> bool:

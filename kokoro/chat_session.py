@@ -80,6 +80,33 @@ class ChatSession:
         if self.event_bus is None:
             self.event_bus = input_events.InputEventBus()
         if self.inner_stream_loop is None:
+            from kokoro import config as _cfg
+            search_section = _cfg.inner_stream_search_config()
+            search_impulse = None
+            if bool(search_section.get("enabled", False)):
+                try:
+                    from kokoro.web_search_impulse import InnerStreamSearchImpulse
+                    search_impulse = InnerStreamSearchImpulse(
+                        character_name=self.character_name,
+                        user_name=self.user_name,
+                        event_callback=self._record_inner_stream_search_event,
+                        section=search_section,
+                    )
+                except Exception as exc:
+                    logger.warning("failed to initialize inner stream search impulse: %s", exc)
+            output_handlers = []
+            memory_section = _cfg.inner_memory_config()
+            if bool(memory_section.get("enabled", True)):
+                try:
+                    from kokoro.inner_memory_reflection import InnerMemoryReflection
+                    output_handlers.append(
+                        InnerMemoryReflection(
+                            session=self,
+                            section=memory_section,
+                        ).consider
+                    )
+                except Exception as exc:
+                    logger.warning("failed to initialize inner memory reflection: %s", exc)
             section = _inner_stream_section()
             self.inner_stream_loop = InnerStreamLoop(
                 stream=self.inner_stream,
@@ -88,6 +115,8 @@ class ChatSession:
                 idle_interval_seconds=float(section.get("idle_interval_seconds", 240.0) or 240.0),
                 time_tick_interval_seconds=float(section.get("time_tick_interval_seconds", 900.0) or 900.0),
                 max_batch=int(section.get("event_max_batch", 16) or 16),
+                search_impulse=search_impulse,
+                output_handlers=output_handlers,
             )
             self.event_bus.subscribe(self.inner_stream_loop.submit)
             self.inner_stream_loop.start()
@@ -466,6 +495,30 @@ class ChatSession:
         except Exception as exc:
             logger.warning("failed to publish self action event: %s", exc)
             return None
+
+    def _record_inner_stream_search_event(
+        self,
+        content: str,
+        source: str,
+        metadata: dict | None = None,
+    ) -> None:
+        action = str((metadata or {}).get("action") or "web_search")
+        if action == "web_search_intent":
+            self.record_self_action(
+                content,
+                source=source,
+                action=action,
+                metadata=metadata or {},
+            )
+            return
+        self.record_input_event(
+            content,
+            source=source,
+            event_type="web_search",
+            metadata=metadata or {},
+            priority="normal",
+            lifetime="session",
+        )
 
     def record_dialogue_observation(self, text: str, *, action: str = "silence", reason: str = "") -> None:
         self.record_input_event(

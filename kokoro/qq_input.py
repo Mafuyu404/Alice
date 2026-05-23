@@ -176,11 +176,11 @@ class QQEnvironment:
                 return None
             return state.build_packet(max_lines=self.packet_max_lines)
 
-    def publish_packet(self, packet: QQContextPacket, *, priority: input_events.InputPriority = "normal") -> None:
+    def publish_packet(self, packet: QQContextPacket, *, priority: input_events.InputPriority = "normal") -> input_events.InputEvent | None:
         record = getattr(self.session, "record_input_event", None)
         if not callable(record):
-            return
-        record(
+            return None
+        return record(
             packet.content,
             source="qq",
             event_type="chat_environment",
@@ -396,19 +396,27 @@ class QQInputRuntime:
     def ingest_message(self, message: QQRawMessage) -> None:
         self.environment.ingest(message)
 
-    def poll(self) -> QQParticipationDecision:
+    def poll(self, *, absorb_before_decide: bool = True) -> QQParticipationDecision:
         packets = self.environment.due_packets(
             min_unread=self.batch_min_unread,
             quiet_seconds=self.batch_quiet_seconds,
         )
+        packet_events: list[input_events.InputEvent] = []
         for packet in packets:
             priority: input_events.InputPriority = "normal"
             if packet.message_type == "private":
                 priority = "high"
-            self.environment.publish_packet(packet, priority=priority)
+            event = self.environment.publish_packet(packet, priority=priority)
+            if event is not None:
+                packet_events.append(event)
 
         if not self.autonomous_enabled or not packets:
             return QQParticipationDecision()
+
+        if absorb_before_decide and packet_events:
+            loop = getattr(self.session, "inner_stream_loop", None)
+            if loop is not None and hasattr(loop, "evaluate_now"):
+                loop.evaluate_now(packet_events, trigger_reason="QQ environment before participation")
 
         decision = self.participant.decide(packets)
         if decision.action != "say":

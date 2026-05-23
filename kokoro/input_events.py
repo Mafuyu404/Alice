@@ -210,6 +210,26 @@ def build_chat_environment_event(
     )
 
 
+def build_web_search_event(
+    content: str,
+    *,
+    source: str = "web_search",
+    metadata: dict | None = None,
+    privacy: PrivacyMark | dict | None = None,
+    priority: InputPriority = "normal",
+    lifetime: InputLifetime = "session",
+) -> InputEvent:
+    return InputEvent(
+        type="web_search",
+        source=source,
+        content=content,
+        metadata=metadata or {},
+        privacy=PrivacyMark.from_raw(privacy),
+        priority=priority,
+        lifetime=lifetime,
+    )
+
+
 def format_events_for_prompt(events: Iterable[InputEvent], *, max_chars: int = 3000) -> str:
     lines: list[str] = []
     for event in events:
@@ -232,4 +252,5 @@ def default_registry() -> InputTypeRegistry:
     registry.register("text", build_text_event)
     registry.register("chat_environment", build_chat_environment_event)
     registry.register("time_tick", build_time_tick_event)
+    registry.register("web_search", build_web_search_event)
     return registry

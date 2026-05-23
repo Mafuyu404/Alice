@@ -395,6 +395,8 @@ class InnerStreamLoop:
         idle_interval_seconds: float = 240.0,
         time_tick_interval_seconds: float = 900.0,
         max_batch: int = 16,
+        search_impulse=None,
+        output_handlers: list | None = None,
     ) -> None:
         self.stream = stream
         self.context_provider = context_provider
@@ -402,6 +404,8 @@ class InnerStreamLoop:
         self.idle_interval_seconds = max(10.0, float(idle_interval_seconds))
         self.time_tick_interval_seconds = max(0.0, float(time_tick_interval_seconds))
         self.max_batch = max(1, int(max_batch))
+        self.search_impulse = search_impulse
+        self.output_handlers = list(output_handlers or [])
         self._events: list[input_events.InputEvent] = []
         self._lock = threading.Lock()
         self._wakeup = threading.Event()
@@ -435,6 +439,18 @@ class InnerStreamLoop:
         if not events:
             events = [self._time_tick_event(reason="manual flush")]
         self._evaluate(events, trigger_reason="manual flush")
+
+    def evaluate_now(
+        self,
+        events: list[input_events.InputEvent] | None = None,
+        *,
+        trigger_reason: str = "manual evaluate",
+    ) -> None:
+        if events is None:
+            events = self._pop_events()
+        if not events:
+            return
+        self._evaluate(events, trigger_reason=trigger_reason)
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -480,6 +496,21 @@ class InnerStreamLoop:
             context = self.context_provider() or {}
             self.stream.evaluate_events(events=events, trigger_reason=trigger_reason, **context)
             self._last_update = time.monotonic()
+            if self.search_impulse is not None and hasattr(self.search_impulse, "consider"):
+                self.search_impulse.consider(
+                    inner_stream=self.stream.text,
+                    context=context,
+                )
+            for handler in self.output_handlers:
+                try:
+                    handler(
+                        inner_stream=self.stream.text,
+                        events=events,
+                        context=context,
+                        trigger_reason=trigger_reason,
+                    )
+                except Exception as exc:
+                    logger.debug("inner stream output handler failed: %s", exc)
         except Exception as exc:
             logger.warning("inner stream loop failed: %s", exc)
 

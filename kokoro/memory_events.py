@@ -1,4 +1,4 @@
-"""Memory/date event detector for proactive dialogue context."""
+﻿"""Memory/date event detector for proactive dialogue context."""
 
 from __future__ import annotations
 
@@ -202,6 +202,20 @@ class MemoryEventStore:
         if self._counter >= self.eval_interval:
             self._counter = 0
             self._summarize(user_name, character_name, summary, counterpart_name)
+
+    def add_direct_event(self, desc: str, *, tags: list[str] | None = None) -> None:
+        """Add an already-reflected natural-language event."""
+        if not self.enabled:
+            return
+        desc = str(desc or "").strip()
+        if not desc:
+            return
+        clean_tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
+        self._pending.append(StoredEvent(desc=desc, tags=clean_tags[:6], created_at=time.time()))
+        self._counter += 1
+        if self._counter >= self.eval_interval:
+            self._counter = 0
+            self._summarize("", "", "", "")
 
     def flush_all(self, user_name: str = "你", character_name: str = "助手",
                    summary: str = "", counterpart_name: str = "") -> None:
@@ -487,3 +501,4 @@ def _is_duplicate(desc: str, existing: list[str]) -> bool:
         if len(norm) >= 4 and (norm in existing_norm or existing_norm in norm):
             return True
     return False
+
