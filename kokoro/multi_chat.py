@@ -599,10 +599,11 @@ class MultiChatOrchestrator:
             messages.append({"role": "system", "content": inner_ctx})
 
         history = self._format_history(max_entries=self.config.max_history) or "无"
-        user_prompt = (
-            f"【最近共享对话】\n{history}\n\n"
-            f"【当前触发内容】\n{trigger_text or decision.topic or '无'}\n\n"
-            f"请只写{session.character_name}现在会说出口的话："
+        user_prompt = prompts.format_prompt(
+            "multi_dialogue_orchestrator.generator_user_prompt",
+            history=history,
+            trigger_text=trigger_text or decision.topic or "无",
+            name=session.character_name,
         )
         messages.append({"role": "user", "content": user_prompt})
         return messages

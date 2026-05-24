@@ -195,6 +195,31 @@ class CognitionStore:
             logger.warning("cognition evaluation failed: %s", exc)
         return debug
 
+    def evaluate_events(
+        self,
+        *,
+        events_text: str,
+        inner_stream: str,
+        summary: str,
+        memories: str,
+        character_name: str,
+        character_id: str,
+        user_name: str = "你",
+    ) -> dict:
+        conversation = prompts.format_prompt(
+            "cognition.autonomous_events_context",
+            events_text=events_text,
+            inner_stream=inner_stream,
+        )
+        return self.evaluate(
+            conversation=conversation,
+            summary=summary,
+            memories=memories,
+            character_name=character_name,
+            character_id=character_id,
+            user_name=user_name,
+        )
+
     def get_context(self) -> str:
         if not self._cache:
             return ""

@@ -92,25 +92,24 @@ SEND_QQ_MESSAGE = {
     "function": {
         "name": "send_qq_message",
         "description": (
-            "Send one message through the connected QQ transport as the character. "
-            "Use only when the character herself decides this is the right action in the current scene, "
-            "for example she wants to participate in QQ, reply to a QQ context, or carry out a QQ-side social action. "
-            "Do not use for ordinary spoken replies."
+            "通过已连接的 QQ 通道，以角色本人身份发送一条消息。"
+            "仅当角色自己判断当前场景适合这样做时使用，例如她想参与 QQ、回应 QQ 上下文，"
+            "或完成一个 QQ 侧社交动作。不要用于普通口头回复。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "message": {
                     "type": "string",
-                    "description": "The exact text to send to QQ, with no action narration.",
+                    "description": "要准确发送到 QQ 的文本，不要包含动作描写。",
                 },
                 "conversation_id": {
                     "type": "string",
-                    "description": "Optional target such as group:123 or private:456. Leave empty to use the most recent QQ conversation.",
+                    "description": "可选目标，例如 group:123 或 private:456。留空则使用最近的 QQ 会话。",
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Brief private reason for why sending now is natural.",
+                    "description": "简短内部理由，说明为什么现在发送是自然的。",
                 },
             },
             "required": ["message"],
@@ -131,7 +130,7 @@ VTS_EXPRESSION = {
                     "enum": [
                         "smile", "happy", "sad", "angry", "surprised",
                         "tired", "thinking", "shy", "excited", "wink",
-                        "pout", "sigh", "cry", "doubt", "awkward", "neutral",
+                        "pout", "sigh", "cry", "doubt", "confused", "awkward", "neutral",
                     ],
                     "description": "要展示的表情。不调用时情绪系统会自动处理，这里只用于刻意强调。",
                 },
@@ -149,6 +148,48 @@ VTS_EXPRESSION = {
                 },
             },
             "required": ["expression"],
+        },
+    },
+}
+
+VTS_MOTION = {
+    "type": "function",
+    "function": {
+        "name": "vts_motion",
+        "description": (
+            "控制角色的 Live2D 身体和头部动作。用户要求你笑一下、摇头晃脑、点头、测试身体、"
+            "让皮套动起来，或你自己想用身体动作表达情绪时使用。这个工具是真实控制 Live2D，"
+            "不是后台代码任务。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "motion": {
+                    "type": "string",
+                    "enum": [
+                        "smile", "happy", "nod", "shake", "sway", "bounce",
+                        "excited", "shy", "pout", "sad", "thinking", "idle",
+                    ],
+                    "description": "动作类型。shake/sway 适合摇头晃脑，bounce/excited 适合活泼身体动作。",
+                },
+                "intensity": {
+                    "type": "number",
+                    "description": "动作强度 0.0-1.0，测试或明显表达时可用 0.7-1.0。",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+                "duration_seconds": {
+                    "type": "number",
+                    "description": "动作持续秒数，建议 2-6 秒。",
+                    "minimum": 0.5,
+                    "maximum": 12,
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "简短内部理由，说明为什么现在这样动。",
+                },
+            },
+            "required": ["motion"],
         },
     },
 }
@@ -238,6 +279,7 @@ ALL_TOOLS: list[dict] = [
     SAVE_TO_MEMORY,
     SEND_QQ_MESSAGE,
     VTS_EXPRESSION,
+    VTS_MOTION,
     CLAUDE_CODE_EXEC,
     CHECK_TASK_PROGRESS,
     LIST_ACTIVE_TASKS,
@@ -256,6 +298,7 @@ DEFAULT_ENABLED_TOOLS: set[str] = {
     "save_to_memory",
     "send_qq_message",
     "vts_expression",
+    "vts_motion",
     "claude_code_exec",
     "check_task_progress",
     "list_active_tasks",

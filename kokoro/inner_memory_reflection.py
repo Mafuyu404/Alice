@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.request
 from typing import Any
 
@@ -33,6 +34,9 @@ class InnerMemoryReflection:
         self.enabled = bool(section.get("enabled", True))
         self.model = str(section.get("model") or "").strip() or cfg.llm_model()
         self.max_tokens = int(section.get("max_tokens", 512) or 512)
+        self.consider_interval_seconds = max(0.0, float(section.get("consider_interval_seconds", 30.0) or 30.0))
+        self.min_events = max(1, int(section.get("min_events", 2) or 2))
+        self._last_consider_at = 0.0
         self._lock = threading.Lock()
 
     def consider(
@@ -45,13 +49,20 @@ class InnerMemoryReflection:
     ) -> None:
         if not self.enabled or not events or not str(inner_stream or "").strip():
             return
+        meaningful_events = [event for event in events if event.type != "time_tick"]
+        if len(meaningful_events) < self.min_events:
+            return
+        now = time.monotonic()
+        if self.consider_interval_seconds > 0 and now - self._last_consider_at < self.consider_interval_seconds:
+            return
+        self._last_consider_at = now
         if not self._lock.acquire(blocking=False):
             return
         thread = threading.Thread(
             target=self._run,
             kwargs={
                 "inner_stream": inner_stream,
-                "events": list(events),
+                "events": meaningful_events,
                 "context": dict(context or {}),
                 "trigger_reason": trigger_reason,
             },

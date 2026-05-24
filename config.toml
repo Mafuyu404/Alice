@@ -263,6 +263,11 @@ auto_reset_on_tts_done = true
 
 [stt]
 
+# 是否启用麦克风 STT 输入。
+# 类型: bool (true/false)
+# false: 主动闭麦，不加载 STT 模型，不打开麦克风；QQ、内在叙事流和其他输入继续运行。
+enabled = true
+
 # 流式 ASR 模型的存放目录。
 # 类型: string（目录路径）
 # 程序首次运行会自动下载模型到此目录。
@@ -380,8 +385,20 @@ stt_skip_short_refine_max_chars = 18
 # 注：若 [aec].enabled = true，此配置无效（由 AEC 替代）。
 stt_pause_during_tts = false
 
-# ===========================================================================
-# 记忆后端
+  # TTS 回声文本过滤窗口（秒）。AEC 漏掉的外放回声会在 STT 提交前用最近 TTS 文本兜底过滤。
+  # 类型: float
+  stt_echo_filter_seconds = 45.0
+
+  # TTS 回声文本过滤的最短字符数。太短的片段容易误杀正常短回应。
+  # 类型: int
+  stt_echo_filter_min_chars = 3
+
+  # TTS 回声文本过滤相似度阈值。越低越激进，越高越保守。
+  # 类型: float
+  stt_echo_filter_similarity = 0.68
+
+  # ===========================================================================
+  # 记忆后端
 # ===========================================================================
 
 # 记忆后端类型。
@@ -443,17 +460,21 @@ max_chars = 1200
 # 类型: int
 max_tokens = 700
 
+# 内在叙事流更新日志。用于观察每次思考的触发、输入和更新结果。
+# 类型: bool
+log_updates = true
+
 # 外部/自身事件进入后，最早提前到多少秒后更新内在叙事流。
 # 类型: float
-event_wakeup_delay_seconds = 2.0
+event_wakeup_delay_seconds = 0.5
 
 # 没有强输入时，内在叙事流自己的基础更新周期。
 # 类型: float
-idle_interval_seconds = 240.0
+idle_interval_seconds = 5.0
 
 # 长时间没有事件时，注入低频 time_tick 的周期。0 表示禁用。
 # 类型: float
-time_tick_interval_seconds = 900.0
+time_tick_interval_seconds = 10.0
 
 # 单次节奏更新最多合并的事件数。
 # 类型: int
@@ -462,6 +483,10 @@ event_max_batch = 16
 # 注入内在叙事流 prompt 的事件文本最大字符数。
 # 类型: int
 event_prompt_max_chars = 3200
+
+# 高频心跳更新时注入内在叙事流 prompt 的事件文本最大字符数。
+# 类型: int
+tick_prompt_max_chars = 1200
 
 # ===========================================================================
 # 内在叙事流主动搜索
@@ -476,7 +501,7 @@ enabled = true
 
 # open-webSearch 本地 daemon 地址。
 # 类型: string
-base_url = "http://127.0.0.1:3000"
+base_url = "http://127.0.0.1:58902"
 
 # 搜索冲动判断使用的模型。留空则使用 llm_model。
 # 类型: string
@@ -489,6 +514,10 @@ max_results = 5
 # 搜索事件写回内在叙事流的最大字符数。
 # 类型: int
 max_event_chars = 6000
+
+# 搜索冲动判断的最小间隔。避免高频心跳每次都重复问搜索。
+# 类型: float
+consider_interval_seconds = 5.0
 
 # daemon 请求超时。
 # 类型: float
@@ -512,6 +541,37 @@ model = ""
 # 单次反思最大生成 token。
 # 类型: int
 max_tokens = 512
+
+# 记忆反思的最小间隔。高频心跳不应每次都触发重型记忆判断。
+# 类型: float
+consider_interval_seconds = 30.0
+
+# 至少有多少个真实输入/自身行动事件时才触发记忆反思。
+# 类型: int
+min_events = 2
+
+# ===========================================================================
+# 内在叙事流认知反思
+# ===========================================================================
+# 内在叙事流更新后，把 QQ 群友、关系、长期对象等稳定印象沉淀到
+# cognition.json。它不记录流水账，只维护可复用的长期认知。
+
+[inner_cognition]
+# 是否启用内在叙事流参与的认知沉淀。
+# 类型: bool
+enabled = true
+
+# 认知反思最小间隔。避免每次心跳都触发 cognition 全量评估。
+# 类型: float
+consider_interval_seconds = 45.0
+
+# 至少有多少个 QQ/搜索/图片/自身行动事件时才触发。
+# 类型: int
+min_events = 1
+
+# 送入 cognition 评估的最近事件最大字符数。
+# 类型: int
+max_event_chars = 5000
 
 # ===========================================================================
 # QQ 环境输入
@@ -545,31 +605,85 @@ max_messages_per_conversation = 200
 
 # 每次交给内在叙事/自主参与判断的最大消息行数。
 # 类型: int
-packet_max_lines = 80
+packet_max_lines = 40
+
+# QQ 环境包只取最近多少秒内的消息；0 表示不按时间过滤。
+# 类型: float
+packet_max_age_seconds = 180.0
+
+# 空闲社交探测只取最近多少秒内的消息；0 表示不按时间过滤。
+# 类型: float
+idle_packet_max_age_seconds = 90.0
 
 # 消息停止多久后才把当前窗口合成一个环境包，避免每条消息都触发。
 # 类型: float
-batch_quiet_seconds = 4.0
+batch_quiet_seconds = 1.0
 
 # 每个环境包至少包含多少条新消息。
 # 类型: int
 batch_min_unread = 1
 
+# 没有新 QQ 消息时，多久允许把最近会话作为空闲社交现场交给自主参与判断。
+# 类型: float
+idle_participation_seconds = 30.0
+
 # 是否启用 QQ 自主参与判断。关闭后 QQ 只进入内在叙事，不主动发消息。
 # 类型: bool
 autonomous_participation_enabled = true
 
+# QQ 自主参与判断前是否同步等待内在叙事流吸收本轮 QQ 环境。
+# false 时 QQ 先快速决策，内在叙事流异步吸收，回复会更快。
+# 类型: bool
+absorb_before_decide = false
+
 # QQ 自主参与判断模型。留空则使用 dialogue_model/llm_model。
 # 类型: string
-participation_model = ""
+participation_model = "deepseek-v4-flash"
 
 # 同一会话两次主动发言的最小间隔。只是外层防刷屏边界，不代表兴趣规则。
 # 类型: float
-participation_cooldown_seconds = 45.0
+participation_cooldown_seconds = 8.0
 
 # QQ 单条发送内容最大字符数。
 # 类型: int
 max_message_chars = 260
+
+[qq.image_understanding]
+# 是否识别 QQ 收到的图片/表情包。
+# 类型: bool
+enabled = true
+
+# 是否允许角色在喜欢某张表情包时自动收藏到本地表情包库。
+# 类型: bool
+auto_save_stickers = true
+
+# 是否允许把截图收藏为表情包。默认关闭；截图仍会被识别并进入内在叙事流。
+# 类型: bool
+save_screenshots = false
+
+# 是否允许把普通照片收藏为表情包。
+# 类型: bool
+save_photos = false
+
+# 表情包库目录。
+# 类型: string
+sticker_dir = "data/stickers"
+
+# 下载 QQ 图片的最大字节数。
+# 类型: int
+max_image_bytes = 8000000
+
+# 图片下载超时。
+# 类型: float
+download_timeout = 15.0
+
+# 图片理解超时。
+# 类型: int
+vision_timeout = 45
+
+# 留空时复用全局 vision_backend / vision_model。
+backend = ""
+model = ""
 
 # ===========================================================================
 # 立绘覆盖层
@@ -613,6 +727,44 @@ portrait_click_through = false
 # 注意：如果有角色配置覆盖了 llm_model（如蓬莱用 charglm-4），
 # 此处必须显式指定，避免回退到角色专用的对话模型。
 portrait_model = "deepseek-v4-flash"
+
+# ===========================================================================
+# VTube Studio / Live2D
+# ===========================================================================
+
+[vts]
+# 是否启用 VTube Studio 连接。
+# 类型: bool
+enabled = true
+
+# VTube Studio Public API 地址。
+host = "localhost"
+port = 8001
+
+[vts.body]
+# 是否启用由内在状态驱动的 Live2D 脸部/身体脚本。
+# 类型: bool
+enabled = true
+
+# 参数注入刷新率。越高动作越顺，通常 20-30 足够。
+# 类型: float
+update_hz = 30.0
+
+# LLM 生成下一段身体表达脚本的最小间隔。
+# 类型: float
+intent_interval_seconds = 2.0
+
+# 没有新表达脚本时，多久主动生成一次待机脚本。
+# 类型: float
+idle_request_seconds = 2.5
+
+# 身体脚本生成模型。留空使用默认 LLM。
+# 类型: string
+model = ""
+
+# 是否记录 [vts_body] 脚本日志。
+# 类型: bool
+debug_log = true
 
 # ===========================================================================
 # 字幕覆盖层 — 流式显示 LLM 输出
@@ -908,8 +1060,8 @@ enabled = true
 # 启用的工具列表。
 # 类型: string 数组
 # 可选: "look_at_screen", "search_memory", "get_current_time", "get_current_app",
-#        "save_to_memory", "send_qq_message", "claude_code_exec", "check_task_progress",
-#        "list_active_tasks", "cancel_task"
+#        "save_to_memory", "send_qq_message", "vts_expression", "vts_motion", "claude_code_exec",
+#        "check_task_progress", "list_active_tasks", "cancel_task"
 tools = [
   "look_at_screen",
   "search_memory",
@@ -917,6 +1069,8 @@ tools = [
   "get_current_app",
   "save_to_memory",
   "send_qq_message",
+  "vts_expression",
+  "vts_motion",
   "claude_code_exec",
   "check_task_progress",
   "list_active_tasks",

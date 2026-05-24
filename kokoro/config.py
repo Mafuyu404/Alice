@@ -149,12 +149,28 @@ def stt_refine_model() -> str:
     return section_get("stt", "stt_refine_model", "qwen2.5:1.5b")
 
 
+def stt_enabled() -> bool:
+    return bool(section_get("stt", "enabled", True))
+
+
 def stt_refine_mode() -> str:
     return section_get("stt", "stt_refine_mode", "separate")
 
 
 def stt_pause_during_tts() -> bool:
     return bool(section_get("stt", "stt_pause_during_tts", False))
+
+
+def stt_echo_filter_seconds() -> float:
+    return float(section_get("stt", "stt_echo_filter_seconds", 45.0))
+
+
+def stt_echo_filter_min_chars() -> int:
+    return int(section_get("stt", "stt_echo_filter_min_chars", 4))
+
+
+def stt_echo_filter_similarity() -> float:
+    return float(section_get("stt", "stt_echo_filter_similarity", 0.72))
 
 
 def stt_refine_stable_seconds() -> float:
@@ -334,6 +350,13 @@ def inner_stream_search_config() -> dict:
 
 def inner_memory_config() -> dict:
     section = get("inner_memory", {})
+    if not isinstance(section, dict):
+        section = {}
+    return section
+
+
+def inner_cognition_config() -> dict:
+    section = get("inner_cognition", {})
     if not isinstance(section, dict):
         section = {}
     return section

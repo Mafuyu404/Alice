@@ -10,6 +10,7 @@ from typing import Any
 
 from kokoro import config as cfg
 from kokoro import llm_client
+from kokoro import prompts
 from kokoro import token_usage
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,36 @@ def _looks_like_qq_message_request(text: str) -> bool:
     if "qq" not in compact and "q" not in compact:
         return False
     return any(marker in text for marker in ("消息", "群", "聊天", "看", "收到", "发"))
+
+
+def _direct_vts_route(text: str, available_tools: list[str]) -> AgentRouteDecision | None:
+    compact = re.sub(r"[\s\W_]+", "", text or "").lower()
+    if not compact:
+        return None
+    vts_markers = ("vts", "live2d", "皮套", "表情", "身体", "动起来", "动作", "摇头", "晃脑", "点头", "笑一笑", "笑一下")
+    if not any(marker.lower() in compact for marker in vts_markers):
+        return None
+    if "vts_motion" in available_tools and any(marker in compact for marker in ("摇头", "晃脑", "身体", "动起来", "动作", "点头")):
+        motion = "shake" if any(marker in compact for marker in ("摇头", "晃脑", "晃一晃")) else "nod" if "点头" in compact else "sway"
+        return AgentRouteDecision(
+            True,
+            "vts_motion",
+            reason="direct_vts_motion_request",
+            arguments={"motion": motion, "intensity": 0.9, "duration_seconds": 4.0, "reason": "用户要求测试 Live2D 身体动作"},
+        )
+    if "vts_expression" in available_tools and any(marker in compact for marker in ("笑", "表情", "眨眼", "撇嘴")):
+        expression = "smile"
+        if "撇嘴" in compact:
+            expression = "pout"
+        elif "眨眼" in compact:
+            expression = "wink"
+        return AgentRouteDecision(
+            True,
+            "vts_expression",
+            reason="direct_vts_expression_request",
+            arguments={"expression": expression, "intensity": 0.9, "duration_seconds": 3.0},
+        )
+    return None
 
 
 def _text(message: dict) -> str:
@@ -37,6 +68,13 @@ def _recent_dialogue(messages: list[dict], max_messages: int = 10) -> str:
         label = "用户" if role == "user" else ("角色" if role == "assistant" else "系统")
         lines.append(f"{label}: {_text(msg)[:700]}")
     return "\n".join(lines)
+
+
+def _latest_user_text(messages: list[dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "user" and _text(msg):
+            return _text(msg)
+    return ""
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -88,6 +126,9 @@ class AgentRouter:
         self._api_key = api_key
 
     def decide(self, messages: list[dict], available_tools: list[str]) -> AgentRouteDecision:
+        direct_vts = _direct_vts_route(_latest_user_text(messages), available_tools)
+        if direct_vts:
+            return direct_vts
         if not self._model:
             return AgentRouteDecision(reason="no_router_model")
         tools = available_tools
@@ -102,21 +143,20 @@ class AgentRouter:
         tool_calls_made: int,
         available_tools: list[str],
     ) -> AgentRouteDecision:
+        direct_vts = _direct_vts_route(_latest_user_text(messages), available_tools)
+        if direct_vts:
+            return direct_vts
         if not self._model:
             return AgentRouteDecision(reason="no_router_model")
         tools = available_tools
         if _looks_like_qq_message_request(_recent_dialogue(messages)) and "send_qq_message" in available_tools:
             tools = ["send_qq_message"]
-        prompt = (
-            "你是工具完整性审核器。只输出 JSON，不要回答用户。\n"
-            "如果最新用户要求真实电脑/文件操作，而候选回复在没有真实工具结果时声称已经完成，返回 call_tool=true。\n"
-            "如果候选回复是在询问或声明已有后台任务状态，优先使用 check_task_progress，不要重新启动 claude_code_exec。\n"
-            "JSON 格式：{\"call_tool\": boolean, \"tool_name\": string, \"arguments\": object, \"reason\": string}。\n\n"
-            f"可用工具：{', '.join(tools)}\n"
-            f"最近对话：\n{_recent_dialogue(messages)}\n\n"
-            f"tool_calls_made: {tool_calls_made}\n"
-            f"候选回复：{reply}\n"
-            "JSON："
+        prompt = prompts.format_prompt(
+            "agent_guard.audit_reply",
+            available_tools=", ".join(tools),
+            recent_dialogue=_recent_dialogue(messages),
+            tool_calls_made=tool_calls_made,
+            reply=reply,
         )
         return self._decide_from_prompt(prompt, tools, "audit_invalid_json")
 
@@ -139,29 +179,10 @@ class AgentRouter:
         return AgentRouteDecision(True, tool_name, task, reason, args)
 
     def _build_prompt(self, messages: list[dict], available_tools: list[str]) -> str:
-        return (
-            "你正在为角色自己的真实能力做路由判断。不要扮演角色，不要回答用户，只输出 JSON。\n"
-            "这些工具不是外部助手，不是把请求转交给别人；它们是角色通过系统实际能做到的能力。\n"
-            "当用户要求角色做需要改变、检查或验证电脑状态的事情时，判断角色现在是否应该使用自己的电脑操作能力。\n\n"
-            "工具：\n"
-            "- claude_code_exec：启动一个新的后台电脑任务，例如创建/写入文件、修改代码、运行命令、整理文档。\n"
-            "- check_task_progress：查询已有后台智能体任务。用户问之前任务是否完成、进度如何、为什么还没好时用它，不要重复启动同一个任务。\n"
-            "- list_active_tasks：列出当前活跃任务。\n\n"
-            "判断规则：\n"
-            "- 普通聊天、知识问答、背诵、解释、情绪回应：call_tool=false。\n"
-            "- 用户要求角色真实操作电脑、编辑文件、创建成果、运行命令、检查本地状态或验证结果：调用 claude_code_exec。\n"
-            "- 用户已经给出期望结果，比如文件名和位置、代码修改目标、要验证的结果，这已经是具体任务。\n"
-            "- 用户在任务启动后追问状态：调用 check_task_progress；不知道 task_id 时 arguments 用空对象 {}。\n"
-            "- 如果系统上下文显示已有任务正在执行，而用户只是催促、表达着急、问好了没有、问为什么多个任务：调用 check_task_progress，绝不能重复启动 claude_code_exec。\n"
-            "- 如果最近角色说任务正在创建、正在处理、正在执行，而最新用户只是短追问“好了吧”“好了吗”“完成了吗”“还没好吗”：调用 check_task_progress。\n"
-            "- 不要把自然语言里的“我做了”当成证据；只有工具结果能证明执行。\n"
-            "- 如果信息不足，仍可调用 claude_code_exec，让执行器安全检查并报告缺少什么。\n\n"
-            "JSON 格式：{\"call_tool\": boolean, \"tool_name\": string, \"arguments\": object, \"reason\": string}。\n"
-            "调用 claude_code_exec 时，arguments 必须包含 {\"task\": \"...\"}。\n"
-            "调用 check_task_progress 时，arguments 可以是 {}。\n\n"
-            f"可用工具名：{', '.join(available_tools)}\n"
-            f"最近对话：\n{_recent_dialogue(messages)}\n\n"
-            "JSON："
+        return prompts.format_prompt(
+            "agent_guard.route",
+            available_tools=", ".join(available_tools),
+            recent_dialogue=_recent_dialogue(messages),
         )
 
     def _decide_from_prompt(

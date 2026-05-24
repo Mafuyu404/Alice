@@ -95,6 +95,18 @@ class ChatSession:
                 except Exception as exc:
                     logger.warning("failed to initialize inner stream search impulse: %s", exc)
             output_handlers = []
+            cognition_section = _cfg.inner_cognition_config()
+            if bool(cognition_section.get("enabled", True)):
+                try:
+                    from kokoro.inner_cognition_reflection import InnerCognitionReflection
+                    output_handlers.append(
+                        InnerCognitionReflection(
+                            session=self,
+                            section=cognition_section,
+                        ).consider
+                    )
+                except Exception as exc:
+                    logger.warning("failed to initialize inner cognition reflection: %s", exc)
             memory_section = _cfg.inner_memory_config()
             if bool(memory_section.get("enabled", True)):
                 try:
@@ -503,6 +515,15 @@ class ChatSession:
         metadata: dict | None = None,
     ) -> None:
         action = str((metadata or {}).get("action") or "web_search")
+        query = str((metadata or {}).get("query") or "").strip()
+        reason = str((metadata or {}).get("reason") or "").strip()
+        if action == "web_search_intent":
+            print(f"\n[web_search] intent query={query!r} reason={reason or 'inner stream impulse'}")
+        elif action == "web_search_result":
+            print(f"\n[web_search] result query={query!r}")
+        elif action == "web_search_error":
+            error = str((metadata or {}).get("error") or "").strip()
+            print(f"\n[web_search] error query={query!r} {error}")
         if action == "web_search_intent":
             self.record_self_action(
                 content,

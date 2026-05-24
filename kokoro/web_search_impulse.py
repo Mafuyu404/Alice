@@ -6,11 +6,13 @@ import json
 import logging
 import re
 import threading
+import time
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from kokoro import config as cfg
+from kokoro import prompts
 from kokoro import token_usage
 from kokoro.web_search_client import WebSearchClient, format_search_result
 
@@ -47,12 +49,18 @@ class InnerStreamSearchImpulse:
         )
         self.max_results = int(section.get("max_results", 5) or 5)
         self.max_event_chars = int(section.get("max_event_chars", 6000) or 6000)
+        self.consider_interval_seconds = max(0.0, float(section.get("consider_interval_seconds", 5.0) or 5.0))
+        self._last_consider_at = 0.0
         self._running_lock = threading.Lock()
 
     def consider(self, *, inner_stream: str, context: dict[str, Any] | None = None) -> None:
         """Start one background search consideration if no previous one is running."""
         if not str(inner_stream or "").strip():
             return
+        now = time.monotonic()
+        if self.consider_interval_seconds > 0 and now - self._last_consider_at < self.consider_interval_seconds:
+            return
+        self._last_consider_at = now
         if not self._running_lock.acquire(blocking=False):
             return
         thread = threading.Thread(
@@ -66,7 +74,13 @@ class InnerStreamSearchImpulse:
         try:
             decision = self._decide(inner_stream=inner_stream, context=context)
             if not decision.search or not decision.query:
+                logger.info("inner stream web search skipped: %s", decision.reason or "no search impulse")
                 return
+            logger.info(
+                "inner stream web search intent: query=%r reason=%s",
+                decision.query,
+                decision.reason or "",
+            )
             self.event_callback(
                 f"我想确认一下：{decision.query}\n原因：{decision.reason or '内在叙事流产生了搜索倾向'}",
                 "web_search",
@@ -78,11 +92,18 @@ class InnerStreamSearchImpulse:
                 },
             )
             try:
+                logger.info("inner stream web search request: query=%r limit=%s", decision.query, self.max_results)
                 result = self.client.search(decision.query, limit=self.max_results)
                 content = format_search_result(
                     decision.query,
                     result,
                     max_chars=self.max_event_chars,
+                )
+                result_count = len(result.get("results") or result.get("items") or []) if isinstance(result, dict) else 0
+                logger.info(
+                    "inner stream web search result: query=%r results=%s",
+                    decision.query,
+                    result_count,
                 )
                 self.event_callback(
                     content,
@@ -95,6 +116,12 @@ class InnerStreamSearchImpulse:
                     },
                 )
             except Exception as exc:
+                logger.warning(
+                    "inner stream web search error: query=%r error=%s: %s",
+                    decision.query,
+                    type(exc).__name__,
+                    exc,
+                )
                 self.event_callback(
                     f"我尝试搜索：{decision.query}\n但搜索失败了：{type(exc).__name__}: {exc}",
                     "web_search",
@@ -126,22 +153,15 @@ class InnerStreamSearchImpulse:
         )
 
     def _build_prompt(self, *, inner_stream: str, context: dict[str, Any]) -> str:
-        return (
-            f"你正在判断{self.character_name}此刻是否会自己去搜索网络信息。"
-            "这不是用户命令路由，也不是工具助理；这是角色根据自己的内在叙事流产生的认知动作。\n"
-            "如果她自然地想确认一个事实、查一个不懂的词、追一个搜索结果里的新线索、确认最新状态，"
-            "就可以 search=true。普通闲聊、情绪延续、已经足够明确时可以 search=false。\n"
-            "不要因为担心频率而压制搜索；只判断此刻是否真的想搜。\n\n"
-            "只输出 JSON：\n"
-            '{"search": boolean, "query": "搜索词", "reason": "为什么想搜", "expected_use": "搜到后会怎样影响她继续想"}\n\n'
-            f"角色：{self.character_name}\n"
-            f"对话对象：{self.user_name}\n\n"
-            f"当前内在叙事流：\n{inner_stream}\n\n"
-            f"最近对话：\n{context.get('recent_history') or '无'}\n\n"
-            f"对话摘要：\n{context.get('summary') or '无'}\n\n"
-            f"环境/场景：\n{context.get('scene_context') or '无'}\n\n"
-            f"相关记忆：\n{context.get('memory_context') or '无'}\n\n"
-            "JSON："
+        return prompts.format_prompt(
+            "web_search_impulse.decision_user",
+            character_name=self.character_name,
+            user_name=self.user_name,
+            inner_stream=inner_stream,
+            recent_history=context.get("recent_history") or "无",
+            summary=context.get("summary") or "无",
+            scene_context=context.get("scene_context") or "无",
+            memory_context=context.get("memory_context") or "无",
         )
 
     def _call_model(self, prompt: str) -> str:

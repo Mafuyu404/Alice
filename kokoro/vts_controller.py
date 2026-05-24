@@ -37,6 +37,14 @@ PARAM_FACE_ANGLE_X = "FaceAngleX"
 PARAM_FACE_ANGLE_Y = "FaceAngleY"
 PARAM_FACE_ANGLE_Z = "FaceAngleZ"
 PARAM_FACE_POS_Z = "FacePositionZ"
+PARAM_FACE_POS_X = "FacePositionX"
+PARAM_FACE_POS_Y = "FacePositionY"
+PARAM_MOCOPI_BODY_ANGLE_X = "MocopiBodyAngleX"
+PARAM_MOCOPI_BODY_ANGLE_Y = "MocopiBodyAngleY"
+PARAM_MOCOPI_BODY_ANGLE_Z = "MocopiBodyAngleZ"
+PARAM_MOCOPI_BODY_POS_X = "MocopiBodyPositionX"
+PARAM_MOCOPI_BODY_POS_Y = "MocopiBodyPositionY"
+PARAM_MOCOPI_BODY_POS_Z = "MocopiBodyPositionZ"
 PARAM_EYE_LEFT_X = "EyeLeftX"
 PARAM_EYE_LEFT_Y = "EyeLeftY"
 PARAM_EYE_RIGHT_X = "EyeRightX"
@@ -45,7 +53,9 @@ PARAM_EYE_RIGHT_Y = "EyeRightY"
 _ALL_VALID_PARAMS = {
     PARAM_EYE_OPEN_L, PARAM_EYE_OPEN_R, PARAM_MOUTH_OPEN,
     PARAM_MOUTH_SMILE, PARAM_BROWS, PARAM_FACE_ANGLE_X,
-    PARAM_FACE_ANGLE_Y, PARAM_FACE_ANGLE_Z, PARAM_FACE_POS_Z,
+    PARAM_FACE_ANGLE_Y, PARAM_FACE_ANGLE_Z, PARAM_FACE_POS_X, PARAM_FACE_POS_Y, PARAM_FACE_POS_Z,
+    PARAM_MOCOPI_BODY_ANGLE_X, PARAM_MOCOPI_BODY_ANGLE_Y, PARAM_MOCOPI_BODY_ANGLE_Z,
+    PARAM_MOCOPI_BODY_POS_X, PARAM_MOCOPI_BODY_POS_Y, PARAM_MOCOPI_BODY_POS_Z,
     PARAM_EYE_LEFT_X, PARAM_EYE_LEFT_Y, PARAM_EYE_RIGHT_X,
     PARAM_EYE_RIGHT_Y,
 }
@@ -151,6 +161,7 @@ class VTSController:
         )
         self._connected = False
         self._authenticated = False
+        self._available_parameter_names: set[str] = set()
 
         # Load expression data
         self._init_expressions(character_id)
@@ -205,6 +216,9 @@ class VTSController:
     ) -> dict[str, Any]:
         if not params:
             return {}
+        params = self.filter_available_params(params)
+        if not params:
+            return {}
         await self.authenticate()
         req = self.myvts.requestSetMultiParameterValue(
             parameters=list(params.keys()),
@@ -235,10 +249,25 @@ class VTSController:
         await self.authenticate()
         req = self.myvts.requestTrackingParameterList()
         resp = await self.vts.request(req)
-        return (
+        params = (
             resp.get("data", {}).get("defaultParameters", [])
             + resp.get("data", {}).get("customParameters", [])
         )
+        self._available_parameter_names = {
+            str(p.get("name") or p.get("parameterName") or p.get("id") or p.get("parameterID"))
+            for p in params
+            if p.get("name") or p.get("parameterName") or p.get("id") or p.get("parameterID")
+        }
+        return params
+
+    async def refresh_parameter_cache(self) -> set[str]:
+        await self.get_tracking_parameters()
+        return set(self._available_parameter_names)
+
+    def filter_available_params(self, params: dict[str, float]) -> dict[str, float]:
+        if not self._available_parameter_names:
+            return dict(params)
+        return {k: v for k, v in params.items() if k in self._available_parameter_names}
 
     # ── Expression helpers ──────────────────────────────────────────────────
 
@@ -305,9 +334,11 @@ class VTSLipSync:
         self.energy_mult = float(cfg["energy_multiplier"])
         self.smooth_factor = float(cfg["smooth_factor"])
         self.mouth_min = float(cfg["mouth_open_min"])
-        self.mouth_max = float(cfg["mouth_open_max"])
+        self.mouth_max = min(float(cfg["mouth_open_max"]), 0.62)
         self.smile_amount = float(cfg["mouth_smile_amount"])
         self._smoothed = 0.0
+        self._previous_raw = 0.0
+        self._noise_floor = 0.01
         self._active = False
         self._last_inject = 0.0
         self._inject_interval = 1.0 / 25  # 25Hz
@@ -315,10 +346,15 @@ class VTSLipSync:
     def start(self) -> None:
         self._active = True
         self._smoothed = 0.0
+        self._previous_raw = 0.0
+        self._noise_floor = 0.01
 
     def stop(self) -> None:
         self._active = False
         self._smoothed = 0.0
+        self._previous_raw = 0.0
+        if self.arbiter:
+            self.arbiter.clear_layer("lipsync")
 
     def on_audio_frame(self, chunk: np.ndarray) -> None:
         if not self._active:
@@ -326,13 +362,24 @@ class VTSLipSync:
             if not self._active:  # still not active after start()
                 return
 
-        rms = float(np.sqrt(np.mean(np.square(chunk.astype(np.float64)))))
-        raw = min(rms * self.energy_mult, self.mouth_max)
-        if raw < self.mouth_min:
+        audio = chunk.astype(np.float64)
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        self._noise_floor = self._noise_floor * 0.96 + min(rms, 0.08) * 0.04
+        normalized = max(0.0, rms - self._noise_floor * 0.8)
+        raw = min(math.sqrt(normalized) * self.energy_mult * 0.28, self.mouth_max)
+        if raw < self.mouth_min * 0.75:
             raw = 0.0
 
-        sf = self.smooth_factor
-        self._smoothed = self._smoothed * sf + raw * (1 - sf)
+        delta = max(0.0, raw - self._previous_raw)
+        self._previous_raw = raw
+        shaped = min(raw + delta * 0.22, self.mouth_max)
+
+        attack = 0.68
+        release = 0.42
+        if shaped > self._smoothed:
+            self._smoothed += (shaped - self._smoothed) * attack
+        else:
+            self._smoothed = self._smoothed * release + shaped * (1 - release)
 
         now = time.monotonic()
         if now - self._last_inject < self._inject_interval:
@@ -340,8 +387,6 @@ class VTSLipSync:
         self._last_inject = now
 
         params = {PARAM_MOUTH_OPEN: self._smoothed}
-        if self._smoothed > 0.1:
-            params[PARAM_MOUTH_SMILE] = self.smile_amount
 
         if self.arbiter:
             self.arbiter.set_layer("lipsync", params)
@@ -361,21 +406,39 @@ class VTSExpressionArbiter:
 
     Priority (highest → lowest):
       1. ``tool``    — LLM explicit ``vts_expression()`` call
-      2. ``lipsync`` — TTS lip-sync (only MouthOpen/MouthSmile)
-      3. ``emotion`` — emotion-driven expression
-      4. ``idle``    — idle animation (breathing, sway)
+      2. ``lipsync``     — TTS lip-sync (only MouthOpen/MouthSmile)
+      3. ``face_script`` — LLM-scripted face motions
+      4. ``body_script`` — LLM-scripted body/head motions
+      5. ``emotion``     — emotion-driven expression
+      6. ``idle``        — idle animation (breathing, sway)
 
     Per-parameter: the highest-priority layer that specifies it wins.
     Runs a periodic inject loop at ``update_hz``.
     """
 
-    LAYER_PRIORITY = ["idle", "emotion", "lipsync", "tool"]
+    LAYER_PRIORITY = [
+        "idle",
+        "emotion",
+        "body_script",
+        "face_script",
+        "direct_body",
+        "direct_face",
+        "lipsync",
+        "tool",
+    ]
 
     def __init__(self, controller: VTSController, update_hz: float = 12.0):
         self.controller = controller
         self._period = 1.0 / update_hz
         self._layers: dict[str, dict[str, float]] = {
-            "tool": {}, "lipsync": {}, "emotion": {}, "idle": {},
+            "tool": {},
+            "lipsync": {},
+            "face_script": {},
+            "body_script": {},
+            "direct_face": {},
+            "direct_body": {},
+            "emotion": {},
+            "idle": {},
         }
         self._running = False
         self._task: asyncio.Task | None = None
@@ -426,7 +489,7 @@ class VTSIdleLoop:
     """Background task driving idle animations via the arbiter.
 
     - **Blink**: random interval 3-6s, closes eyes for 150ms
-    - **Breathing**: ``FacePositionZ`` sine wave at ~0.25Hz
+    - **Breathing**: subtle ``FacePositionY`` sine wave at ~0.25Hz
     - **Head sway**: ``FaceAngleX`` slow drift
 
     Skips blink when ``tts_active`` is True.
@@ -469,7 +532,7 @@ class VTSIdleLoop:
                 PARAM_EYE_OPEN_R: 1.0,
             }
             if self.breathing_amp > 0:
-                idle_params[PARAM_FACE_POS_Z] = math.sin(elapsed * math.pi / 2.0) * self.breathing_amp
+                idle_params[PARAM_FACE_POS_Y] = math.sin(elapsed * math.pi / 2.0) * self.breathing_amp * 0.5
             if self.head_sway_amp > 0:
                 idle_params[PARAM_FACE_ANGLE_X] = math.sin(elapsed * 0.7) * self.head_sway_amp * 0.5
             # Periodic blink: set close window, auto-opens after BLINK_DURATION

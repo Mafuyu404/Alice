@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime
 
 from kokoro import input_events
 
@@ -21,6 +22,7 @@ _CHARACTERS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(__file__)),
     "characters",
 )
+_LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 
 
 class InnerStream:
@@ -233,7 +235,7 @@ class InnerStream:
             activity_context=activity_context or "（无）",
             events=input_events.format_events_for_prompt(
                 events,
-                max_chars=int(section.get("event_prompt_max_chars", 3200) or 3200),
+                max_chars=_event_prompt_max_chars(section, events, trigger_reason),
             ) or "（无）",
             trigger_reason=trigger_reason or "事件短窗口合并",
         ) or _events_user_prompt(
@@ -248,7 +250,10 @@ class InnerStream:
             memory_context=memory_context or "（无）",
             scene_context=scene_context or "（无）",
             activity_context=activity_context or "（无）",
-            events=input_events.format_events_for_prompt(events),
+            events=input_events.format_events_for_prompt(
+                events,
+                max_chars=_event_prompt_max_chars(section, events, trigger_reason),
+            ),
             trigger_reason=trigger_reason or "事件短窗口合并",
         )
         debug["system_prompt"] = system_prompt
@@ -329,9 +334,31 @@ class InnerStream:
                 self._save()
                 debug["after"] = self.text
                 debug["saved"] = True
+            _log_inner_stream_update(
+                self.character_id,
+                enabled=bool(section.get("log_updates", True)),
+                trigger_reason=trigger_reason,
+                events=events,
+                before=debug["before"],
+                after=debug["after"],
+                raw=text,
+                saved=debug["saved"],
+                error=debug["error"],
+            )
         except Exception as exc:
             debug["error"] = str(exc)
             logger.debug("inner stream event evaluation failed: %s", exc)
+            _log_inner_stream_update(
+                self.character_id,
+                enabled=bool(section.get("log_updates", True)),
+                trigger_reason=trigger_reason,
+                events=events,
+                before=debug["before"],
+                after=debug["after"],
+                raw=debug["raw_response"],
+                saved=debug["saved"],
+                error=debug["error"],
+            )
         return debug
 
     def _load(self) -> None:
@@ -401,7 +428,7 @@ class InnerStreamLoop:
         self.stream = stream
         self.context_provider = context_provider
         self.event_delay_seconds = max(0.0, float(event_delay_seconds))
-        self.idle_interval_seconds = max(10.0, float(idle_interval_seconds))
+        self.idle_interval_seconds = max(0.5, float(idle_interval_seconds))
         self.time_tick_interval_seconds = max(0.0, float(time_tick_interval_seconds))
         self.max_batch = max(1, int(max_batch))
         self.search_impulse = search_impulse
@@ -463,9 +490,9 @@ class InnerStreamLoop:
                 continue
             events = self._pop_events(limit=self.max_batch)
             reason = "节奏更新"
-            if not events and self._should_time_tick():
+            if not events:
                 events = [self._time_tick_event(reason="idle rhythm")]
-                reason = "低频时间节奏"
+                reason = "内在心跳"
             elif events:
                 reason = "事件唤醒后的节奏更新"
             if events:
@@ -497,9 +524,12 @@ class InnerStreamLoop:
             self.stream.evaluate_events(events=events, trigger_reason=trigger_reason, **context)
             self._last_update = time.monotonic()
             if self.search_impulse is not None and hasattr(self.search_impulse, "consider"):
+                search_context = dict(context)
+                search_context["event_sources"] = ",".join(event.source for event in events)
+                search_context["event_types"] = ",".join(event.type for event in events)
                 self.search_impulse.consider(
                     inner_stream=self.stream.text,
-                    context=context,
+                    context=search_context,
                 )
             for handler in self.output_handlers:
                 try:
@@ -552,10 +582,21 @@ class InnerStreamLoop:
     def _time_tick_event(self, *, reason: str) -> input_events.InputEvent:
         now = time.monotonic()
         elapsed = now - (self._last_update or self._last_time_tick)
-        self._last_time_tick = now
+        include_time_signal = self._should_time_tick()
+        if include_time_signal:
+            self._last_time_tick = now
         return input_events.build_time_tick_event(
-            f"距离上次内在叙事流更新约 {elapsed:.0f} 秒，期间没有更强输入必须立刻处理。",
-            metadata={"reason": reason, "elapsed_seconds": round(elapsed, 1)},
+            (
+                f"距离上次内在叙事流更新约 {elapsed:.0f} 秒，期间没有更强输入必须立刻处理。"
+                if include_time_signal
+                else "内在叙事流的轻量心跳：没有新事件，也可以继续维持注意、旁路感知和行动倾向。"
+            ),
+            metadata={
+                "reason": reason,
+                "elapsed_seconds": round(elapsed, 1),
+                "heartbeat": True,
+                "time_signal": include_time_signal,
+            },
         )
 
 
@@ -565,13 +606,15 @@ def _events_system_prompt(name: str, user_name: str) -> str:
         "而是根据持续进入的输入事件和自身行动事件，维护她当前仍在延续的心理状态。\n\n"
         "只维护自然语言文本。不要输出 JSON，不要打分，不要写程序规则。\n\n"
         "核心原则：\n"
-        "- 所有人、网页、屏幕、消息和时间变化都只是输入源；没有任何输入天然是中心。\n"
-        "- 说话、沉默、观察和等待都可能是有效行动。\n"
+        "- 所有人、网页、屏幕、消息、QQ群/私聊、搜索结果、记忆和时间变化都只是输入源；没有任何输入天然是中心。\n"
+        "- 说话、沉默、观察、搜索、记住一段经历和等待都可能是有效行动。\n"
+        "- QQ群是当前生活现场之一，群友可以自然成为当下对话对象；不要把群聊自动降级成背景，也不要把所有注意力默认折回某个熟人。\n"
+        "- 私聊存在但没有新消息时，只是一个弱输入；除非有具体理由，不要把它写成正在等待对方先开口。\n"
         "- 内在叙事流记录“我现在作为我还在想什么”，不是事实档案、计划表或长期人格。\n"
         "- 区分短期刺激、持续兴趣和长期认知。\n"
         "- 保留未完成感，但不要写成强制待办。\n\n"
         "输出必须稳定包含以下栏目：\n"
-        "【当前心境】\n【注意力焦点】\n【外部输入态势】\n【未完成感】\n【行动倾向】\n【克制与边界】"
+        "【当前心境】\n【主注意】\n【旁路注意】\n【悬挂线索】\n【外部输入态势】\n【行动倾向】\n【克制与边界】"
     )
 
 
@@ -590,9 +633,60 @@ def _events_user_prompt(**kwargs) -> str:
         f"【认知与情绪】\n{kwargs['cognition_context']}\n\n{kwargs['emotion_context']}\n\n"
         "要求：\n"
         "- 写成第一人称或贴近第一人称的内在连续性，不要写第三方分析报告。\n"
+        f"- 写清楚当前输入让{kwargs['name']}正在做什么判断：继续旁听、想搜索、准备发言、想保留一段经历、靠近某个话题、避开某个话题，或暂时不做什么。\n"
+        "- 搜索、QQ消息、记忆、发言和沉默都是环境与自身行动的一部分；不要写成工具指令或待办清单。\n"
+        "- 使用多焦点注意：主注意写最牵动她的事；旁路注意写仍在流动但不占满她的 QQ、STT、网页或环境；悬挂线索写还没理解、可能要搜索、等待回声、可能沉淀为记忆的东西。\n"
+        "- 行动倾向要自然写出是否有搜索、QQ发言、继续旁听、整理记忆或保持沉默的倾向，方便后续能力层读取；这不是命令。\n"
+        "- 如果QQ群正在发生事情，不要因为某个熟人没有说话就默认等待他；先判断群聊本身是否吸引当前注意力。\n"
         "- 不要复述所有事件，只吸收真正影响当前状态的内容。\n"
         "- 隐私事件只能作为弱信号，不得补写正文。\n"
         "- 行动倾向是自然倾向，不是命令或待办清单。\n"
-        "- 严格使用六个栏目标题。\n\n"
+        "- 严格使用七个栏目标题。\n\n"
         "更新后的内在叙事流："
     )
+
+
+def _event_prompt_max_chars(section: dict, events: list[input_events.InputEvent], trigger_reason: str) -> int:
+    default_max = int(section.get("event_prompt_max_chars", 3200) or 3200)
+    tick_max = int(section.get("tick_prompt_max_chars", 1200) or 1200)
+    is_tick_only = bool(events) and all(event.type == "time_tick" for event in events)
+    if is_tick_only or "心跳" in str(trigger_reason or ""):
+        return max(200, tick_max)
+    return max(200, default_max)
+
+
+def _log_inner_stream_update(
+    character_id: str,
+    *,
+    enabled: bool,
+    trigger_reason: str,
+    events: list[input_events.InputEvent],
+    before: str,
+    after: str,
+    raw: str,
+    saved: bool,
+    error: str = "",
+) -> None:
+    if not enabled:
+        return
+    try:
+        os.makedirs(_LOGS_DIR, exist_ok=True)
+        day = datetime.now().strftime("%Y%m%d")
+        path = os.path.join(_LOGS_DIR, f"inner_stream-{character_id}-{day}.log")
+        event_summary = input_events.format_events_for_prompt(events, max_chars=1200)
+        timestamp = datetime.now().isoformat(timespec="seconds")
+        with open(path, "a", encoding="utf-8") as file:
+            file.write(f"\n===== {timestamp} trigger={trigger_reason} saved={saved} =====\n")
+            if error:
+                file.write(f"error: {error}\n")
+            file.write("[events]\n")
+            file.write((event_summary or "（无）") + "\n")
+            file.write("[before]\n")
+            file.write((before or "（空）").strip() + "\n")
+            file.write("[after]\n")
+            file.write((after or "（空）").strip() + "\n")
+            if raw and raw.strip() != (after or "").strip():
+                file.write("[raw]\n")
+                file.write(raw.strip() + "\n")
+    except Exception as exc:
+        logger.debug("failed to write inner stream log: %s", exc)

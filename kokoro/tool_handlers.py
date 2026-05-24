@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 _vts_revert_timer: threading.Timer | None = None
 _vts_revert_lock = threading.Lock()
 
+_VTS_EXPRESSION_ALIASES = {
+    "confused": "doubt",
+    "confuse": "doubt",
+    "疑惑": "doubt",
+    "困惑": "doubt",
+    "thinking_face": "thinking",
+    "think": "thinking",
+    "smiling": "smile",
+    "happy_smile": "happy",
+}
+
 
 def handle_get_current_time(arguments: dict, **context) -> str:
     now = datetime.datetime.now()
@@ -130,20 +141,20 @@ def handle_save_to_memory(arguments: dict, **context) -> str:
 
 
 def handle_send_qq_message(arguments: dict, **context) -> str:
-    message = str(arguments.get("message") or "").strip()
+    message = str(arguments.get("message") or arguments.get("content") or "").strip()
     if not message:
-        return "QQ message is empty; nothing was sent."
+        return "QQ 消息为空，未发送。"
     conversation_id = str(arguments.get("conversation_id") or "").strip()
     reason = str(arguments.get("reason") or "").strip() or "llm_decided"
     sender = context.get("qq_send_message")
     if not callable(sender):
-        return "QQ transport is not connected; message was not sent."
+        return "QQ 通道未连接，消息未发送。"
     try:
         result = sender(message, conversation_id=conversation_id, reason=reason)
     except Exception as exc:
         logger.warning("send_qq_message failed: %s", exc)
-        return f"QQ send failed: {type(exc).__name__}: {exc}"
-    return str(result or "QQ send returned no result.")
+        return f"QQ 发送失败：{type(exc).__name__}: {exc}"
+    return str(result or "QQ 发送未返回结果。")
 
 
 def handle_vts_expression(arguments: dict, **context) -> str:
@@ -152,11 +163,12 @@ def handle_vts_expression(arguments: dict, **context) -> str:
     Context required: ``vts_controller`` (VTSController instance).
     Optional: ``vts_arbiter`` (VTSExpressionArbiter), ``event_loop``.
     """
+    global _vts_revert_timer
     ctrl = context.get("vts_controller")
     if ctrl is None:
         return "VTS 未连接，无法控制表情。"
 
-    expr = arguments.get("expression", "").strip()
+    expr = _normalize_vts_expression(arguments.get("expression", ""))
     if not expr:
         return "未指定表情。"
 
@@ -165,6 +177,26 @@ def handle_vts_expression(arguments: dict, **context) -> str:
 
     if not ctrl.has_expression(expr):
         return f"未知表情：{expr}"
+
+    arbiter = context.get("vts_arbiter")
+    params = ctrl.get_expression_params(expr, intensity)
+    if arbiter is not None:
+        arbiter.set_layer("tool", params)
+
+        def _delayed_clear():
+            try:
+                arbiter.clear_layer("tool")
+            except Exception:
+                pass
+
+        if duration > 0:
+            with _vts_revert_lock:
+                if _vts_revert_timer and _vts_revert_timer.is_alive():
+                    _vts_revert_timer.cancel()
+                _vts_revert_timer = threading.Timer(duration, _delayed_clear)
+                _vts_revert_timer.daemon = True
+                _vts_revert_timer.start()
+        return f"已切换表情为 {expr}"
 
     # Schedule async injection on the main event loop
     loop: asyncio.AbstractEventLoop | None = context.get("event_loop")
@@ -192,7 +224,6 @@ def handle_vts_expression(arguments: dict, **context) -> str:
             except Exception:
                 pass
 
-        global _vts_revert_timer
         with _vts_revert_lock:
             if _vts_revert_timer and _vts_revert_timer.is_alive():
                 _vts_revert_timer.cancel()
@@ -206,6 +237,39 @@ def handle_vts_expression(arguments: dict, **context) -> str:
         return f"表情设置失败：{exc}"
 
     return f"已切换表情为 {expr}"
+
+
+def _normalize_vts_expression(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    return _VTS_EXPRESSION_ALIASES.get(raw, _VTS_EXPRESSION_ALIASES.get(raw.lower(), raw))
+
+
+def handle_vts_motion(arguments: dict, **context) -> str:
+    body_driver = context.get("vts_body_driver")
+    arbiter = context.get("vts_arbiter")
+    if body_driver is None and arbiter is None:
+        return "VTS 身体控制未连接。"
+
+    motion = str(arguments.get("motion") or "idle").strip().lower()
+    intensity = _clamp_float(arguments.get("intensity", 0.75), 0.0, 1.0)
+    duration = _clamp_float(arguments.get("duration_seconds", 4.0), 0.5, 12.0)
+    reason = str(arguments.get("reason") or motion or "vts_motion").strip()
+
+    if body_driver is not None and hasattr(body_driver, "play_direct_motion"):
+        body_driver.play_direct_motion(motion, intensity=intensity, duration=duration, reason=reason)
+        return f"已执行 Live2D 动作：{motion}"
+
+    return "VTS 身体驱动未启用，无法执行身体动作。"
+
+
+def _clamp_float(value, low: float, high: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = low
+    return max(low, min(high, number))
 
 
 def _find_claude_code() -> str:
@@ -251,18 +315,14 @@ def _run_claude_code_sync(
         cwd = str(Path(__file__).resolve().parent.parent)
 
     desktop = _windows_desktop_dir()
-    system_prompt = (
-        "你是角色通过系统拥有的真实电脑操作能力，由角色自主决定调用。"
-        "你必须实际改变、检查或验证文件系统/系统状态，不要只描述做法，也不要在没有验证时声称成功。\n"
-        f"运行环境：\n- 操作系统：Windows\n- 项目工作目录：{cwd}\n- 用户桌面目录：{desktop}\n\n"
-        "如果任务提到 Desktop 或桌面，必须使用上面的用户桌面目录。"
-        "完成任务后，必须用真实的文件系统检查或命令输出验证结果。"
-        "最终回答必须包含实际创建/修改/检查的精确路径，以及验证是否通过。"
-        "如果验证失败，明确说失败并给出错误。"
+    system_prompt = prompts.format_prompt(
+        "claude_code_exec.system",
+        cwd=cwd,
+        desktop=desktop,
     )
-    user_prompt = (
-        "现在执行下面这个具体任务。不要复述这些说明，直接执行任务并验证结果。\n\n"
-        f"{task}"
+    user_prompt = prompts.format_prompt(
+        "claude_code_exec.user",
+        task=task,
     )
 
     cmd = [

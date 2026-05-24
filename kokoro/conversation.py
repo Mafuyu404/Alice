@@ -34,6 +34,23 @@ def _normalize_echo_text(text: str) -> str:
     return _ECHO_TEXT_RE.sub("", (text or "").lower())
 
 
+def _echo_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        return min(len(a), len(b)) / max(len(a), len(b))
+    max_len = min(len(a), len(b))
+    best = 0
+    for i in range(len(a)):
+        for j in range(len(b)):
+            k = 0
+            while i + k < len(a) and j + k < len(b) and a[i + k] == b[j + k]:
+                k += 1
+            if k > best:
+                best = k
+    return best / max_len if max_len else 0.0
+
+
 class ConversationManager:
     """Processes mic audio through STT and produces user-utterance events.
 
@@ -179,6 +196,11 @@ class ConversationManager:
         if self._partial_count < 2:
             return
 
+        if self._is_ai_context_echo(text):
+            print(f"\n  [trace] overlap dropped_echo text={text[:40]}")
+            self._reset_after_delivery()
+            return
+
         decision = self._classifier.classify(
             user_text=text,
             ai_context=self._ai_context,
@@ -298,6 +320,8 @@ class ConversationManager:
         if len(norm) < 8:
             return norm == spoken or spoken.startswith(norm) or spoken.endswith(norm)
         if norm in spoken or spoken in norm:
+            return True
+        if _echo_similarity(norm, spoken) >= cfg.stt_echo_filter_similarity():
             return True
         overlap = min(len(norm), len(spoken))
         return overlap >= 6 and (norm[:overlap] == spoken[:overlap] or norm[-overlap:] == spoken[-overlap:])

@@ -340,7 +340,7 @@ class StreamingTTS:
 
     def _try_send(self, text: str) -> bool:
         """Send a sentence. Returns False if WS is down (caller should retry)."""
-        if not self._ws_started.is_set() or not self._ws:
+        if self._session_done or not self._ws_started.is_set() or not self._ws:
             return False
         cc = len(text)
         if cc:
@@ -359,6 +359,7 @@ class StreamingTTS:
                 self._pending_count = 0
                 self._all_done.set()
             self._ws_started.clear()
+            self._session_done = True
             return False
 
     def _requeue_inflight_locked(self) -> None:
@@ -408,7 +409,7 @@ class StreamingTTS:
 
             if not send_text:
                 break
-            if not self._ws_started.is_set():
+            if self._session_done or not self._ws_started.is_set():
                 if not self.prepare():
                     break
             if self._try_send(send_text):
@@ -433,7 +434,7 @@ class StreamingTTS:
             remaining = "".join(self._buf).strip()
             if not remaining:
                 break
-            if not self._ws_started.is_set():
+            if self._session_done or not self._ws_started.is_set():
                 if not self.prepare():
                     if time.perf_counter() > deadline or self._should_stop:
                         self._buf = []
@@ -571,9 +572,10 @@ class StreamingTTS:
                             break
                         continue
                     elif event == "task_failed":
+                        status_msg = str(data.get("base_resp", {}).get("status_msg", "unknown error") or "")
                         logger.warning(
                             "MiniMax TTS task_failed: %s",
-                            data.get("base_resp", {}).get("status_msg", "unknown error"),
+                            status_msg,
                         )
                         self._audio_queue.put(None)
                         self._ws_started.clear()
@@ -581,6 +583,8 @@ class StreamingTTS:
                             self._requeue_inflight_locked()
                             self._pending_count = 0
                             self._all_done.set()
+                        if "no messages received" in status_msg.lower():
+                            self._session_done = True
                         break
             except Exception:
                 pass

@@ -102,17 +102,11 @@ class OverlapClassifier:
         if not system_prompt:
             return self._fallback_classify(text)
 
-        system_prompt = (
-            "你是重叠语音打断判断器。AI 正在说话，用户也开口了。\n"
-            "你的任务不是判断用户有没有说话，而是判断用户是否明确要求打断 AI 当前发言。\n"
-            "只有当用户的意思明确是：停下、暂停、等一下、别说了、不要继续、纠正当前正在说的内容、"
-            "要求重来或强行打断时，输出 hard_break。\n"
-            "以下情况一律输出 continue：附和、回答 AI 的问题、普通聊天、提新问题、继续自己的话、"
-            "听不清的短片段、口头禅、背景声、意图不确定。\n"
-            "如果你犹豫，输出 continue。\n"
-            "只输出 hard_break 或 continue。"
+        user_prompt = prompts.format_prompt(
+            "overlap.user",
+            ai_context=ai_context or "（无）",
+            user_text=text,
         )
-        user_prompt = f"AI正在说：{ai_context or '（无）'}\n\n用户说：{text}\n\n分类："
 
         url = f"{self._ollama_url}/api/chat"
         payload = {

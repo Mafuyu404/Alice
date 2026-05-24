@@ -86,6 +86,10 @@ def _extract_items(value: Any) -> list[dict[str, Any]]:
         return [x for x in value if isinstance(x, dict)]
     if not isinstance(value, dict):
         return []
+    if isinstance(value.get("data"), dict):
+        nested = _extract_items(value["data"])
+        if nested:
+            return nested
     for key in ("results", "items", "data", "organic", "webPages"):
         candidate = value.get(key)
         if isinstance(candidate, list):

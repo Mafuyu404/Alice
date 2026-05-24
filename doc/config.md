@@ -135,6 +135,8 @@ minimax_tts_buffer_seconds = 0.3   # 预缓冲秒数，越大越流畅但首音�
 ### STT 语音识别
 
 ```toml
+[stt]
+enabled = false
 stt_model_dir = "models/stt"
 
 # STT 精炼模型（修正同音错字）
@@ -151,7 +153,56 @@ overlap_model = "qwen2.5:0.5b"
 
 # TTS 播放期间暂停麦克风（AEC 启用时无效）
 stt_pause_during_tts = false
+
+# AEC 漏回声时的文本兜底过滤窗口（秒）
+stt_echo_filter_seconds = 45.0
+
+# 回声文本过滤最短字符数
+stt_echo_filter_min_chars = 3
+
+# 回声文本过滤相似度阈值，越低越激进
+stt_echo_filter_similarity = 0.68
 ```
+
+`[stt].enabled = false` 表示主动闭麦：CLI 不加载 STT 模型、不打开麦克风，也不会把环境噪音当成用户输入。QQ、内在叙事流、主动搜索和其他输入仍会继续运行。
+
+### QQ 自主参与
+
+```toml
+[qq]
+packet_max_lines = 40
+packet_max_age_seconds = 180.0
+idle_packet_max_age_seconds = 90.0
+batch_quiet_seconds = 1.0
+idle_participation_seconds = 30.0
+autonomous_participation_enabled = true
+absorb_before_decide = false
+participation_cooldown_seconds = 8.0
+max_message_chars = 260
+
+[qq.image_understanding]
+enabled = true
+auto_save_stickers = true
+save_screenshots = false
+save_photos = false
+sticker_dir = "data/stickers"
+```
+
+`absorb_before_decide = false` 时，QQ 消息会先注册到输入事件，再由 QQ 参与判断读取当前 inner stream 和最新环境包快速决定是否回应；内在叙事流随后异步吸收。主动搜索可以继续并行触发，搜索结果回来后再作为输入影响后续内在叙事流。图片和表情包仍会被识别并反馈进内在叙事流，但截图/照片默认不会进入表情包库。
+
+表情包库会保存语义档案，包括画面描述、图中文字、情绪、适用场景、风格、强度和使用说明。QQ 发送表情包前会用当前群聊和内在叙事流做本地关键词初筛，再把较多相关候选交给 LLM 选择。
+
+### 内在认知反思
+
+```toml
+[inner_cognition]
+enabled = true
+consider_interval_seconds = 45.0
+min_events = 1
+max_event_chars = 5000
+```
+
+`inner_cognition` 会在内在叙事流更新后，把 QQ 群友、关系、项目和长期对象的稳定印象写入 `characters/{id}/cognition.json`。它和 `inner_memory` 不同：memory 记录发生过的一整件事，cognition 记录之后会反复影响态度和理解的稳定认识。
 
 ### 回声消除 (AEC)
 

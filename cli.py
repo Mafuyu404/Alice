@@ -13,12 +13,14 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import traceback
 import threading
 from collections import deque
 from datetime import datetime
+from urllib.parse import urlparse
 
 import requests
 
@@ -48,6 +50,8 @@ from kokoro import token_usage
 from kokoro import tool_registry as tool_registry_mod
 from kokoro import task_manager as task_manager_mod
 from kokoro import vts_controller as vts_mod
+from kokoro.vts_body_driver import VTSBodyDriver
+from kokoro.web_search_client import WebSearchClient
 
 
 _PAREN_STRIP_RE = re.compile(r"\s*[\uff08(][^\uff09)]*[\uff09)]\s*")
@@ -61,6 +65,23 @@ _ECHO_TEXT_RE = re.compile(r"[\s\W_]+", re.UNICODE)
 
 def _normalize_echo_text(text: str) -> str:
     return _ECHO_TEXT_RE.sub("", (text or "").lower())
+
+
+def _echo_similarity(a: str, b: str) -> float:
+    if not a or not b:
+        return 0.0
+    if a in b or b in a:
+        return min(len(a), len(b)) / max(len(a), len(b))
+    max_len = min(len(a), len(b))
+    best = 0
+    for i in range(len(a)):
+        for j in range(len(b)):
+            k = 0
+            while i + k < len(a) and j + k < len(b) and a[i + k] == b[j + k]:
+                k += 1
+            if k > best:
+                best = k
+    return best / max_len if max_len else 0.0
 
 
 class _ParenFilter:
@@ -80,6 +101,102 @@ class _ParenFilter:
             elif self._depth == 0:
                 result.append(ch)
         return "".join(result)
+
+
+def _start_web_search_daemon(config: dict) -> subprocess.Popen | None:
+    section = config.get("inner_stream_search", {})
+    if not isinstance(section, dict) or not bool(section.get("enabled", False)):
+        return None
+    base_url = str(section.get("base_url") or "http://127.0.0.1:58902").rstrip("/")
+    try:
+        WebSearchClient(base_url=base_url, timeout=2.0).health()
+        print(f"  [web_search] daemon ready: {base_url}")
+        return None
+    except Exception:
+        pass
+
+    parsed = urlparse(base_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 58902
+    node_exe, entry_js = _find_open_websearch_entry()
+    if not node_exe or not entry_js:
+        print("  [web_search] open-websearch not found; install with `npm install -g open-websearch`")
+        return None
+
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    out_path = os.path.join(log_dir, "open-websearch.out.log")
+    err_path = os.path.join(log_dir, "open-websearch.err.log")
+    out_file = open(out_path, "a", encoding="utf-8")
+    err_file = open(err_path, "a", encoding="utf-8")
+    try:
+        proc = subprocess.Popen(
+            [
+                node_exe,
+                entry_js,
+                "serve",
+                "--host",
+                host,
+                "--port",
+                str(port),
+            ],
+            cwd=os.path.dirname(__file__),
+            stdout=out_file,
+            stderr=err_file,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception as exc:
+        out_file.close()
+        err_file.close()
+        print(f"  [web_search] failed to start daemon: {type(exc).__name__}: {exc}")
+        return None
+
+    for _ in range(20):
+        time.sleep(0.5)
+        try:
+            WebSearchClient(base_url=base_url, timeout=2.0).health()
+            print(f"  [web_search] daemon started: {base_url}")
+            return proc
+        except Exception:
+            if proc.poll() is not None:
+                print(f"  [web_search] daemon exited early; see {err_path}")
+                return None
+    print(f"  [web_search] daemon start timed out: {base_url}")
+    return proc
+
+
+def _find_open_websearch_entry() -> tuple[str, str]:
+    candidates: list[tuple[str, str]] = []
+    for base in (
+        os.path.dirname(sys.executable),
+        os.environ.get("APPDATA", ""),
+        r"D:\program\nodejs",
+    ):
+        if not base:
+            continue
+        candidates.append(
+            (
+                os.path.join(base, "node.exe"),
+                os.path.join(base, "node_modules", "open-websearch", "build", "index.js"),
+            )
+        )
+    for node_exe, entry_js in candidates:
+        if os.path.exists(node_exe) and os.path.exists(entry_js):
+            return node_exe, entry_js
+    return "", ""
+
+
+def _stop_web_search_daemon(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 CONFIG = cfg.load()
@@ -208,6 +325,7 @@ def chat_stream(
     usage_callback=None,
     subtitle_client=None,
     trace_t0: float | None = None,
+    ai_context_callback=None,
 ) -> tuple[str, bool]:
     """Stream LLM response. Returns (reply_text, was_cancelled)."""
     print(f"\n{char_name}: ", end="", flush=True)
@@ -282,6 +400,8 @@ def chat_stream(
             print(f"{char_name}: ", end="", flush=True)
         print(content, end="", flush=True)
         reply += content
+        if ai_context_callback:
+            ai_context_callback(reply)
         if tts_engine:
             tts_engine.push(content)
         if subtitle_client:
@@ -404,6 +524,7 @@ def main() -> None:
     _vts_arbiter: vts_mod.VTSExpressionArbiter | None = None
     _vts_idle_loop: vts_mod.VTSIdleLoop | None = None
     _vts_lipsync: vts_mod.VTSLipSync | None = None
+    _vts_body_driver: VTSBodyDriver | None = None
     _vts_loop: asyncio.AbstractEventLoop | None = None
     _vts_loop_thread: threading.Thread | None = None
 
@@ -431,6 +552,18 @@ def main() -> None:
             asyncio.run_coroutine_threadsafe(_vts_idle_loop.start(), _vts_loop)
 
             _vts_lipsync = vts_mod.VTSLipSync(_vts_controller, _vts_arbiter, loop=_vts_loop)
+            body_cfg = vts_cfg.get("body", {}) if isinstance(vts_cfg.get("body", {}), dict) else {}
+            _vts_body_driver = VTSBodyDriver(
+                arbiter=_vts_arbiter,
+                session=session,
+                enabled=bool(body_cfg.get("enabled", True)),
+                update_hz=float(body_cfg.get("update_hz", 30.0)),
+                intent_interval_seconds=float(body_cfg.get("intent_interval_seconds", 2.0)),
+                idle_request_seconds=float(body_cfg.get("idle_request_seconds", 2.5)),
+                model=str(body_cfg.get("model", "") or ""),
+                debug_log=bool(body_cfg.get("debug_log", True)),
+            )
+            asyncio.run_coroutine_threadsafe(_vts_body_driver.start(), _vts_loop)
 
             if tts_engine is not None:
                 _original_audio_frame = tts_engine.on_audio_frame
@@ -443,12 +576,12 @@ def main() -> None:
             def _on_vts_emotion(tone: str, motivation: str) -> None:
                 if _vts_arbiter is None:
                     return
-                expr_id = _vts_controller.resolve_emotion_tone(tone) if _vts_controller else None
-                if expr_id:
-                    params = _vts_controller.get_expression_params(expr_id, 1.0)
-                    _vts_arbiter.set_layer("emotion", params)
-                else:
-                    _vts_arbiter.clear_layer("emotion")
+                _vts_arbiter.clear_layer("emotion")
+                if _vts_body_driver is not None:
+                    _vts_body_driver.request_update(
+                        "emotion_update",
+                        f"情绪基调：{tone}\n中期动机：{motivation}",
+                    )
 
             if session is not None and hasattr(session, "emotion"):
                 session.emotion._on_update = _on_vts_emotion
@@ -458,12 +591,18 @@ def main() -> None:
                 while not machine.is_shutting_down and _vts_idle_loop:
                     is_active = bool(tts_engine and tts_engine.is_playing)
                     _vts_idle_loop.set_tts_active(is_active)
+                    if _vts_body_driver is not None:
+                        _vts_body_driver.set_speaking(is_active)
                     if is_active and not was_active:
                         if _vts_lipsync:
                             _vts_lipsync.start()
+                        if _vts_body_driver is not None:
+                            _vts_body_driver.request_update("tts_started", "开始说话")
                     elif not is_active and was_active:
                         if _vts_lipsync:
                             _vts_lipsync.stop()
+                        if _vts_body_driver is not None:
+                            _vts_body_driver.request_update("tts_finished", "刚说完话")
                     was_active = is_active
                     time.sleep(0.5)
             if _vts_idle_loop:
@@ -476,6 +615,7 @@ def main() -> None:
             _vts_arbiter = None
             _vts_idle_loop = None
             _vts_lipsync = None
+            _vts_body_driver = None
 
     # ── subtitle overlay (tied to portrait on/off) ────────────────────────────
     _subtitle_client: subtitle_mod.SubtitleOverlayClient | None = None
@@ -541,27 +681,31 @@ def main() -> None:
         if not norm:
             return
         now = time.monotonic()
+        keep_seconds = max(8.0, cfg.stt_echo_filter_seconds())
         with recent_tts_lock:
             recent_tts_texts.append((now, norm))
-            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+            while recent_tts_texts and now - recent_tts_texts[0][0] > keep_seconds:
                 recent_tts_texts.popleft()
 
     def is_probable_tts_echo(text: str) -> bool:
         norm = _normalize_echo_text(text)
-        if len(norm) < 2:
+        min_chars = max(2, cfg.stt_echo_filter_min_chars())
+        if len(norm) < min_chars:
             return False
         now = time.monotonic()
+        keep_seconds = max(8.0, cfg.stt_echo_filter_seconds())
+        threshold = max(0.5, min(0.98, cfg.stt_echo_filter_similarity()))
         with recent_tts_lock:
-            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+            while recent_tts_texts and now - recent_tts_texts[0][0] > keep_seconds:
                 recent_tts_texts.popleft()
             for _, spoken in recent_tts_texts:
                 if len(norm) < 8:
-                    if norm == spoken or (
-                        len(norm) >= 2 and (spoken.startswith(norm) or spoken.endswith(norm))
-                    ):
+                    if norm == spoken or norm in spoken or spoken.startswith(norm) or spoken.endswith(norm):
                         return True
                     continue
                 if norm in spoken or spoken in norm:
+                    return True
+                if _echo_similarity(norm, spoken) >= threshold:
                     return True
                 overlap = min(len(norm), len(spoken))
                 if overlap >= 6 and (
@@ -585,6 +729,8 @@ def main() -> None:
     elif args.bilibili_room is not None and _bilibili_room_id_raw > 0:
         print(f"  [bilibili] Room {_bilibili_room_id_raw} set but bilibili_live.enabled = false in config")
         _bilibili_enabled = False
+
+    _web_search_proc = _start_web_search_daemon(CONFIG)
 
     # ── dialogue orchestrator + proactive speech ────────────────────────────
     _stt_refine_mode = cfg.stt_refine_mode()
@@ -627,6 +773,13 @@ def main() -> None:
             _pending_user_turn["reason"] = "endpoint"
         if not text:
             return
+        if is_probable_tts_echo(text):
+            if _stt_subtitle_client:
+                _stt_subtitle_client.clear()
+            print("\n  [stt] dropped probable tts echo at flush")
+            conversation.reset_stream()
+            machine.set_stt_state(sm.STTState.LISTENING)
+            return
         print(
             f"\n  [trace] cli_flush force={force} reason={reason} text={len(text)}ch "
             f"merge_wait={(max(0.0, now - (deadline or now))):.2f}s"
@@ -636,6 +789,18 @@ def main() -> None:
                 _stt_subtitle_client.clear()
             display_user(text)
             _dialogue.cancel_plans()
+            session.record_input_event(
+                text,
+                source="speech",
+                event_type="text",
+                metadata={
+                    "speaker": session.user_name,
+                    "interrupts_prior_focus": True,
+                    "attention_reset": "latest_user_input",
+                    "reason": reason,
+                },
+                priority="high",
+            )
             if not machine.emit(sm.SystemEvent.STT_REFINED):
                 return
             conversation.reset_stream()
@@ -747,6 +912,18 @@ def main() -> None:
                 _stt_subtitle_client.clear()
             display_user(consumed)
             _dialogue.cancel_plans()
+            session.record_input_event(
+                consumed,
+                source="speech",
+                event_type="text",
+                metadata={
+                    "speaker": session.user_name,
+                    "interrupts_prior_focus": True,
+                    "attention_reset": "latest_user_input",
+                    "reason": "stt_pool",
+                },
+                priority="high",
+            )
             machine.emit(sm.SystemEvent.LLM_DONE)
 
             # 直接用 planner 的回复（一次 LLM 调用完成全部，不走第二次 chat_stream）
@@ -912,10 +1089,11 @@ def main() -> None:
                     character_id=session.character_id,
                     vts_controller=_vts_controller,
                     vts_arbiter=_vts_arbiter,
+                    vts_body_driver=_vts_body_driver,
                     event_loop=_vts_loop,
                     task_manager=_task_manager,
                     qq_send_message=_qq_tool_sender[0],
-                ), subtitle_client=_subtitle_client, trace_t0=trace_t0)
+                ), subtitle_client=_subtitle_client, trace_t0=trace_t0, ai_context_callback=conversation.update_ai_context if conversation else None)
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
                 machine.emit_error("llm_connection")
@@ -936,6 +1114,8 @@ def main() -> None:
             print(f"  [trace] reply_clean +{time.perf_counter() - trace_t0:.2f}s reply={len(reply)}ch")
             if reply:
                 remember_tts_text(reply)
+                if conversation:
+                    conversation.update_ai_context(reply)
 
             if tts_engine:
                 machine.set_tts_state(sm.TTSState.STREAMING)
@@ -956,6 +1136,8 @@ def main() -> None:
                 if cancel_event.is_set():
                     _current_cancel[0] = None
                     return
+                if reply:
+                    remember_tts_text(reply)
                 if _aec_processor is not None and cfg.aec_auto_reset_on_tts_done():
                     _aec_processor.reset()
                 tts_engine.prepare()
@@ -1025,11 +1207,13 @@ def main() -> None:
                         character_id=session.character_id,
                         vts_controller=_vts_controller,
                         vts_arbiter=_vts_arbiter,
+                        vts_body_driver=_vts_body_driver,
                         event_loop=_vts_loop,
                         task_manager=_task_manager,
                         qq_send_message=_qq_tool_sender[0],
                     ),
                     subtitle_client=_subtitle_client,
+                    ai_context_callback=conversation.update_ai_context if conversation else None,
                 )
             except requests.exceptions.ConnectionError:
                 print(f"\n[connection failed] Cannot connect to {llm_client.api_base_for(dialogue_model)}")
@@ -1094,7 +1278,7 @@ def main() -> None:
                     if not target_id:
                         target_id = _qq_runtime.recent_conversation_id()
                     if not target_id:
-                        return "QQ send failed: no recent QQ conversation is available."
+                        return "QQ 发送失败：没有可用的最近 QQ 会话。"
 
                     params = {"message": message}
                     if target_id.startswith("group:"):
@@ -1104,7 +1288,7 @@ def main() -> None:
                         params["message_type"] = "private"
                         params["user_id"] = target_id.split(":", 1)[1]
                     else:
-                        return f"QQ send failed: unknown conversation_id {target_id!r}."
+                        return f"QQ 发送失败：未知 conversation_id {target_id!r}。"
 
                     decision = qq_input.QQParticipationDecision(
                         action="say",
@@ -1116,10 +1300,10 @@ def main() -> None:
                     try:
                         future.result(timeout=5)
                     except Exception as exc:
-                        return f"QQ send failed: {type(exc).__name__}: {exc}"
+                        return f"QQ 发送失败：{type(exc).__name__}: {exc}"
                     _qq_runtime.record_sent(decision, nickname=session.character_name)
                     print(f"\n[qq] tool say {target_id}: {message[:80]}")
-                    return f"QQ message sent to {target_id}: {message}"
+                    return f"QQ 消息已发送到 {target_id}：{message}"
 
                 def _poll_and_maybe_send(ws) -> None:
                     if not poll_lock.acquire(blocking=False):
@@ -1134,7 +1318,7 @@ def main() -> None:
                             if decision.reason:
                                 print(f"\n[qq] silent: {decision.reason}")
                             return
-                        params = {"message": decision.message}
+                        params = {"message": decision.payload}
                         if decision.conversation_id.startswith("group:"):
                             params["message_type"] = "group"
                             params["group_id"] = decision.conversation_id.split(":", 1)[1]
@@ -1245,22 +1429,31 @@ def main() -> None:
     threading.Thread(target=_dialogue_context_worker, daemon=True).start()
 
     refine_url, refine_model, refine_key = refine_endpoint()
+    stt_enabled = cfg.stt_enabled()
+    device = args.device if args.device is not None else (stt_mod.find_input_device() if stt_enabled else None)
+    recognizer = None
+    conversation = None
+    if stt_enabled:
+        if device is None:
+            print("\n[error] No microphone device found.")
+            print("Run `python cli.py --list-devices` to inspect available devices.\n")
+            return
 
-    device = args.device if args.device is not None else stt_mod.find_input_device()
-    if device is None:
-        print("\n[error] No microphone device found.")
-        print("Run `python cli.py --list-devices` to inspect available devices.\n")
-        return
-
-    model_path = stt_mod.download_model(CONFIG.get("stt_model_dir", "models/stt"))
-    print("  [cli] Loading speech model...")
-    recognizer = stt_mod.create_recognizer(
-        model_path,
-        argparse.Namespace(num_threads=4, hotwords="", hotwords_score=1.5, verbose=False),
-    )
+        model_path = stt_mod.download_model(CONFIG.get("stt_model_dir", "models/stt"))
+        print("  [cli] Loading speech model...")
+        recognizer = stt_mod.create_recognizer(
+            model_path,
+            argparse.Namespace(num_threads=4, hotwords="", hotwords_score=1.5, verbose=False),
+        )
+    else:
+        print("  [stt] disabled by config")
 
     # ── ConversationManager (replaces old ConversationPool + manual STT loop) ──
     def _on_stt_partial(text: str) -> None:
+        if is_probable_tts_echo(text):
+            if _stt_subtitle_client:
+                _stt_subtitle_client.clear()
+            return
         if _stt_subtitle_client:
             _stt_subtitle_client.push_text(text, mode="set")
         sys.stdout.write(f"\r\033[K  [STT] {text}")
@@ -1269,24 +1462,25 @@ def main() -> None:
             machine.emit(sm.SystemEvent.USER_SPEECH_START)
             machine.set_stt_state(sm.STTState.LISTENING)
 
-    conversation = conversation_mod.ConversationManager(
-        recognizer=recognizer,
-        machine=machine,
-        on_user_utterance=on_user_utterance,
-        on_partial=_on_stt_partial,
-        sample_rate=stt_mod.SAMPLE_RATE,
-        silence_endpoint_delay=cfg.stt_refine_stable_seconds(),
-        commit_delay=cfg.stt_utterance_commit_seconds(),
-        short_extra_delay=cfg.stt_short_utterance_extra_seconds(),
-        short_max_chars=cfg.stt_short_utterance_max_chars(),
-    )
+    if stt_enabled and recognizer is not None:
+        conversation = conversation_mod.ConversationManager(
+            recognizer=recognizer,
+            machine=machine,
+            on_user_utterance=on_user_utterance,
+            on_partial=_on_stt_partial,
+            sample_rate=stt_mod.SAMPLE_RATE,
+            silence_endpoint_delay=cfg.stt_refine_stable_seconds(),
+            commit_delay=cfg.stt_utterance_commit_seconds(),
+            short_extra_delay=cfg.stt_short_utterance_extra_seconds(),
+            short_max_chars=cfg.stt_short_utterance_max_chars(),
+        )
 
     print()
     print("=" * 50)
     print("  Alice CLI")
     print(f"  Character: {session.character_name}")
     print(f"  Dialogue model: {dialogue_model}")
-    print(f"  Microphone: [{device}]")
+    print(f"  Microphone: [{'disabled' if not stt_enabled else device}]")
     print(f"  TTS: {tts_engine is not None}")
     print(f"  Portrait: {portrait_worker is not None}")
     print(f"  VTS: {_vts_controller is not None}")
@@ -1353,8 +1547,9 @@ def main() -> None:
                 except Exception:
                     pass
 
-    stt_thread = threading.Thread(target=stt_worker, daemon=True)
-    stt_thread.start()
+    if stt_enabled and conversation is not None:
+        stt_thread = threading.Thread(target=stt_worker, daemon=True)
+        stt_thread.start()
     def screen_cache_worker() -> None:
         """Continuous screen capture -> analyze -> cache loop.
 
@@ -1484,6 +1679,7 @@ def main() -> None:
             _qq_server_stop.set()
         if _qq_server_thread is not None:
             _qq_server_thread.join(timeout=2)
+        _stop_web_search_daemon(_web_search_proc)
         print()
         print(token_usage.summary())
         if portrait_worker:
@@ -1500,6 +1696,11 @@ def main() -> None:
         if _vts_idle_loop:
             try:
                 asyncio.run_coroutine_threadsafe(_vts_idle_loop.stop(), _vts_loop).result(timeout=3)
+            except Exception:
+                pass
+        if _vts_body_driver:
+            try:
+                asyncio.run_coroutine_threadsafe(_vts_body_driver.stop(), _vts_loop).result(timeout=3)
             except Exception:
                 pass
         if _vts_arbiter:
@@ -1578,6 +1779,7 @@ def _run_multi_cli(args):
     from kokoro import memory as mem_mod
 
     runtime_cfg = cfg.load()
+    _web_search_proc = _start_web_search_daemon(runtime_cfg)
     user_name = cfg.user_name()
     default_model = cfg.llm_model()
     machine = sm.SystemStateMachine()
@@ -1690,21 +1892,27 @@ def _run_multi_cli(args):
         if not norm:
             return
         now = time.monotonic()
+        keep_seconds = max(8.0, cfg.stt_echo_filter_seconds())
         with recent_tts_lock:
             recent_tts_texts.append((now, norm))
-            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+            while recent_tts_texts and now - recent_tts_texts[0][0] > keep_seconds:
                 recent_tts_texts.popleft()
 
     def is_probable_tts_echo(text: str) -> bool:
         norm = _normalize_echo_text(text)
-        if len(norm) < 8:
+        min_chars = max(2, cfg.stt_echo_filter_min_chars())
+        if len(norm) < min_chars:
             return False
         now = time.monotonic()
+        keep_seconds = max(8.0, cfg.stt_echo_filter_seconds())
+        threshold = max(0.5, min(0.98, cfg.stt_echo_filter_similarity()))
         with recent_tts_lock:
-            while recent_tts_texts and now - recent_tts_texts[0][0] > 8.0:
+            while recent_tts_texts and now - recent_tts_texts[0][0] > keep_seconds:
                 recent_tts_texts.popleft()
             for _, spoken in recent_tts_texts:
                 if norm in spoken or spoken in norm:
+                    return True
+                if _echo_similarity(norm, spoken) >= threshold:
                     return True
         return False
 
@@ -1787,6 +1995,11 @@ def _run_multi_cli(args):
             _pending_user_turn["deadline"] = 0.0
         if not text:
             return
+        if is_probable_tts_echo(text):
+            conversation.reset_stream()
+            safe_print("\n  [stt] dropped probable tts echo at flush")
+            machine.set_stt_state(sm.STTState.LISTENING)
+            return
         machine.emit(sm.SystemEvent.STT_REFINED)
         hold_auto_turns(2.0)
         if _aec_processor is not None:
@@ -1805,37 +2018,44 @@ def _run_multi_cli(args):
             _pending_user_turn["deadline"] = time.monotonic() + stt_turn_deadline_delay(_pending_user_turn["text"])
 
     def _on_stt_partial(text: str) -> None:
+        if is_probable_tts_echo(text):
+            return
         with io_lock:
             sys.stdout.write(f"\r\033[K  [STT] {text}")
             sys.stdout.flush()
-        hold_auto_turns(0.8)
         if machine.is_idle:
             machine.emit(sm.SystemEvent.USER_SPEECH_START)
             machine.set_stt_state(sm.STTState.LISTENING)
 
-    device = args.device if args.device is not None else stt_mod.find_input_device()
-    if device is None:
-        safe_print("\n[error] No microphone device found.")
-        safe_print("Run `python cli.py --list-devices` to inspect available devices.\n")
-        return
+    stt_enabled = cfg.stt_enabled()
+    device = args.device if args.device is not None else (stt_mod.find_input_device() if stt_enabled else None)
+    recognizer = None
+    conversation = None
+    if stt_enabled:
+        if device is None:
+            safe_print("\n[error] No microphone device found.")
+            safe_print("Run `python cli.py --list-devices` to inspect available devices.\n")
+            return
 
-    model_path = stt_mod.download_model(CONFIG.get("stt_model_dir", "models/stt"))
-    safe_print("  [cli] Loading speech model...")
-    recognizer = stt_mod.create_recognizer(
-        model_path,
-        argparse.Namespace(num_threads=4, hotwords="", hotwords_score=1.5, verbose=False),
-    )
-    conversation = conversation_mod.ConversationManager(
-        recognizer=recognizer,
-        machine=machine,
-        on_user_utterance=on_user_utterance,
-        on_partial=_on_stt_partial,
-        sample_rate=stt_mod.SAMPLE_RATE,
-        silence_endpoint_delay=cfg.stt_refine_stable_seconds(),
-        commit_delay=cfg.stt_utterance_commit_seconds(),
-        short_extra_delay=cfg.stt_short_utterance_extra_seconds(),
-        short_max_chars=cfg.stt_short_utterance_max_chars(),
-    )
+        model_path = stt_mod.download_model(CONFIG.get("stt_model_dir", "models/stt"))
+        safe_print("  [cli] Loading speech model...")
+        recognizer = stt_mod.create_recognizer(
+            model_path,
+            argparse.Namespace(num_threads=4, hotwords="", hotwords_score=1.5, verbose=False),
+        )
+        conversation = conversation_mod.ConversationManager(
+            recognizer=recognizer,
+            machine=machine,
+            on_user_utterance=on_user_utterance,
+            on_partial=_on_stt_partial,
+            sample_rate=stt_mod.SAMPLE_RATE,
+            silence_endpoint_delay=cfg.stt_refine_stable_seconds(),
+            commit_delay=cfg.stt_utterance_commit_seconds(),
+            short_extra_delay=cfg.stt_short_utterance_extra_seconds(),
+            short_max_chars=cfg.stt_short_utterance_max_chars(),
+        )
+    else:
+        safe_print("  [stt] disabled by config")
 
     # In multi-character voice chat, pausing STT during TTS makes the user
     # effectively unable to break in while either character is speaking.
@@ -1885,15 +2105,16 @@ def _run_multi_cli(args):
                 except Exception:
                     pass
 
-    stt_thread = threading.Thread(target=stt_worker, daemon=True)
-    stt_thread.start()
+    if stt_enabled and conversation is not None:
+        stt_thread = threading.Thread(target=stt_worker, daemon=True)
+        stt_thread.start()
 
     def run_auto_turns(limit: int, *, sleep_between: bool = False) -> int:
         produced = 0
         while limit <= 0 or produced < limit:
             if sleep_between and produced > 0:
                 time.sleep(max(0.1, float(args.idle_seconds)))
-            if machine.is_listening or auto_turns_blocked():
+            if auto_turns_blocked():
                 time.sleep(0.1)
                 continue
             _wait_for_multi_tts(tts_map)
@@ -1999,6 +2220,7 @@ def _run_multi_cli(args):
             orch.close()
         except Exception:
             pass
+        _stop_web_search_daemon(_web_search_proc)
         # ── Write multi-character chat logs ──────────────────────────────────
         for cid, c_session in getattr(orch, 'sessions', {}).items():
             try:
