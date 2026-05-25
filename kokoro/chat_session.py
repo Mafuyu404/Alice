@@ -140,9 +140,17 @@ class ChatSession:
     def character_name(self) -> str:
         return self.character_data["name"]
 
+    _cached_system_prompt: str = ""
+    _cached_system_prompt_key: tuple = ()
+
     @property
     def system_prompt(self) -> str:
-        return character.build_system_prompt(self.character_data, user_name=self.user_name)
+        key = (self.character_data.get("name", ""), self.user_name,
+               self.character_data.get("system_prompt_template", ""))
+        if key != self._cached_system_prompt_key:
+            self._cached_system_prompt = character.build_system_prompt(self.character_data, user_name=self.user_name)
+            self._cached_system_prompt_key = key
+        return self._cached_system_prompt
 
     @property
     def scene_name(self) -> str:
@@ -601,62 +609,21 @@ class ChatSession:
         system = prompts.get("conversation_summary.system", "")
 
         from kokoro import config as cfg
-        from kokoro import token_usage
+        from kokoro import deepseek_api
 
         model = cfg.stt_refine_model()
-        url = cfg.llm_url()
-        api_key = ""
-        if cfg.is_deepseek_model(model):
-            api_key = cfg.deepseek_api_key()
-            url = cfg.deepseek_url()
-
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-            api_url = f"{url}/v1/chat/completions"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.1,
-                "max_tokens": 512,
-            }
-        else:
-            api_url = f"{url}/api/chat"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": 512},
-            }
-
         try:
-            req = urllib.request.Request(
-                api_url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
+            result = deepseek_api.chat(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                model=model,
+                temperature=0.1,
+                max_tokens=512,
+                function="conversation_summary",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-            if api_key:
-                usage = result.get("usage", {})
-                pt = int(usage.get("prompt_tokens", 0))
-                ct = int(usage.get("completion_tokens", 0))
-                if pt or ct:
-                    token_usage.record(model, "conversation_summary", pt, ct)
-                text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            else:
-                pt = int(result.get("prompt_eval_count", 0))
-                ct = int(result.get("eval_count", 0))
-                if pt or ct:
-                    token_usage.record(model, "conversation_summary", pt, ct)
-                text = result.get("message", {}).get("content", "").strip()
-            return text if text else None
+            return result["content"] if result["content"] else None
         except Exception as exc:
             logger.warning("summary LLM call failed: %s", exc)
             return None

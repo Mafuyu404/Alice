@@ -1301,7 +1301,7 @@ def main() -> None:
                         future.result(timeout=5)
                     except Exception as exc:
                         return f"QQ 发送失败：{type(exc).__name__}: {exc}"
-                    _qq_runtime.record_sent(decision, nickname=session.character_name)
+                    _qq_runtime.record_sent(decision, self_id=_qq_runtime.self_id, nickname=session.character_name)
                     print(f"\n[qq] tool say {target_id}: {message[:80]}")
                     return f"QQ 消息已发送到 {target_id}：{message}"
 
@@ -1329,6 +1329,7 @@ def main() -> None:
                             print(f"\n[qq] unknown conversation id: {decision.conversation_id}")
                             return
 
+                        _qq_runtime.record_sent(decision, self_id=_qq_runtime.self_id, nickname=session.character_name)
                         future = asyncio.run_coroutine_threadsafe(_send_action(ws, "send_msg", params), loop)
 
                         def _log_send_result(done) -> None:
@@ -1337,7 +1338,6 @@ def main() -> None:
                             except Exception as exc:
                                 print(f"\n[qq] send action failed: {type(exc).__name__}: {exc}")
                                 return
-                            _qq_runtime.record_sent(decision, nickname=session.character_name)
                             print(f"\n[qq] say {decision.conversation_id}: {decision.message[:80]}")
 
                         future.add_done_callback(_log_send_result)

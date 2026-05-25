@@ -590,57 +590,36 @@ class DialogueOrchestrator:
         return "\n".join(plan.to_prompt_line(now) for plan in plans)
 
     def _call_planner(self, system_prompt: str, user_prompt: str) -> str:
+        from kokoro import deepseek_api
+
         model = self.planning_model
         openai_compatible = False
         if cfg.is_deepseek_model(model):
-            api_key = cfg.deepseek_api_key()
-            api_url = cfg.deepseek_url()
             openai_compatible = True
         elif model.lower().startswith("charglm"):
-            api_key = cfg.charglm_api_key()
-            api_url = self.session.character_config.get("llm_url") or cfg.llm_url()
             openai_compatible = True
-        else:
-            api_key = ""
-            api_url = cfg.llm_url()
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        headers = {"Content-Type": "application/json"}
         if openai_compatible:
-            base_url = api_url.rstrip("/")
-            if not re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            headers["Authorization"] = f"Bearer {api_key}"
-            resp = requests.post(
-                f"{base_url}/chat/completions",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": 500,
-                    "response_format": {"type": "json_object"},
-                },
-                headers=headers,
-                timeout=45,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            usage = data.get("usage", {})
-            pt = int(usage.get("prompt_tokens", 0))
-            ct = int(usage.get("completion_tokens", 0))
-            if pt or ct:
-                token_usage.record(model, "dialogue_plan", pt, ct)
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return deepseek_api.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                model=model,
+                temperature=0.2,
+                max_tokens=500,
+                json_mode=True,
+                function="dialogue_plan",
+            )["content"]
 
         resp = requests.post(
-            f"{api_url}/api/chat",
+            f"{cfg.llm_url().rstrip('/')}/api/chat",
             json={
                 "model": model,
-                "messages": messages,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
                 "stream": False,
                 "options": {"temperature": 0.2, "num_predict": 500},
             },

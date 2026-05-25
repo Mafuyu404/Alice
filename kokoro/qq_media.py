@@ -424,6 +424,10 @@ def fallback_sticker(query: str = "", *, min_score: float = 0.45) -> dict | None
     return StickerLibrary().fallback_item(query, min_score=min_score)
 
 
+def retire_sticker(sticker_id: str, *, reason: str = "", actor: str = "") -> dict | None:
+    return StickerLibrary().retire_item(sticker_id, reason=reason, actor=actor)
+
+
 def _parse_cq_attrs(text: str) -> dict[str, str]:
     attrs: dict[str, str] = {}
     for part in str(text or "").split(","):

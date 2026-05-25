@@ -265,7 +265,6 @@ class Mem0Backend(MemoryBackend):
 
     def _check_importance_llm(self, user_msg: str, assistant_msg: str, name: str = "助手") -> bool:
         model = self._lc["importance_llm"] or "qwen2.5:1.5b"
-        base_url = self._lc["importance_llm_url"] or cfg_mod.llm_url()
         prompt = prompts.format_prompt(
             "memory_importance.user_template",
             user_msg=user_msg,
@@ -274,28 +273,17 @@ class Mem0Backend(MemoryBackend):
             name=name,
         )
         try:
-            import requests
+            from kokoro import deepseek_api
 
-            resp = requests.post(
-                f"{base_url}/v1/chat/completions",
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.1,
-                    "max_tokens": 16,
-                },
+            result = deepseek_api.chat(
+                [{"role": "user", "content": prompt}],
+                model=model,
+                temperature=0.1,
+                max_tokens=16,
+                function="memory_importance",
                 timeout=15,
             )
-            if resp.ok:
-                data = resp.json()
-                usage = data.get("usage", {})
-                pt = int(usage.get("prompt_tokens", 0))
-                ct = int(usage.get("completion_tokens", 0))
-                if pt or ct:
-                    token_usage.record(model, "memory_importance", pt, ct)
-                text = data["choices"][0]["message"]["content"].strip()
-                return "不重要" in text
-            logger.warning("[mem0] importance LLM returned %s", resp.status_code)
+            return "不重要" in result["content"]
         except Exception as exc:
             logger.warning("[mem0] importance LLM call failed: %s", exc)
         return self._is_trivial(user_msg) and self._is_trivial(assistant_msg)

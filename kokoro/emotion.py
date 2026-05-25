@@ -89,72 +89,20 @@ class EmotionState:
         debug["user_prompt"] = user_prompt
 
         model = cfg.emotion_model() or cfg.stt_refine_model()
-        url = cfg.llm_url()
-        api_key = ""
-        openai_compatible = False
-        if cfg.is_deepseek_model(model):
-            api_key = cfg.deepseek_api_key()
-            url = cfg.deepseek_url()
-            openai_compatible = True
-
-        headers = {"Content-Type": "application/json"}
-        if openai_compatible:
-            headers["Authorization"] = f"Bearer {api_key}"
-            import re as _re
-            base_url = url.rstrip("/")
-            if not _re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            api_url = f"{base_url}/chat/completions"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 256,
-            }
-        else:
-            api_url = f"{url}/api/chat"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "stream": False,
-                "options": {"temperature": 0.3, "num_predict": 256},
-            }
+        from kokoro import deepseek_api
 
         try:
-            import urllib.request
-
-            req = urllib.request.Request(
-                api_url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
+            result = deepseek_api.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                model=model,
+                temperature=0.3,
+                max_tokens=256,
+                function="emotion_evaluate",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-
-            if openai_compatible:
-                usage = result.get("usage", {})
-                pt = int(usage.get("prompt_tokens", 0))
-                ct = int(usage.get("completion_tokens", 0))
-                if pt or ct:
-                    token_usage.record(model, "emotion_evaluate", pt, ct)
-                text = (
-                    result.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-            else:
-                pt = int(result.get("prompt_eval_count", 0))
-                ct = int(result.get("eval_count", 0))
-                if pt or ct:
-                    token_usage.record(model, "emotion_evaluate", pt, ct)
-                text = result.get("message", {}).get("content", "").strip()
+            text = result["content"]
 
             if text:
                 debug["raw_response"] = text

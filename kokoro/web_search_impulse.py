@@ -7,13 +7,12 @@ import logging
 import re
 import threading
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from kokoro import config as cfg
+from kokoro import deepseek_api
 from kokoro import prompts
-from kokoro import token_usage
 from kokoro.web_search_client import WebSearchClient, format_search_result
 
 logger = logging.getLogger(__name__)
@@ -94,6 +93,7 @@ class InnerStreamSearchImpulse:
             try:
                 logger.info("inner stream web search request: query=%r limit=%s", decision.query, self.max_results)
                 result = self.client.search(decision.query, limit=self.max_results)
+                result = self._retry_low_quality_result(decision.query, result)
                 content = format_search_result(
                     decision.query,
                     result,
@@ -137,6 +137,22 @@ class InnerStreamSearchImpulse:
         finally:
             self._running_lock.release()
 
+    def _retry_low_quality_result(self, query: str, result: dict[str, Any]) -> dict[str, Any]:
+        if not _looks_like_low_quality_result(query, result):
+            return result
+        refined = _refined_query(query)
+        if not refined or refined == query:
+            return result
+        try:
+            logger.info("inner stream web search retry: query=%r refined=%r", query, refined)
+            retried = self.client.search(refined, limit=max(self.max_results, 8))
+        except Exception as exc:
+            logger.info("inner stream web search retry failed: query=%r error=%s", refined, exc)
+            return result
+        if not _looks_like_low_quality_result(query, retried):
+            return retried
+        return result
+
     def _decide(self, *, inner_stream: str, context: dict[str, Any]) -> SearchImpulseDecision:
         prompt = self._build_prompt(inner_stream=inner_stream, context=context)
         raw = self._call_model(prompt)
@@ -145,6 +161,11 @@ class InnerStreamSearchImpulse:
             return SearchImpulseDecision()
         query = str(data.get("query") or "").strip()
         search = bool(data.get("search", False)) and bool(query)
+        if search and _looks_like_private_memory_lookup(query, str(data.get("reason") or ""), inner_stream):
+            logger.info(
+                "inner stream web search looks like private memory lookup; honoring LLM decision: query=%r",
+                query,
+            )
         return SearchImpulseDecision(
             search=search,
             query=query,
@@ -165,52 +186,17 @@ class InnerStreamSearchImpulse:
         )
 
     def _call_model(self, prompt: str) -> str:
-        model = self.model
-        headers = {"Content-Type": "application/json"}
-        if cfg.is_deepseek_model(model):
-            base_url = cfg.deepseek_url().rstrip("/")
-            if not re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            api_url = f"{base_url}/chat/completions"
-            key = cfg.deepseek_api_key()
-            if key:
-                headers["Authorization"] = f"Bearer {key}"
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3,
-                "max_tokens": 256,
-                "response_format": {"type": "json_object"},
-            }
-        else:
-            api_url = f"{cfg.llm_url().rstrip('/')}/api/chat"
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "options": {"temperature": 0.3, "num_predict": 256},
-            }
-        req = urllib.request.Request(
-            api_url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=headers,
-        )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read())
-        if cfg.is_deepseek_model(model):
-            usage = data.get("usage") or {}
-            pt = int(usage.get("prompt_tokens", 0) or 0)
-            ct = int(usage.get("completion_tokens", 0) or 0)
-            if pt or ct:
-                token_usage.record(model, "inner_stream_search_impulse", pt, ct)
-            return str(data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-        usage = {
-            "prompt_tokens": int(data.get("prompt_eval_count", 0) or 0),
-            "completion_tokens": int(data.get("eval_count", 0) or 0),
-        }
-        if usage["prompt_tokens"] or usage["completion_tokens"]:
-            token_usage.record(model, "inner_stream_search_impulse", usage["prompt_tokens"], usage["completion_tokens"])
-        return str(data.get("message", {}).get("content") or "").strip()
+        return deepseek_api.chat(
+            [
+                {"role": "system", "content": "你是角色的搜索冲动判断助手。只输出JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            model=self.model,
+            temperature=0.3,
+            max_tokens=256,
+            json_mode=True,
+            function="inner_stream_search_impulse",
+        )["content"]
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -230,3 +216,116 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return value if isinstance(value, dict) else None
+
+
+def _looks_like_low_quality_result(query: str, result: dict[str, Any]) -> bool:
+    items = _extract_search_items(result)
+    if not items:
+        return True
+    query_text = str(query or "").strip()
+    compact_query = re.sub(r"\s+", "", query_text).lower()
+    tokens = [token.lower() for token in re.split(r"\s+", query_text) if len(token) >= 2]
+    if not compact_query and not tokens:
+        return False
+    for item in items:
+        haystack = " ".join(
+            str(item.get(key) or "")
+            for key in ("title", "name", "url", "link", "href", "source", "snippet", "content", "description", "summary")
+        ).lower()
+        compact_haystack = re.sub(r"\s+", "", haystack)
+        if compact_query and compact_query in compact_haystack:
+            return False
+        if tokens and all(token in haystack for token in tokens[:4]):
+            return False
+    return True
+
+
+def _refined_query(query: str) -> str:
+    value = str(query or "").strip()
+    if not value:
+        return ""
+    additions: list[str] = []
+    if not re.search(r"Minecraft|我的世界|模组|mod", value, flags=re.I):
+        additions.extend(["我的世界", "模组"])
+    return " ".join([value, *additions]).strip()
+
+
+def _extract_search_items(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [x for x in value if isinstance(x, dict)]
+    if not isinstance(value, dict):
+        return []
+    if isinstance(value.get("data"), dict):
+        nested = _extract_search_items(value["data"])
+        if nested:
+            return nested
+    for key in ("results", "items", "data", "organic", "webPages"):
+        candidate = value.get(key)
+        if isinstance(candidate, list):
+            return [x for x in candidate if isinstance(x, dict)]
+        if isinstance(candidate, dict):
+            nested = _extract_search_items(candidate)
+            if nested:
+                return nested
+    return []
+
+
+def _looks_like_private_memory_lookup(query: str, reason: str = "", inner_stream: str = "") -> bool:
+    text = " ".join([str(query or ""), str(reason or ""), str(inner_stream or "")[-1200:]])
+    direct_private_markers = (
+        "\u7fa4\u804a\u8bb0\u5f55",
+        "\u7fa4\u8bb0\u5f55",
+        "\u804a\u5929\u8bb0\u5f55",
+        "\u7ffb\u8bb0\u5f55",
+        "\u7ffb\u7fa4",
+        "\u79c1\u4e0b\u7ffb",
+        "\u8bb0\u5fc6\u788e\u7247",
+        "\u8bb0\u5f97",
+        "\u662f\u8c01",
+        "\u5370\u8c61",
+        "\u548c\u6211\u6709\u4ec0\u4e48\u4e92\u52a8",
+        "\u5bf9\u67d0\u4eba",
+        "\u7fa4\u53cb",
+    )
+    direct_public_markers = (
+        "\u5b98\u7f51",
+        "\u767e\u79d1",
+        "\u65b0\u95fb",
+        "\u4ef7\u683c",
+        "\u6587\u6863",
+        "\u8bba\u6587",
+        "\u53d1\u5e03",
+        "\u7248\u672c",
+        "API",
+        "GitHub",
+    )
+    if any(marker in text for marker in direct_private_markers):
+        return not any(marker in text for marker in direct_public_markers)
+    private_markers = (
+        "群聊记录",
+        "群记录",
+        "聊天记录",
+        "翻记录",
+        "翻群",
+        "私下翻",
+        "记忆碎片",
+        "记得",
+        "是谁",
+        "印象",
+        "和我有什么互动",
+    )
+    if not any(marker in text for marker in private_markers):
+        return False
+    public_markers = (
+        "官网",
+        "百科",
+        "新闻",
+        "价格",
+        "文档",
+        "论文",
+        "发布",
+        "版本",
+        "API",
+        "GitHub",
+    )
+    return not any(marker in text for marker in public_markers)

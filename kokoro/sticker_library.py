@@ -53,6 +53,17 @@ class StickerLibrary:
                 return item
         return None
 
+    def retire_item(self, sticker_id: str, *, reason: str = "", actor: str = "") -> dict[str, Any] | None:
+        return self.update_item(
+            sticker_id,
+            {
+                "retired": True,
+                "retired_reason": str(reason or "").strip(),
+                "retired_by": str(actor or "").strip(),
+                "retired_at": datetime.now().astimezone().isoformat(),
+            },
+        )
+
     def add_from_file(
         self,
         image_path: str | os.PathLike,
@@ -84,6 +95,9 @@ class StickerLibrary:
             "intensity": "",
             "avoid": "",
             "usage_notes": "",
+            "social_feedback": [],
+            "risk_notes": "",
+            "retired": False,
             "why_saved": str(why_saved or "").strip(),
             "source": source,
             "source_group": source_group,
@@ -111,14 +125,19 @@ class StickerLibrary:
         items = self.load()
         for item in items:
             if str(item.get("id") or "") == wanted:
+                if item.get("retired"):
+                    return None
                 return item
-        prefix_matches = [item for item in items if str(item.get("id") or "").startswith(wanted)]
+        prefix_matches = [
+            item for item in items
+            if not item.get("retired") and str(item.get("id") or "").startswith(wanted)
+        ]
         if len(prefix_matches) == 1:
             return prefix_matches[0]
         return None
 
     def fallback_item(self, query: str = "", *, min_score: float = 0.45) -> dict[str, Any] | None:
-        items = self.load()
+        items = [item for item in self.load() if not item.get("retired")]
         if not items:
             return None
         query = str(query or "").strip()
@@ -143,14 +162,14 @@ class StickerLibrary:
         return None
 
     def candidates_text(self, *, limit: int = 18) -> str:
-        items = self.load()[-max(1, limit):]
+        items = [item for item in self.load() if not item.get("retired")][-max(1, limit):]
         return self.format_candidates(items)
 
     def search_candidates(self, query: str, *, limit: int = 30) -> str:
         return self.format_candidates(self.search_items(query, limit=limit))
 
     def search_items(self, query: str, *, limit: int = 30) -> list[dict[str, Any]]:
-        items = self.load()
+        items = [item for item in self.load() if not item.get("retired")]
         if not items:
             return []
         terms = _terms(query)
@@ -190,6 +209,8 @@ class StickerLibrary:
         tag_set = {str(t).strip() for t in (tags or []) if str(t).strip()}
         fingerprint = str(fingerprint or "").strip()
         for item in reversed(self.load()):
+            if item.get("retired"):
+                continue
             if fingerprint and fingerprint == str(item.get("fingerprint") or ""):
                 return item
             item_desc = str(item.get("desc") or "")
@@ -224,6 +245,11 @@ def _format_item(item: dict[str, Any]) -> str:
         fields.append(f"intensity={str(item.get('intensity'))[:24]}")
     if item.get("usage_notes"):
         fields.append(f"use={str(item.get('usage_notes'))[:80]}")
+    if item.get("risk_notes"):
+        fields.append(f"risk={str(item.get('risk_notes'))[:80]}")
+    feedback = item.get("social_feedback") or []
+    if feedback:
+        fields.append(f"feedback={str(feedback[-1])[:80]}")
     return "- " + " | ".join(fields)
 
 

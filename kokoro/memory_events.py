@@ -330,71 +330,17 @@ class MemoryEventStore:
     # ── LLM call ────────────────────────────────────────────────────────────
 
     def _call_llm(self, system: str, user_prompt: str, max_tokens: int = 512) -> str:
-        from kokoro import token_usage
-
-        model = self.eval_model
-        url = _cfg.llm_url()
-        api_key = ""
-        openai_compatible = False
-        if _cfg.is_deepseek_model(model):
-            api_key = _cfg.deepseek_api_key()
-            url = _cfg.deepseek_url()
-            openai_compatible = True
-
-        headers = {"Content-Type": "application/json"}
-        if openai_compatible:
-            headers["Authorization"] = f"Bearer {api_key}"
-            base_url = url.rstrip("/")
-            if not re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            api_url = f"{base_url}/chat/completions"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": max_tokens,
-            }
-        else:
-            api_url = f"{url}/api/chat"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "stream": False,
-                "options": {"temperature": 0.3, "num_predict": max_tokens},
-            }
-
-        try:
-            import urllib.request
-            req = urllib.request.Request(
-                api_url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-
-            if openai_compatible:
-                usage = result.get("usage", {})
-                pt = int(usage.get("prompt_tokens", 0))
-                ct = int(usage.get("completion_tokens", 0))
-                if pt or ct:
-                    token_usage.record(model, "memory_event_extract", pt, ct)
-                return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            else:
-                pt = int(result.get("prompt_eval_count", 0))
-                ct = int(result.get("eval_count", 0))
-                if pt or ct:
-                    token_usage.record(model, "memory_event_extract", pt, ct)
-                return result.get("message", {}).get("content", "").strip()
-        except Exception as exc:
-            _logger.warning("memory event LLM call failed: %s", exc)
-            return ""
+        from kokoro import deepseek_api as _api
+        return _api.chat(
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_prompt},
+            ],
+            model=self.eval_model,
+            temperature=0.3,
+            max_tokens=max_tokens,
+            function="memory_event_extract",
+        )["content"]
 
     # ── response parsing ────────────────────────────────────────────────────
 

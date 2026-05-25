@@ -199,32 +199,16 @@ class AgentRouter:
         return self._decision_from_json(data, available_tools)
 
     def _call_model(self, prompt: str) -> str:
-        base_url = self._api_base_url.rstrip("/") if self._api_base_url else llm_client.api_base_for(self._model)
-        if not re.search(r"/v\d+$", base_url):
-            base_url += "/v1"
-        headers = llm_client.api_headers(self._model)
-        if self._api_key:
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        payload = llm_client.build_payload(self._model, [{"role": "user", "content": prompt}], stream=False)
-        payload["temperature"] = 0
-        payload["max_tokens"] = 256
+        from kokoro import deepseek_api
+
         try:
-            req_headers = {"Content-Type": "application/json"}
-            req_headers.update(headers)
-            req = urllib.request.Request(
-                f"{base_url}/chat/completions",
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers=req_headers,
-            )
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                data = json.loads(resp.read())
-            message = data.get("choices", [{}])[0].get("message", {})
-            usage_data = data.get("usage") or {}
-            pt = int(usage_data.get("prompt_tokens", 0) or 0)
-            ct = int(usage_data.get("completion_tokens", 0) or 0)
-            if pt or ct:
-                token_usage.record(self._model, "agent_tool_route", pt, ct)
-            return str(message.get("content") or "").strip()
+            return deepseek_api.chat(
+                [{"role": "user", "content": prompt}],
+                model=self._model,
+                temperature=0,
+                max_tokens=256,
+                function="agent_tool_route",
+            )["content"]
         except Exception as exc:
             logger.debug("agent router failed: %s", exc)
             return ""

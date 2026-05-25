@@ -189,45 +189,16 @@ def _call_refine_style_llm(
     api_key: str | None,
     timeout: int,
 ) -> str:
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-        url = f"{llm_url.rstrip('/')}/v1/chat/completions"
-        payload = {
-            "model": llm_model,
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 64,
-            "thinking": {"type": "disabled"},
-        }
-    else:
-        url = f"{llm_url.rstrip('/')}/api/chat"
-        payload = {
-            "model": llm_model,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": 0.7, "num_predict": 64},
-        }
+    from kokoro import deepseek_api
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        result = json.loads(resp.read())
-    if api_key:
-        usage = result.get("usage", {})
-        pt = int(usage.get("prompt_tokens", 0))
-        ct = int(usage.get("completion_tokens", 0))
-        if pt or ct:
-            token_usage.record(llm_model, "waiting_reply", pt, ct)
-        return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    pt = int(result.get("prompt_eval_count", 0))
-    ct = int(result.get("eval_count", 0))
-    if pt or ct:
-        token_usage.record(llm_model, "waiting_reply", pt, ct)
-    return result.get("message", {}).get("content", "").strip()
+    return deepseek_api.chat(
+        messages,
+        model=llm_model,
+        temperature=0.7,
+        max_tokens=64,
+        function="waiting_reply",
+        timeout=timeout,
+    )["content"]
 
 
 def _format_recent(messages: Iterable[dict], limit: int = 6) -> str:

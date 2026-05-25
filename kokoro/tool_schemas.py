@@ -117,6 +117,32 @@ SEND_QQ_MESSAGE = {
     },
 }
 
+RETIRE_STICKER = {
+    "type": "function",
+    "function": {
+        "name": "retire_sticker",
+        "description": (
+            "主动停用一张本地表情包。仅当角色自己根据长期记忆、他人反馈或当前社交判断，"
+            "认为某张表情包以后不该再用、容易冒犯、语境不合适，或想认真回应对方要求时使用。"
+            "这不是外部硬限制，而是角色自己的整理行为。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sticker_id": {
+                    "type": "string",
+                    "description": "要停用的表情包 id。",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "简短说明为什么决定停用。",
+                },
+            },
+            "required": ["sticker_id"],
+        },
+    },
+}
+
 VTS_EXPRESSION = {
     "type": "function",
     "function": {
@@ -278,6 +304,7 @@ ALL_TOOLS: list[dict] = [
     GET_CURRENT_APP,
     SAVE_TO_MEMORY,
     SEND_QQ_MESSAGE,
+    RETIRE_STICKER,
     VTS_EXPRESSION,
     VTS_MOTION,
     CLAUDE_CODE_EXEC,
@@ -297,6 +324,7 @@ DEFAULT_ENABLED_TOOLS: set[str] = {
     "get_current_app",
     "save_to_memory",
     "send_qq_message",
+    "retire_sticker",
     "vts_expression",
     "vts_motion",
     "claude_code_exec",

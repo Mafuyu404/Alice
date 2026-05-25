@@ -131,53 +131,20 @@ class ConversationPool:
     def _refine(self, text: str) -> Optional[str]:
         user_prompt = prompts.format_prompt("stt_refine.user_template", text=text)
         system_prompt = prompts.get("stt_refine.system")
-        headers = {"Content-Type": "application/json"}
 
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-            url = f"{self.llm_url}/v1/chat/completions"
-            payload = {
-                "model": self.llm_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.1,
-                "max_tokens": self.max_tokens,
-                "thinking": {"type": "disabled"},
-            }
-        else:
-            url = f"{self.llm_url}/api/chat"
-            payload = {
-                "model": self.llm_model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "stream": False,
-                "options": {"temperature": 0.1, "num_predict": self.max_tokens},
-            }
+        from kokoro import deepseek_api
 
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
-            )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                result = json.loads(resp.read())
-            if self.api_key:
-                usage = result.get("usage", {})
-                pt = int(usage.get("prompt_tokens", 0))
-                ct = int(usage.get("completion_tokens", 0))
-                if pt or ct:
-                    token_usage.record(self.llm_model, "stt_refine", pt, ct)
-                return result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            pt = int(result.get("prompt_eval_count", 0))
-            ct = int(result.get("eval_count", 0))
-            if pt or ct:
-                token_usage.record(self.llm_model, "stt_refine", pt, ct)
-            return result.get("message", {}).get("content", "").strip()
+            return deepseek_api.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                model=self.llm_model,
+                temperature=0.1,
+                max_tokens=self.max_tokens,
+                function="stt_refine",
+            )["content"]
         except Exception as exc:
             logger.debug("STT refine LLM call failed: %s", exc)
             return None

@@ -266,7 +266,7 @@ auto_reset_on_tts_done = true
 # 是否启用麦克风 STT 输入。
 # 类型: bool (true/false)
 # false: 主动闭麦，不加载 STT 模型，不打开麦克风；QQ、内在叙事流和其他输入继续运行。
-enabled = true
+enabled = false
 
 # 流式 ASR 模型的存放目录。
 # 类型: string（目录路径）
@@ -587,9 +587,9 @@ enabled = true
 
 # qq_client.py 连接到 cli.py 的本地地址。
 # 类型: string / int
-alice_ws_url = "ws://127.0.0.1:58901"
+alice_ws_url = "ws://127.0.0.1:58911"
 alice_host = "127.0.0.1"
-alice_port = 58901
+alice_port = 58911
 
 # qq_client.py 直接连接 NapCat OneBot WebSocket 的默认地址。
 # 类型: string
@@ -760,7 +760,7 @@ idle_request_seconds = 2.5
 
 # 身体脚本生成模型。留空使用默认 LLM。
 # 类型: string
-model = ""
+model = "qwen2.5:1.5b"
 
 # 是否记录 [vts_body] 脚本日志。
 # 类型: bool
@@ -1060,7 +1060,7 @@ enabled = true
 # 启用的工具列表。
 # 类型: string 数组
 # 可选: "look_at_screen", "search_memory", "get_current_time", "get_current_app",
-#        "save_to_memory", "send_qq_message", "vts_expression", "vts_motion", "claude_code_exec",
+#        "save_to_memory", "send_qq_message", "retire_sticker", "vts_expression", "vts_motion", "claude_code_exec",
 #        "check_task_progress", "list_active_tasks", "cancel_task"
 tools = [
   "look_at_screen",
@@ -1069,6 +1069,7 @@ tools = [
   "get_current_app",
   "save_to_memory",
   "send_qq_message",
+  "retire_sticker",
   "vts_expression",
   "vts_motion",
   "claude_code_exec",

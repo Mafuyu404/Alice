@@ -20,6 +20,7 @@ _BUILTIN_HANDLERS: dict[str, Handler] = {
     "get_current_app": tool_handlers.handle_get_current_app,
     "save_to_memory": tool_handlers.handle_save_to_memory,
     "send_qq_message": tool_handlers.handle_send_qq_message,
+    "retire_sticker": tool_handlers.handle_retire_sticker,
     "vts_expression": tool_handlers.handle_vts_expression,
     "vts_motion": tool_handlers.handle_vts_motion,
     "claude_code_exec": tool_handlers.handle_claude_code_exec,

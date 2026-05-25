@@ -14,6 +14,7 @@ import os
 import re
 import threading
 import time
+from difflib import SequenceMatcher
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -23,6 +24,7 @@ import requests
 
 from kokoro import config as cfg
 from kokoro import input_events
+from kokoro import memory as memory_mod
 from kokoro import prompts
 from kokoro import qq_media
 from kokoro import token_usage
@@ -41,9 +43,12 @@ class QQRawMessage:
     message_id: str = ""
     timestamp: float = field(default_factory=time.time)
     self_id: str = ""
+    conversation_id_override: str = ""
 
     @property
     def conversation_id(self) -> str:
+        if self.conversation_id_override:
+            return self.conversation_id_override
         if self.message_type == "group" and self.group_id:
             return f"group:{self.group_id}"
         return f"private:{self.user_id}"
@@ -76,6 +81,9 @@ class QQContextPacket:
     idle_probe: bool = False
     self_message_count: int = 0
     recent_self_lines: list[str] = field(default_factory=list)
+    turn_key: str = ""
+    memory_context: str = ""
+    recall_anchors: list[str] = field(default_factory=list)
 
     @property
     def content(self) -> str:
@@ -129,11 +137,14 @@ class QQConversationState:
         self.last_packet_at = 0.0
         self.last_message_at = 0.0
         self.last_sent_at = 0.0
+        self.responded_turn_keys: deque[str] = deque(maxlen=80)
+        self.recent_sent_texts: deque[tuple[float, str]] = deque(maxlen=24)
 
-    def append(self, message: QQRawMessage) -> None:
+    def append(self, message: QQRawMessage, *, count_unread: bool = True) -> None:
         self.messages.append(message)
-        self.unread_since_packet += 1
-        self.last_message_at = message.timestamp
+        if count_unread:
+            self.unread_since_packet += 1
+            self.last_message_at = message.timestamp
 
     def build_packet(
         self,
@@ -162,6 +173,8 @@ class QQConversationState:
                 seen.add(name)
         first = window[0]
         last = window[-1]
+        external_window = [msg for msg in window if not _is_self_message(msg, self_id)]
+        turn_key = _packet_turn_key(external_window)
         attention_lines = _detect_attention_lines(
             window,
             character_name=character_name,
@@ -174,7 +187,7 @@ class QQConversationState:
         )
         self_messages = [
             msg for msg in window[-12:]
-            if (self_id and msg.user_id == self_id) or (msg.self_id and msg.user_id == msg.self_id)
+            if _is_self_message(msg, self_id)
         ]
         return QQContextPacket(
             conversation_id=first.conversation_id,
@@ -190,6 +203,8 @@ class QQConversationState:
             idle_probe=idle_probe,
             self_message_count=len(self_messages),
             recent_self_lines=[msg.content for msg in self_messages[-3:]],
+            turn_key=turn_key,
+            recall_anchors=_recall_anchors_for_messages(external_window[-8:]),
         )
 
     def mark_packeted(self) -> None:
@@ -231,7 +246,7 @@ class QQEnvironment:
             if state is None:
                 state = QQConversationState(max_messages=self.max_messages_per_conversation)
                 self._states[message.conversation_id] = state
-            state.append(message)
+            state.append(message, count_unread=not _is_self_message(message, self.self_id))
 
     def due_packets(self, *, min_unread: int = 1, quiet_seconds: float = 4.0) -> list[QQContextPacket]:
         now = time.time()
@@ -323,6 +338,64 @@ class QQEnvironment:
             if state is not None:
                 state.last_sent_at = time.time()
 
+    def mark_sent_text(self, conversation_id: str, message: str) -> None:
+        normalized = _normalize_for_duplicate(message)
+        if not normalized:
+            return
+        with self._lock:
+            state = self._states.get(conversation_id)
+            if state is not None:
+                now = time.time()
+                state.last_sent_at = now
+                state.recent_sent_texts.append((now, normalized))
+
+    def has_recent_duplicate_send(
+        self,
+        conversation_id: str,
+        message: str,
+        *,
+        window_seconds: float = 120.0,
+        similarity: float = 0.94,
+    ) -> bool:
+        normalized = _normalize_for_duplicate(message)
+        if not normalized:
+            return False
+        now = time.time()
+        with self._lock:
+            state = self._states.get(conversation_id)
+            if state is None:
+                return False
+            fresh: deque[tuple[float, str]] = deque(maxlen=state.recent_sent_texts.maxlen or 24)
+            duplicate = False
+            for ts, previous in state.recent_sent_texts:
+                if now - ts > max(1.0, float(window_seconds)):
+                    continue
+                fresh.append((ts, previous))
+                if normalized == previous:
+                    duplicate = True
+                    continue
+                if previous and SequenceMatcher(None, normalized, previous).ratio() >= similarity:
+                    duplicate = True
+            state.recent_sent_texts = fresh
+            return duplicate
+
+    def mark_turn_responded(self, conversation_id: str, turn_key: str) -> None:
+        key = str(turn_key or "").strip()
+        if not key:
+            return
+        with self._lock:
+            state = self._states.get(conversation_id)
+            if state is not None and key not in state.responded_turn_keys:
+                state.responded_turn_keys.append(key)
+
+    def has_turn_response(self, conversation_id: str, turn_key: str) -> bool:
+        key = str(turn_key or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            state = self._states.get(conversation_id)
+            return bool(state is not None and key in state.responded_turn_keys)
+
     def last_sent_age(self, conversation_id: str) -> float:
         with self._lock:
             state = self._states.get(conversation_id)
@@ -347,7 +420,7 @@ class QQParticipationDecision:
     @classmethod
     def from_dict(cls, data: dict) -> "QQParticipationDecision":
         action = str(data.get("action", "silence") or "silence").strip().lower()
-        if action not in {"silence", "say", "send_sticker"}:
+        if action not in {"silence", "say", "send_sticker", "retire_sticker"}:
             action = "silence"
         message = str(data.get("message", "") or "").strip()
         sticker_id = str(data.get("sticker_id", "") or data.get("image_id", "") or "").strip()
@@ -382,32 +455,34 @@ class QQAutonomousParticipant:
         packet_list = [packet for packet in packets if packet.conversation_id != "private:self"]
         if not packet_list:
             return QQParticipationDecision()
+        packet_list = _with_memory_context(self.session, packet_list)
 
         system_prompt = prompts.get("qq.participation_system", "") or prompts.get("qq.default_participation_system", "")
-        system_prompt = (
-            f"{system_prompt}\n\n"
-            f"{prompts.get('qq.participation_output_contract', '')}"
-        )
+        recent_self_context = _recent_self_context_for_packets(packet_list)
         sticker_query = _sticker_query_for_packets(
             packet_list,
             inner_stream=_safe_context(getattr(self.session, "inner_stream", None)),
             cognition_context=_safe_context(getattr(self.session, "cognition", None)),
         )
+        cognition_context = _cognition_context_for_packets(self.session, packet_list)
         user_prompt = prompts.format_prompt(
             "qq.participation_user",
             name=self.session.character_name,
             user_name=self.session.user_name,
             character_profile=_compact_character(self.session.character_data),
             inner_stream=_safe_context(getattr(self.session, "inner_stream", None)) or "无",
-            cognition_context=_safe_context(getattr(self.session, "cognition", None)) or "无",
+            cognition_context=cognition_context or "无",
+            memory_context=_memory_context_for_packets(packet_list) or "无",
+            recent_self_context=recent_self_context or "无",
             summary=getattr(self.session, "summary", "") or "无",
             sticker_candidates=qq_media.sticker_candidates_for_context(sticker_query, limit=30),
-            packets="\n\n---\n\n".join(_format_packet_for_decision(p) for p in packet_list),
+            packets="\n\n---\n\n".join(
+                _format_packet_for_decision(p)
+                + f"\nrecall_anchors: {', '.join(p.recall_anchors) if p.recall_anchors else 'none'}"
+                + f"\nrelated_memory:\n{p.memory_context or 'none'}"
+                for p in packet_list
+            ),
         ) or _default_participation_user(self.session, packet_list)
-        user_prompt = (
-            f"{user_prompt}\n\n"
-            f"{prompts.get('qq.participation_user_suffix', '')}"
-        )
 
         try:
             raw = self._call_llm(system_prompt, user_prompt)
@@ -446,6 +521,23 @@ class QQAutonomousParticipant:
         valid_ids.discard("private:self")
         if decision.action in {"say", "send_sticker"} and decision.conversation_id not in valid_ids:
             return QQParticipationDecision(reason="LLM chose an unknown conversation")
+        if decision.action == "retire_sticker":
+            item = qq_media.retire_sticker(
+                decision.sticker_id,
+                reason=decision.reason or decision.message,
+                actor=getattr(self.session, "character_name", ""),
+            )
+            if item:
+                record = getattr(self.session, "record_self_action", None)
+                if callable(record):
+                    record(
+                        f"我决定以后不再使用表情包 {decision.sticker_id}。原因：{decision.reason or decision.message}",
+                        source="sticker_library",
+                        action="retire_sticker",
+                        metadata={"sticker_id": decision.sticker_id, "reason": decision.reason},
+                    )
+                return QQParticipationDecision(reason=f"retired sticker {decision.sticker_id}")
+            return QQParticipationDecision(reason=f"unknown sticker_id for retire: {decision.sticker_id}")
         if decision.action == "send_sticker":
             sticker_item = qq_media.resolve_sticker(decision.sticker_id)
             if not sticker_item:
@@ -558,51 +650,28 @@ class QQAutonomousParticipant:
             return QQParticipationDecision(reason=type(exc).__name__)
 
     def _call_llm(self, system_prompt: str, user_prompt: str, *, json_mode: bool = True) -> str:
+        from kokoro import deepseek_api
+
         model = self.model
-        openai_compatible = False
-        if cfg.is_deepseek_model(model):
-            api_key = cfg.deepseek_api_key()
-            api_url = cfg.deepseek_url()
-            openai_compatible = True
-        else:
-            api_key = ""
-            api_url = cfg.llm_url()
+        openai_compatible = cfg.is_deepseek_model(model)
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
-        headers = {"Content-Type": "application/json"}
+
         if openai_compatible:
-            base_url = api_url.rstrip("/")
-            if not re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            headers["Authorization"] = f"Bearer {api_key}"
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": 512,
-            }
-            if json_mode:
-                payload["response_format"] = {"type": "json_object"}
-            resp = requests.post(
-                f"{base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=45,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            usage = data.get("usage", {})
-            pt = int(usage.get("prompt_tokens", 0))
-            ct = int(usage.get("completion_tokens", 0))
-            if pt or ct:
-                token_usage.record(model, "qq_participation", pt, ct)
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return deepseek_api.chat(
+                messages,
+                model=model,
+                temperature=0.2,
+                max_tokens=512,
+                json_mode=json_mode,
+                function="qq_participation",
+            )["content"]
 
         resp = requests.post(
-            f"{api_url}/api/chat",
+            f"{cfg.llm_url().rstrip('/')}/api/chat",
             json={
                 "model": model,
                 "messages": messages,
@@ -667,7 +736,11 @@ class QQInputRuntime:
         message = build_raw_message_from_onebot(event)
         if message is None:
             return None
+        if message.self_id:
+            self.self_id = message.self_id
         self.environment.ingest(message)
+        self._record_social_feedback_candidate(message)
+        self._record_search_request_candidate(message)
         self.image_processor.consider_message(
             message,
             recent_lines=self.environment.recent_lines(message.conversation_id, limit=20),
@@ -678,9 +751,61 @@ class QQInputRuntime:
         if message.self_id:
             self.self_id = message.self_id
         self.environment.ingest(message)
+        self._record_social_feedback_candidate(message)
+        self._record_search_request_candidate(message)
         self.image_processor.consider_message(
             message,
             recent_lines=self.environment.recent_lines(message.conversation_id, limit=20),
+        )
+
+    def _record_social_feedback_candidate(self, message: QQRawMessage) -> None:
+        text = str(message.content or "").strip()
+        if not _looks_like_social_feedback(text):
+            return
+        record = getattr(self.session, "record_input_event", None)
+        if not callable(record):
+            return
+        record(
+            (
+                "QQ social feedback worth remembering: "
+                f"conversation={message.conversation_id}; speaker={message.nickname or message.user_id}; "
+                f"content={text}"
+            ),
+            source="qq",
+            event_type="text",
+            metadata={
+                "input_type": "social_feedback_candidate",
+                "conversation_id": message.conversation_id,
+                "speaker": message.nickname or message.user_id,
+                "message_id": message.message_id,
+            },
+            priority="high",
+            lifetime="memorize_candidate",
+        )
+
+    def _record_search_request_candidate(self, message: QQRawMessage) -> None:
+        text = str(message.content or "").strip()
+        if not _looks_like_search_request(text):
+            return
+        record = getattr(self.session, "record_input_event", None)
+        if not callable(record):
+            return
+        record(
+            (
+                "QQ search request worth considering: "
+                f"conversation={message.conversation_id}; speaker={message.nickname or message.user_id}; "
+                f"content={text}; search_topic_from_context={_search_topic_from_recent_context(message, self.environment)}"
+            ),
+            source="qq",
+            event_type="text",
+            metadata={
+                "input_type": "search_request_candidate",
+                "conversation_id": message.conversation_id,
+                "speaker": message.nickname or message.user_id,
+                "message_id": message.message_id,
+            },
+            priority="high",
+            lifetime="session",
         )
 
     def _record_image_understanding(self, content: str, metadata: dict) -> None:
@@ -705,6 +830,14 @@ class QQInputRuntime:
             idle_packet = self.environment.idle_packet(min_interval=self.idle_participation_seconds)
             if idle_packet is not None:
                 packets = [idle_packet]
+        packets = [
+            packet for packet in packets
+            if not (
+                packet.turn_key
+                and not packet.idle_probe
+                and self.environment.has_turn_response(packet.conversation_id, packet.turn_key)
+            )
+        ]
         packet_events: list[input_events.InputEvent] = []
         for packet in packets:
             priority: input_events.InputPriority = "normal"
@@ -728,11 +861,30 @@ class QQInputRuntime:
         decision = self.participant.decide(packets)
         if decision.action != "say":
             return decision
+        chosen_packet = next((p for p in packets if p.conversation_id == decision.conversation_id), None)
+        if (
+            chosen_packet is not None
+            and chosen_packet.turn_key
+            and not chosen_packet.idle_probe
+            and self.environment.has_turn_response(chosen_packet.conversation_id, chosen_packet.turn_key)
+        ):
+            return QQParticipationDecision(
+                action="silence",
+                reason="turn already responded",
+            )
         if self.environment.last_sent_age(decision.conversation_id) < self.participant.cooldown_seconds:
             return QQParticipationDecision(
                 action="silence",
                 reason="cooldown boundary",
             )
+        if self.environment.has_recent_duplicate_send(decision.conversation_id, decision.message):
+            return QQParticipationDecision(
+                action="silence",
+                reason="duplicate recent self message",
+            )
+        if chosen_packet is not None:
+            self.environment.mark_sent_text(decision.conversation_id, decision.message)
+            self.environment.mark_turn_responded(decision.conversation_id, chosen_packet.turn_key)
         return decision
 
     def recent_conversation_id(self, *, message_type: str = "group") -> str:
@@ -754,19 +906,33 @@ class QQInputRuntime:
             return
         if decision.conversation_id == "private:self":
             return
-        self.environment.mark_sent(decision.conversation_id)
-        if decision.conversation_id.startswith("group:") or decision.conversation_id.startswith("private:"):
-            self.environment.ingest(
-                build_self_message(
-                    conversation_id=decision.conversation_id,
-                    message=decision.message,
-                    self_id=self_id,
-                    nickname=nickname,
-                )
+        self.environment.mark_sent_text(decision.conversation_id, decision.message)
+        state = self.environment._states.get(decision.conversation_id)
+        if state is not None:
+            packet = state.build_packet(
+                max_lines=self.environment.packet_max_lines,
+                character_name=str(getattr(self.session, "character_name", "") or ""),
+                self_id=self.self_id,
+                max_age_seconds=self.environment.packet_max_age_seconds,
             )
-        record = getattr(self.session, "record_self_action", None)
-        if callable(record):
-            record(
+            if packet is not None:
+                self.environment.mark_turn_responded(decision.conversation_id, packet.turn_key)
+        if decision.conversation_id.startswith("group:") or decision.conversation_id.startswith("private:"):
+            message = build_self_message(
+                conversation_id=decision.conversation_id,
+                message=decision.message,
+                self_id=self_id or self.self_id,
+                nickname=nickname,
+            )
+            with self.environment._lock:
+                state = self.environment._states.get(message.conversation_id)
+                if state is None:
+                    state = QQConversationState(max_messages=self.environment.max_messages_per_conversation)
+                    self.environment._states[message.conversation_id] = state
+                state.append(message, count_unread=False)
+            record = getattr(self.session, "record_self_action", None)
+            if callable(record):
+                record(
                 f"我在 QQ 里主动说了：{decision.message}",
                 source="qq",
                 action="send_message",
@@ -837,6 +1003,7 @@ def build_self_message(
         timestamp=timestamp or time.time(),
         self_id=self_id,
         group_id="",
+        conversation_id_override=conversation_id,
     )
 
 
@@ -864,6 +1031,8 @@ def _detect_attention_lines(
     self_id = str(self_id or "").strip()
     recent = messages[-12:]
     for msg in recent:
+        if _is_self_message(msg, self_id):
+            continue
         content = str(msg.content or "").strip()
         speaker = msg.nickname or msg.user_id or "有人"
         if not content:
@@ -934,13 +1103,20 @@ def _detect_relation_lines(
             continue
 
         if idx >= len(recent) - 3:
-            relations.append(f"ambient_group_topic: {speaker} contributes to the current group flow -> {content[:70]}")
+            if msg.message_type == "private":
+                relations.append(f"private_thread: {speaker} is talking with Alice in private chat -> {content[:70]}")
+            else:
+                relations.append(f"ambient_group_topic: {speaker} contributes to the current group flow -> {content[:70]}")
 
     return relations[-8:]
 
 
 def _is_self_message(msg: QQRawMessage, self_id: str = "") -> bool:
-    return bool((self_id and msg.user_id == self_id) or (msg.self_id and msg.user_id == msg.self_id))
+    return bool(
+        msg.user_id == "self"
+        or (self_id and msg.user_id == self_id)
+        or (msg.self_id and msg.user_id == msg.self_id)
+    )
 
 
 def _reply_targets_self(content: str, self_id: str = "") -> bool:
@@ -1021,9 +1197,221 @@ def _config_float(data: dict, key: str, default: float) -> float:
         return float(default)
 
 
+def _packet_turn_key(messages: list[QQRawMessage]) -> str:
+    if not messages:
+        return ""
+    anchor = _latest_attention_message(messages) or messages[-1]
+    first = anchor
+    last = anchor
+    last_id = str(last.message_id or "").strip() or f"{last.user_id}:{int(last.timestamp)}:{abs(hash(last.content)) % 1000000}"
+    first_id = str(first.message_id or "").strip() or f"{first.user_id}:{int(first.timestamp)}"
+    return f"{last.conversation_id}:{first_id}->{last_id}"
+
+
+def _latest_attention_message(messages: list[QQRawMessage]) -> QQRawMessage | None:
+    for message in reversed(messages):
+        if _recall_anchors_for_messages([message]):
+            return message
+    return messages[-1] if messages else None
+
+
+def _with_memory_context(session, packets: list[QQContextPacket]) -> list[QQContextPacket]:
+    backend = getattr(session, "memory_backend", None)
+    if backend is None or not getattr(backend, "ready", False):
+        return packets
+    result: list[QQContextPacket] = []
+    for packet in packets:
+        query = _memory_query_for_packet(packet)
+        memory_context = ""
+        if query:
+            try:
+                memory_context = _lookup_packet_memory(session, backend, packet, query)
+            except Exception as exc:
+                logger.debug("QQ memory recall failed: %s", exc)
+        anchor_contexts: list[str] = []
+        for anchor in packet.recall_anchors[:6]:
+            try:
+                ctx = _lookup_packet_memory(session, backend, packet, anchor)
+            except Exception as exc:
+                logger.debug("QQ anchor memory recall failed: %s", exc)
+                ctx = ""
+            if ctx and ctx not in anchor_contexts:
+                anchor_contexts.append(ctx)
+        if anchor_contexts:
+            memory_context = "\n".join([memory_context, *anchor_contexts]).strip()
+        packet.memory_context = str(memory_context or "").strip()[-1600:]
+        result.append(packet)
+    return result
+
+
+def _lookup_packet_memory(session, backend, packet: QQContextPacket, query: str) -> str:
+    owner_id = getattr(session, "character_id", "default")
+    counterparts = [_memory_counterpart_for_packet(session, packet)]
+    if packet.message_type == "group":
+        counterparts.extend(packet.participant_names[-12:])
+    seen: set[str] = set()
+    user_ids: list[str] = []
+    for counterpart in counterparts:
+        for user_id in memory_mod.context_user_ids(owner_id, counterpart):
+            if user_id not in seen:
+                seen.add(user_id)
+                user_ids.append(user_id)
+    return backend.get_context_multi(query, user_ids) or ""
+
+
+def _memory_query_for_packet(packet: QQContextPacket) -> str:
+    parts: list[str] = [
+        packet.label,
+        packet.conversation_id,
+        " ".join(packet.participant_names[-12:]),
+        " ".join(packet.recall_anchors[:8]),
+        packet.attention_summary,
+        packet.relation_summary,
+        packet.self_activity_summary,
+    ]
+    parts.extend(packet.lines[-12:])
+    return "\n".join(part for part in parts if str(part or "").strip())[-3000:]
+
+
+def _memory_counterpart_for_packet(session, packet: QQContextPacket) -> str:
+    if packet.message_type == "private" and packet.participant_names:
+        return packet.participant_names[-1]
+    return packet.label or getattr(session, "user_name", "")
+
+
+def _recall_anchors_for_messages(messages: list[QQRawMessage]) -> list[str]:
+    anchors: list[str] = []
+    for message in messages:
+        text = str(message.content or "").strip()
+        if not text:
+            continue
+        for pattern in (
+            r"记得\s*([^，。！？?!\s]{1,24})\s*(?:是谁|吗|么|不)",
+            r"([^，。！？?!\s]{1,24})\s*是谁",
+            r"对\s*([^，。！？?!\s]{1,24})\s*(?:什么印象|有印象|印象)",
+            r"([^，。！？?!\s]{1,24})\s*(?:什么印象|有印象)",
+        ):
+            for match in re.finditer(pattern, text, flags=re.I):
+                anchor = _clean_recall_anchor(match.group(1))
+                if anchor and anchor not in anchors:
+                    anchors.append(anchor)
+    return anchors[:12]
+
+
+def _clean_recall_anchor(value: str) -> str:
+    anchor = str(value or "").strip()
+    anchor = re.sub(r"^(你|她|他|它|这个|那个|一下|关于|我问你)", "", anchor).strip()
+    anchor = re.sub(r"^(记得|知道|认识)", "", anchor).strip()
+    anchor = re.sub(r"(是谁|是哪个|是哪位|的话|这个人|这个群友)$", "", anchor).strip()
+    if not anchor or len(anchor) > 24:
+        return ""
+    if anchor in {"你", "我", "她", "他", "它", "这个", "那个", "什么", "谁"}:
+        return ""
+    return anchor
+
+
+def _memory_context_for_packets(packets: list[QQContextPacket]) -> str:
+    chunks = [p.memory_context for p in packets if p.memory_context]
+    return "\n\n".join(chunks)[-2400:]
+
+
+def _recent_self_context_for_packets(packets: list[QQContextPacket]) -> str:
+    lines: list[str] = []
+    for packet in packets:
+        if packet.recent_self_lines:
+            joined = "；".join(packet.recent_self_lines[-3:])
+            lines.append(f"{packet.conversation_id}: {joined}")
+    return "\n".join(lines)[-1200:]
+
+
+def _cognition_context_for_packets(session, packets: list[QQContextPacket]) -> str:
+    cognition = getattr(session, "cognition", None)
+    if cognition is None:
+        return ""
+    query_parts: list[str] = []
+    for packet in packets:
+        query_parts.append(packet.label)
+        query_parts.append(packet.conversation_id)
+        query_parts.extend(packet.participant_names[-20:])
+        query_parts.extend(packet.recall_anchors[:12])
+        query_parts.extend(packet.attention_lines[-8:])
+        query_parts.extend(packet.lines[-16:])
+    query = "\n".join(part for part in query_parts if str(part or "").strip())[-5000:]
+    if hasattr(cognition, "get_context_for_text"):
+        try:
+            return str(cognition.get_context_for_text(query) or "")
+        except Exception:
+            logger.debug("QQ cognition context lookup failed", exc_info=True)
+    return _safe_context(cognition)
+
+
+def _looks_like_social_feedback(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    markers = (
+        "\u4e0d\u8981\u7528",
+        "\u4e0d\u8bb8\u7528",
+        "\u5220\u6389",
+        "\u5220\u9664",
+        "\u4e0d\u559c\u6b22",
+        "\u4e0d\u8212\u670d",
+        "\u6076\u4fd7",
+        "\u8d2c\u4e49",
+        "\u5192\u72af",
+        "\u6b20\u63cd",
+        "\u718a\u5b69\u5b50",
+        "\u4e0d\u53ef\u7231",
+        "\u6539\u4f4e",
+        "\u8bb0\u4f4f",
+        "\u4ee5\u540e\u522b",
+        "\u4ee5\u540e\u4e0d\u8981",
+    )
+    return any(marker in value for marker in markers)
+
+
+def _looks_like_search_request(text: str) -> bool:
+    value = str(text or "").strip()
+    if not value:
+        return False
+    markers = (
+        "\u641c\u7d22",
+        "\u641c\u4e00\u4e0b",
+        "\u67e5\u4e00\u4e0b",
+        "\u67e5\u67e5",
+        "\u67e5\u4e00\u67e5",
+        "\u4e86\u89e3\u4e00\u4e0b",
+        "\u68c0\u7d22",
+        "\u767e\u5ea6\u4e00\u4e0b",
+        "\u641c\u641c",
+        "\u770b\u770b",
+    )
+    return any(marker in value for marker in markers)
+
+
+def _search_topic_from_recent_context(message: QQRawMessage, environment: QQEnvironment) -> str:
+    lines = environment.recent_lines(message.conversation_id, limit=6)
+    if not lines:
+        return ""
+    return " | ".join(lines)[-500:]
+
+
+def _normalize_for_duplicate(text: str) -> str:
+    value = str(text or "")
+    value = re.sub(r"\[CQ:[^\]]+\]", "", value)
+    value = re.sub(r"\s+", "", value)
+    punctuation = set(
+        ",.!?~;:\"'()[]<>"
+        "\u3002\uff0c\uff01\uff1f\u3001\uff1a\uff1b\u201c\u201d\u2018\u2019"
+        "\uff08\uff09\u3010\u3011\u300a\u300b\u2026\uff5e"
+    )
+    value = "".join(ch for ch in value if ch not in punctuation)
+    return value.lower().strip()
+
 def _format_packet_for_decision(packet: QQContextPacket) -> str:
     return (
         f"conversation_id: {packet.conversation_id}\n"
+        f"turn_key: {packet.turn_key}\n"
         f"位置: {packet.label}\n"
         f"类型: {packet.message_type}\n"
         f"消息数: {packet.unread_count}\n"
@@ -1203,7 +1591,7 @@ def _salvage_partial_decision(text: str) -> dict | None:
     if not raw or '"action"' not in raw:
         return None
     action = _extract_json_string_field(raw, "action")
-    if action not in {"say", "silence", "send_sticker"}:
+    if action not in {"say", "silence", "send_sticker", "retire_sticker"}:
         return None
     conversation_id = _extract_json_string_field(raw, "conversation_id") or ""
     if conversation_id == "private:self":
@@ -1214,6 +1602,8 @@ def _salvage_partial_decision(text: str) -> dict | None:
     if action == "say" and (not conversation_id or not message):
         return None
     if action == "send_sticker" and not conversation_id:
+        return None
+    if action == "retire_sticker" and not sticker_id:
         return None
     return {
         "action": action,

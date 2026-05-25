@@ -273,45 +273,21 @@ class VTSBodyDriver:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
 
-        model = self.model
-        headers = {"Content-Type": "application/json"}
-        url = cfg.llm_url()
-        openai_compatible = False
-        if cfg.is_deepseek_model(model):
-            openai_compatible = True
-            url = cfg.deepseek_url()
-            headers["Authorization"] = f"Bearer {cfg.deepseek_api_key()}"
+        from kokoro import deepseek_api
 
-        if openai_compatible:
-            base_url = url.rstrip("/")
-            if not re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            api_url = f"{base_url}/chat/completions"
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.6,
-                "max_tokens": 800,
-                "response_format": {"type": "json_object"},
-            }
-        else:
-            api_url = f"{url.rstrip('/')}/api/chat"
-            payload = {
-                "model": model,
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0.6, "num_predict": 800},
-            }
-        req = urllib.request.Request(api_url, data=json.dumps(payload).encode("utf-8"), headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            result = json.loads(resp.read())
-        if openai_compatible:
-            usage = result.get("usage", {})
-            token_usage.record(model, "vts_body_script", int(usage.get("prompt_tokens", 0) or 0), int(usage.get("completion_tokens", 0) or 0))
-            raw = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        else:
-            token_usage.record(model, "vts_body_script", int(result.get("prompt_eval_count", 0) or 0), int(result.get("eval_count", 0) or 0))
-            raw = result.get("message", {}).get("content", "")
+        try:
+            result = deepseek_api.chat(
+                messages,
+                model=self.model,
+                temperature=0.6,
+                max_tokens=800,
+                json_mode=True,
+                function="vts_body_script",
+                timeout=20,
+            )
+            raw = result["content"]
+        except Exception:
+            return {}
         return _extract_json(raw) or {}
 
     def _evaluate_script(self, script: MotionScript, now: float, *, channel: str) -> dict[str, float]:

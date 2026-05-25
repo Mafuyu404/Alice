@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -62,6 +63,10 @@ def format_search_result(query: str, result: dict[str, Any], *, max_chars: int =
         return "\n".join(lines)[:max_chars].strip()
 
     lines.append("搜索结果：")
+    matching = _matching_items(query, items)
+    if matching:
+        titles = "；".join(str(item.get("title") or item.get("name") or "")[:80] for item in matching[:3])
+        lines.append(f"命中提示：以下结果看起来直接包含查询词或其关键词：{titles}")
     for i, item in enumerate(items, 1):
         title = str(item.get("title") or item.get("name") or "无标题").strip()
         url = str(item.get("url") or item.get("link") or item.get("href") or "").strip()
@@ -99,3 +104,25 @@ def _extract_items(value: Any) -> list[dict[str, Any]]:
             if nested:
                 return nested
     return []
+
+
+def _matching_items(query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    query_text = str(query or "").strip().lower()
+    compact_query = re.sub(r"\s+", "", query_text)
+    tokens = [token for token in re.split(r"\s+", query_text) if len(token) >= 2]
+    matched: list[dict[str, Any]] = []
+    for item in items:
+        haystack = " ".join(
+            str(item.get(key) or "")
+            for key in ("title", "name", "url", "link", "href", "source", "snippet", "content", "description", "summary")
+        ).lower()
+        compact_haystack = re.sub(r"\s+", "", haystack)
+        if compact_query and compact_query in compact_haystack:
+            matched.append(item)
+            continue
+        if tokens and any(len(token) >= 4 and token in haystack for token in tokens):
+            matched.append(item)
+            continue
+        if tokens and all(token in haystack for token in tokens[:4]):
+            matched.append(item)
+    return matched

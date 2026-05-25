@@ -72,6 +72,28 @@ class CognitionStore:
         _ensure(self._entries, matched, {k for k in self._entries if k in {"自己", "自我"}})
         self._cache = matched
 
+    def get_context_for_text(self, text: str, *, max_entries: int = 12) -> str:
+        """Return cognition entries that match the current local context."""
+        value = str(text or "")
+        if not value:
+            return self.get_context()
+        matched: dict[str, str] = {}
+        for key, entry_value in self._entries.items():
+            if _key_matches(key, value):
+                matched[key] = entry_value
+                if len(matched) >= max_entries:
+                    break
+        _ensure(self._entries, matched, _PRIORITY_KEYS)
+        _ensure(
+            self._entries,
+            matched,
+            {k for k in self._entries if _is_relation_key(k) and _key_matches(k, value)},
+        )
+        if not matched:
+            return self.get_context()
+        lines = [f"- {key}: {entry_value}" for key, entry_value in matched.items()]
+        return "\u3010\u8ba4\u77e5\u3011\n" + "\n".join(lines)
+
     def evaluate(
         self,
         conversation: str,
@@ -108,72 +130,24 @@ class CognitionStore:
         debug["user_prompt"] = user_prompt
 
         model = cfg.cognition_model() or cfg.llm_model()
-        url = cfg.llm_url()
-        api_key = ""
-        openai_compatible = False
-        if cfg.is_deepseek_model(model):
-            api_key = cfg.deepseek_api_key()
-            url = cfg.deepseek_url()
-            openai_compatible = True
+        from kokoro import deepseek_api
 
-        headers = {"Content-Type": "application/json"}
-        if openai_compatible:
-            headers["Authorization"] = f"Bearer {api_key}"
-            import re as _re
-            base_url = url.rstrip("/")
-            if not _re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            api_url = f"{base_url}/chat/completions"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.2,
-                "max_tokens": 2048,
-            }
-        else:
-            api_url = f"{url}/api/chat"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "stream": False,
-                "options": {"temperature": 0.2, "num_predict": 2048},
-            }
+        debug["system_prompt"] = system_prompt
+        debug["user_prompt"] = user_prompt
 
         try:
-            import urllib.request
-
-            req = urllib.request.Request(
-                api_url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
+            result = deepseek_api.chat(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                model=model,
+                temperature=0.2,
+                max_tokens=2048,
+                function="cognition_evaluate",
+                timeout=60,
             )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read())
-
-            if openai_compatible:
-                usage = result.get("usage", {})
-                pt = int(usage.get("prompt_tokens", 0))
-                ct = int(usage.get("completion_tokens", 0))
-                if pt or ct:
-                    token_usage.record(model, "cognition_evaluate", pt, ct)
-                text = (
-                    result.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-            else:
-                pt = int(result.get("prompt_eval_count", 0))
-                ct = int(result.get("eval_count", 0))
-                if pt or ct:
-                    token_usage.record(model, "cognition_evaluate", pt, ct)
-                text = result.get("message", {}).get("content", "").strip()
+            text = result["content"]
 
             new_entries = self._parse_json_entries(text)
             debug["raw_response"] = text

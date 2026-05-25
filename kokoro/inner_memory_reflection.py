@@ -12,12 +12,11 @@ import logging
 import re
 import threading
 import time
-import urllib.request
 from typing import Any
 
 from kokoro import config as cfg
+from kokoro import deepseek_api
 from kokoro import input_events
-from kokoro import token_usage
 
 logger = logging.getLogger(__name__)
 
@@ -154,54 +153,23 @@ class InnerMemoryReflection:
             f"最近对话：\n{context.get('recent_history') or '无'}\n\n"
             f"已有摘要：\n{context.get('summary') or '无'}\n\n"
             f"相关记忆：\n{context.get('memory_context') or '无'}\n\n"
+            "如果最近有人明确指出某个线索是 bug、幻觉、误会或不要再管，"
+            "不要把那个错误线索当作事实写入记忆；只能记住“她被纠正并撤销了这个判断”。\n\n"
             "JSON："
         )
 
     def _call_model(self, prompt: str) -> str:
-        model = self.model
-        headers = {"Content-Type": "application/json"}
-        if cfg.is_deepseek_model(model):
-            base_url = cfg.deepseek_url().rstrip("/")
-            if not re.search(r"/v\d+$", base_url):
-                base_url += "/v1"
-            api_url = f"{base_url}/chat/completions"
-            key = cfg.deepseek_api_key()
-            if key:
-                headers["Authorization"] = f"Bearer {key}"
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-                "max_tokens": self.max_tokens,
-                "response_format": {"type": "json_object"},
-            }
-        else:
-            api_url = f"{cfg.llm_url().rstrip('/')}/api/chat"
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "options": {"temperature": 0.2, "num_predict": self.max_tokens},
-            }
-        req = urllib.request.Request(
-            api_url,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers=headers,
-        )
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read())
-        if cfg.is_deepseek_model(model):
-            usage = data.get("usage") or {}
-            pt = int(usage.get("prompt_tokens", 0) or 0)
-            ct = int(usage.get("completion_tokens", 0) or 0)
-            if pt or ct:
-                token_usage.record(model, "inner_memory_reflection", pt, ct)
-            return str(data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-        pt = int(data.get("prompt_eval_count", 0) or 0)
-        ct = int(data.get("eval_count", 0) or 0)
-        if pt or ct:
-            token_usage.record(model, "inner_memory_reflection", pt, ct)
-        return str(data.get("message", {}).get("content") or "").strip()
+        return deepseek_api.chat(
+            [
+                {"role": "system", "content": "你是角色的内在记忆反思助手。只输出JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            model=self.model,
+            temperature=0.2,
+            max_tokens=self.max_tokens,
+            json_mode=True,
+            function="inner_memory_reflection",
+        )["content"]
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:

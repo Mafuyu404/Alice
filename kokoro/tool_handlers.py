@@ -13,6 +13,7 @@ import time
 
 from kokoro import memory as memory_mod
 from kokoro import prompts
+from kokoro import qq_media
 from kokoro import screen_interest
 from kokoro import vision
 
@@ -155,6 +156,27 @@ def handle_send_qq_message(arguments: dict, **context) -> str:
         logger.warning("send_qq_message failed: %s", exc)
         return f"QQ 发送失败：{type(exc).__name__}: {exc}"
     return str(result or "QQ 发送未返回结果。")
+
+
+def handle_retire_sticker(arguments: dict, **context) -> str:
+    sticker_id = str(arguments.get("sticker_id") or arguments.get("image_id") or "").strip()
+    if not sticker_id:
+        return "表情包 id 为空，未停用。"
+    reason = str(arguments.get("reason") or "").strip()
+    session = context.get("session")
+    actor = getattr(session, "character_name", "") if session is not None else ""
+    item = qq_media.retire_sticker(sticker_id, reason=reason, actor=actor)
+    if not item:
+        return f"没有找到可停用的表情包：{sticker_id}"
+    record = getattr(session, "record_self_action", None) if session is not None else None
+    if callable(record):
+        record(
+            f"我决定以后不再使用表情包 {sticker_id}。原因：{reason or '不适合继续使用'}",
+            source="sticker_library",
+            action="retire_sticker",
+            metadata={"sticker_id": sticker_id, "reason": reason},
+        )
+    return f"已停用表情包：{sticker_id}"
 
 
 def handle_vts_expression(arguments: dict, **context) -> str:

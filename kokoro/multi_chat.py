@@ -880,38 +880,25 @@ class MultiChatOrchestrator:
             return ""
 
     def _call_planner(self, system_prompt: str, user_prompt: str) -> str:
+        from kokoro import deepseek_api
+
         model = self.planning_model
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         if _cfg.is_deepseek_model(model):
-            api_url = _cfg.deepseek_url().rstrip("/v1")
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {_cfg.deepseek_api_key()}"}
-            resp = requests.post(
-                f"{api_url}/v1/chat/completions",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                    "max_tokens": 500,
-                    "response_format": {"type": "json_object"},
-                },
-                headers=headers,
-                timeout=45,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            usage = data.get("usage", {})
-            pt = int(usage.get("prompt_tokens", 0))
-            ct = int(usage.get("completion_tokens", 0))
-            if pt or ct:
-                token_usage.record(model, "multi_dialogue_plan", pt, ct)
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            return deepseek_api.chat(
+                messages,
+                model=model,
+                temperature=0.2,
+                max_tokens=500,
+                json_mode=True,
+                function="multi_dialogue_plan",
+            )["content"]
 
-        api_url = _cfg.llm_url()
         resp = requests.post(
-            f"{api_url}/api/chat",
+            f"{_cfg.llm_url().rstrip('/')}/api/chat",
             json={
                 "model": model,
                 "messages": messages,
