@@ -28,12 +28,23 @@ _LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
 class InnerStream:
     """A character's current inner continuity, maintained by an LLM."""
 
-    def __init__(self, character_id: str, character_data: dict | None = None):
+    def __init__(
+        self,
+        character_id: str,
+        character_data: dict | None = None,
+        *,
+        reset_on_start: bool = False,
+    ):
         self.character_id = character_id
         self.character_data = character_data or {}
         self._path = os.path.join(_CHARACTERS_DIR, character_id, "inner_stream.txt")
         self.text: str = ""
-        self._load()
+        self._last_event_digest: str = ""
+        if reset_on_start:
+            self.text = ""
+            self._save()
+        else:
+            self._load()
 
     def get_context(self) -> str:
         if not self.text.strip():
@@ -101,7 +112,7 @@ class InnerStream:
         debug["user_prompt"] = user_prompt
 
         model = str(section.get("model") or "").strip() or cfg.llm_model()
-        max_tokens = int(section.get("max_tokens", 700) or 700)
+        max_tokens = int(section.get("max_tokens", 350) or 350)
         try:
             from kokoro import deepseek_api
 
@@ -157,16 +168,42 @@ class InnerStream:
             "after": self.text,
             "saved": False,
             "error": "",
+            "skipped": "",
         }
 
         section = cfg.inner_stream_config()
         if not section.get("enabled", True) or not events:
             return debug
 
+        # Skip guard: if all meaningful events are identical to the previous batch
+        # and the stream already has content, don't waste an LLM call.
+        has_meaningful = any(
+            (
+                event.type == "time_tick"
+                and bool((event.metadata or {}).get("time_signal"))
+            )
+            or (
+                event.type != "time_tick"
+                and _event_type_has_content(event)
+            )
+            for event in events
+        )
+        if not has_meaningful and self.text.strip():
+            debug["skipped"] = "all events are ambient ticks, skipping"
+            return debug
+        digest = _events_digest(events)
+        if digest == self._last_event_digest and self.text.strip():
+            debug["skipped"] = "events unchanged since last update, skipping"
+            return debug
+        self._last_event_digest = digest
+
         system_prompt = prompts.format_prompt(
             "inner_stream.events_system",
             name=character_name,
             user_name=user_name,
+            inner_continuity_skill=prompts.skill("inner_continuity"),
+            social_presence_skill=prompts.skill("social_presence"),
+            memory_cognition_skill=prompts.skill("memory_cognition"),
         ) or _events_system_prompt(character_name, user_name)
         profile = _compact_profile(self.character_data)
         user_prompt = prompts.format_prompt(
@@ -209,7 +246,7 @@ class InnerStream:
         debug["user_prompt"] = user_prompt
 
         model = str(section.get("model") or "").strip() or cfg.llm_model()
-        max_tokens = int(section.get("max_tokens", 700) or 700)
+        max_tokens = int(section.get("max_tokens", 350) or 350)
         try:
             from kokoro import deepseek_api
 
@@ -389,7 +426,7 @@ class InnerStreamLoop:
             events = self._pop_events(limit=self.max_batch)
             reason = "节奏更新"
             if not events:
-                events = [self._time_tick_event(reason="idle rhythm")]
+                events = [self._time_tick_event(reason="idle_heartbeat")]
                 reason = "内在心跳"
             elif events:
                 reason = "事件唤醒后的节奏更新"
@@ -419,8 +456,10 @@ class InnerStreamLoop:
     def _evaluate(self, events: list[input_events.InputEvent], *, trigger_reason: str) -> None:
         try:
             context = self.context_provider() or {}
-            self.stream.evaluate_events(events=events, trigger_reason=trigger_reason, **context)
+            result = self.stream.evaluate_events(events=events, trigger_reason=trigger_reason, **context)
             self._last_update = time.monotonic()
+            if result.get("skipped"):
+                return  # nothing changed, don't fire output handlers
             if self.search_impulse is not None and hasattr(self.search_impulse, "consider"):
                 search_context = dict(context)
                 search_context["event_sources"] = ",".join(event.source for event in events)
@@ -588,3 +627,32 @@ def _log_inner_stream_update(
                 file.write(raw.strip() + "\n")
     except Exception as exc:
         logger.debug("failed to write inner stream log: %s", exc)
+
+
+def _event_type_has_content(event: input_events.InputEvent) -> bool:
+    """Check if an event type carries meaningful new information."""
+    if event.type in ("time_tick", "chat_environment"):
+        return False  # heartbeats and QQ polling snapshots are never meaningful on their own
+    if event.type == "text":
+        content = str(event.content or "").strip()
+        return bool(content) and content != "（无）"
+    if event.type == "self_action":
+        return True
+    if event.type == "context_cache":
+        return bool(event.content and "无" not in str(event.content))
+    return True  # other types like vision/image/search/memory are content
+
+
+def _events_digest(events: list[input_events.InputEvent]) -> str:
+    """A lightweight digest to detect repeated event batches."""
+    parts: list[str] = []
+    for event in events[-8:]:
+        if event.type == "time_tick":
+            if (event.metadata or {}).get("time_signal"):
+                elapsed = int(float((event.metadata or {}).get("elapsed_seconds") or 0.0))
+                parts.append(f"time_tick:{elapsed}")
+            continue
+        content = str(event.content or "")[:120]
+        meta = str(event.metadata.get("action") or event.metadata.get("source") or "")[:40]
+        parts.append(f"{event.type}:{event.source}:{meta}:{content}")
+    return "|".join(parts)

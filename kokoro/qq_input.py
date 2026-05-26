@@ -89,6 +89,11 @@ class QQContextPacket:
     def content(self) -> str:
         participants = "、".join(self.participant_names[:20]) or "无"
         duration = max(0.0, self.ended_at - self.started_at)
+        now = time.time()
+        current_time = datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S")
+        start_time = datetime.fromtimestamp(self.started_at).strftime("%Y-%m-%d %H:%M:%S")
+        end_time = datetime.fromtimestamp(self.ended_at).strftime("%Y-%m-%d %H:%M:%S")
+        since_latest = max(0.0, now - self.ended_at)
         scene_note = (
             "这是当前QQ群现场的一部分，群友的发言可以自然成为当下社交输入。"
             if self.message_type == "group"
@@ -98,7 +103,11 @@ class QQContextPacket:
             f"【QQ环境】\n"
             f"位置：{self.label}\n"
             f"现场说明：{scene_note}\n"
+            f"当前时间：{current_time}\n"
+            f"窗口开始：{start_time}\n"
+            f"窗口最新：{end_time}\n"
             f"时间跨度：约 {duration:.0f} 秒\n"
+            f"距最新消息：约 {since_latest:.0f} 秒\n"
             f"消息数：{self.unread_count}\n"
             f"空闲探测：{'是' if self.idle_probe else '否'}\n"
             f"参与者：{participants}\n"
@@ -117,7 +126,7 @@ class QQContextPacket:
     @property
     def relation_summary(self) -> str:
         if not self.relation_lines:
-            return "未发现明确指向雪吱的话轮；默认按旁听现场理解，不把群友之间的建议当成自己的任务。"
+            return "未发现明确指向本角色的话轮；默认按旁听现场理解，不把其他人之间的建议当成自己的任务。"
         return "；".join(self.relation_lines[:8])
 
     @property
@@ -445,11 +454,13 @@ class QQAutonomousParticipant:
         model: str,
         cooldown_seconds: float = 45.0,
         max_message_chars: int = 260,
+        environment: QQEnvironment | None = None,
     ) -> None:
         self.session = session
         self.model = model
         self.cooldown_seconds = max(0.0, float(cooldown_seconds))
         self.max_message_chars = max(40, int(max_message_chars))
+        self.environment = environment
 
     def decide(self, packets: Iterable[QQContextPacket]) -> QQParticipationDecision:
         packet_list = [packet for packet in packets if packet.conversation_id != "private:self"]
@@ -457,7 +468,15 @@ class QQAutonomousParticipant:
             return QQParticipationDecision()
         packet_list = _with_memory_context(self.session, packet_list)
 
-        system_prompt = prompts.get("qq.participation_system", "") or prompts.get("qq.default_participation_system", "")
+        system_prompt = "\n\n".join(
+            part
+            for part in (
+                prompts.skill("social_presence"),
+                prompts.skill("memory_cognition"),
+                prompts.get("qq.participation_system", "") or prompts.get("qq.default_participation_system", ""),
+            )
+            if part
+        )
         recent_self_context = _recent_self_context_for_packets(packet_list)
         sticker_query = _sticker_query_for_packets(
             packet_list,
@@ -539,54 +558,18 @@ class QQAutonomousParticipant:
                 return QQParticipationDecision(reason=f"retired sticker {decision.sticker_id}")
             return QQParticipationDecision(reason=f"unknown sticker_id for retire: {decision.sticker_id}")
         if decision.action == "send_sticker":
-            sticker_item = qq_media.resolve_sticker(decision.sticker_id)
-            if not sticker_item:
-                fallback_query = " ".join([decision.sticker_id, decision.message, decision.reason]).strip()
-                sticker_item = qq_media.fallback_sticker(
-                    fallback_query,
-                    min_score=0.55,
-                )
-                if sticker_item:
-                    logger.warning(
-                        "QQ participation unknown sticker_id=%r, fallback sticker_id=%r",
-                        decision.sticker_id,
-                        sticker_item.get("id", ""),
-                    )
-            if not sticker_item:
-                if decision.message:
-                    return QQParticipationDecision(
-                        action="say",
-                        conversation_id=decision.conversation_id,
-                        message=clean_qq_reply(decision.message, self.session.character_name),
-                        reason="unknown sticker_id; sent companion text only",
-                    )
-                fallback = self._fallback_direct_reply(packet_list, system_prompt)
-                if fallback.action == "say":
-                    return fallback
-                return QQParticipationDecision(reason="unknown sticker_id")
-            sticker_id = str(sticker_item.get("id") or decision.sticker_id)
-            path = qq_media.resolve_sticker_path(sticker_id)
-            if not path:
-                return QQParticipationDecision(reason="sticker path missing")
-            file_uri = _file_uri(path)
-            cq = _sticker_cq(file_uri)
-            message = (decision.message + " " + cq).strip() if decision.message else cq
-            segments: list[dict] = []
-            if decision.message:
-                segments.append({"type": "text", "data": {"text": decision.message}})
-            segments.append(_sticker_segment(file_uri))
-            return QQParticipationDecision(
-                action="say",
-                conversation_id=decision.conversation_id,
-                message=message,
-                reason=decision.reason,
-                sticker_id=sticker_id,
-                message_segments=segments,
-            )
+            return self.materialize_sticker_decision(decision, packet_list, system_prompt=system_prompt)
         if decision.action == "say":
             cleaned = clean_qq_reply(decision.message, self.session.character_name)
             if not cleaned:
                 return QQParticipationDecision(reason="empty cleaned message")
+            if _looks_like_unbacked_action_promise(cleaned, packet_list):
+                return QQParticipationDecision(
+                    action="silence",
+                    conversation_id="",
+                    message="",
+                    reason="promise guard: cannot claim an unstarted external action",
+                )
             if _looks_like_misowned_task(cleaned, packet_list):
                 logger.info(
                     "QQ participation suppressed likely misowned task: conversation=%s message=%r",
@@ -613,6 +596,60 @@ class QQAutonomousParticipant:
                 return fallback
         return decision
 
+    def materialize_sticker_decision(
+        self,
+        decision: QQParticipationDecision,
+        packets: list[QQContextPacket] | None = None,
+        *,
+        system_prompt: str = "",
+    ) -> QQParticipationDecision:
+        sticker_item = qq_media.resolve_sticker(decision.sticker_id)
+        if not sticker_item:
+            fallback_query = " ".join([decision.sticker_id, decision.message, decision.reason]).strip()
+            sticker_item = qq_media.fallback_sticker(
+                fallback_query,
+                min_score=0.55,
+            )
+            if sticker_item:
+                logger.warning(
+                    "QQ participation unknown sticker_id=%r, fallback sticker_id=%r",
+                    decision.sticker_id,
+                    sticker_item.get("id", ""),
+                )
+        if not sticker_item:
+            if decision.message:
+                return QQParticipationDecision(
+                    action="say",
+                    conversation_id=decision.conversation_id,
+                    message=clean_qq_reply(decision.message, self.session.character_name),
+                    reason="unknown sticker_id; sent companion text only",
+                )
+            if packets:
+                fallback = self._fallback_direct_reply(packets, system_prompt)
+                if fallback.action == "say":
+                    return fallback
+            return QQParticipationDecision(reason="unknown sticker_id")
+        sticker_id = str(sticker_item.get("id") or decision.sticker_id)
+        path = qq_media.resolve_sticker_path(sticker_id)
+        if not path:
+            return QQParticipationDecision(reason="sticker path missing")
+        file_uri = _file_uri(path)
+        cq = _sticker_cq(file_uri)
+        cleaned_message = clean_qq_reply(decision.message, self.session.character_name) if decision.message else ""
+        message = (cleaned_message + " " + cq).strip() if cleaned_message else cq
+        segments: list[dict] = []
+        if cleaned_message:
+            segments.append({"type": "text", "data": {"text": cleaned_message}})
+        segments.append(_sticker_segment(file_uri))
+        return QQParticipationDecision(
+            action="say",
+            conversation_id=decision.conversation_id,
+            message=message,
+            reason=decision.reason,
+            sticker_id=sticker_id,
+            message_segments=segments,
+        )
+
     def _fallback_direct_reply(
         self,
         packets: list[QQContextPacket],
@@ -635,7 +672,7 @@ class QQAutonomousParticipant:
                 json_mode=False,
             )
             message = clean_qq_reply(raw, self.session.character_name)
-            if not message or message.upper() == "SILENCE":
+            if not message or message.upper() == "SILENCE" or message == "沉默":
                 return QQParticipationDecision(reason="direct fallback chose silence")
             if len(message) > self.max_message_chars:
                 message = message[: self.max_message_chars].rstrip()
@@ -725,6 +762,7 @@ class QQInputRuntime:
             model=participation_model,
             cooldown_seconds=_config_float(self.config, "participation_cooldown_seconds", 45.0),
             max_message_chars=_config_int(self.config, "max_message_chars", 260),
+            environment=self.environment,
         )
         self.autonomous_enabled = bool(self.config.get("autonomous_participation_enabled", True))
         self.batch_quiet_seconds = _config_float(self.config, "batch_quiet_seconds", 4.0)
@@ -851,15 +889,13 @@ class QQInputRuntime:
             return QQParticipationDecision()
 
         should_absorb_now = absorb_before_decide and self.absorb_before_decide
-        if _has_direct_social_signal(packets):
-            should_absorb_now = False
         if should_absorb_now and packet_events:
             loop = getattr(self.session, "inner_stream_loop", None)
             if loop is not None and hasattr(loop, "evaluate_now"):
                 loop.evaluate_now(packet_events, trigger_reason="QQ environment before participation")
 
-        decision = self.participant.decide(packets)
-        if decision.action != "say":
+        decision = self._decide_autonomous(packets, packet_events)
+        if decision.action not in {"say", "send_sticker"}:
             return decision
         chosen_packet = next((p for p in packets if p.conversation_id == decision.conversation_id), None)
         if (
@@ -877,15 +913,83 @@ class QQInputRuntime:
                 action="silence",
                 reason="cooldown boundary",
             )
-        if self.environment.has_recent_duplicate_send(decision.conversation_id, decision.message):
+        duplicate_key = decision.message or decision.sticker_id
+        if self.environment.has_recent_duplicate_send(decision.conversation_id, duplicate_key):
             return QQParticipationDecision(
                 action="silence",
                 reason="duplicate recent self message",
             )
         if chosen_packet is not None:
-            self.environment.mark_sent_text(decision.conversation_id, decision.message)
+            self.environment.mark_sent_text(decision.conversation_id, duplicate_key)
             self.environment.mark_turn_responded(decision.conversation_id, chosen_packet.turn_key)
         return decision
+
+    def _decide_autonomous(
+        self,
+        packets: list[QQContextPacket],
+        packet_events: list[input_events.InputEvent],
+    ) -> QQParticipationDecision:
+        autonomous = getattr(self.session, "autonomous_step", None)
+        if autonomous is None or not getattr(autonomous, "enabled", False):
+            return self.participant.decide(packets)
+        context = {}
+        provider = getattr(self.session, "_inner_stream_event_context", None)
+        if callable(provider):
+            try:
+                context = provider() or {}
+            except Exception:
+                context = {}
+        try:
+            from kokoro import qq_media
+            sticker_query = " ".join(
+                str(getattr(p, "content", "") or "")[:100] for p in packets[-3:]
+            ) or ""
+            sticker_candidates = qq_media.sticker_candidates_for_context(sticker_query, limit=20)
+            if sticker_candidates:
+                context["sticker_candidates"] = sticker_candidates
+        except Exception:
+            pass
+        decision = autonomous.decide(
+            events=packet_events,
+            context=context,
+            qq_packets=packets,
+            trigger_reason="QQ autonomous participation",
+            capabilities=["say_qq", "send_sticker", "search_web", "remember", "update_cognition", "observe", "wait"],
+            cooldown_scope="qq",
+        )
+        if decision.action == "say_qq":
+            cleaned = clean_qq_reply(decision.message, self.session.character_name)
+            if not cleaned:
+                return QQParticipationDecision(reason="empty autonomous message")
+            if len(cleaned) > self.participant.max_message_chars:
+                cleaned = cleaned[: self.participant.max_message_chars].rstrip()
+            marker = getattr(autonomous, "mark_social_output", None)
+            if callable(marker):
+                marker(decision.conversation_id)
+            return QQParticipationDecision(
+                action="say",
+                conversation_id=decision.conversation_id,
+                message=cleaned,
+                reason=decision.reason,
+            )
+        if decision.action == "send_sticker":
+            marker = getattr(autonomous, "mark_social_output", None)
+            if callable(marker):
+                marker(decision.conversation_id)
+            return self.participant.materialize_sticker_decision(QQParticipationDecision(
+                action="send_sticker",
+                conversation_id=decision.conversation_id,
+                sticker_id=decision.sticker_id,
+                message=clean_qq_reply(decision.message, self.session.character_name) if decision.message else "",
+                reason=decision.reason,
+            ), packets)
+        autonomous.execute_async(
+            decision,
+            events=packet_events,
+            context=context,
+            trigger_reason="QQ autonomous participation",
+        )
+        return QQParticipationDecision(reason=decision.reason or decision.action)
 
     def recent_conversation_id(self, *, message_type: str = "group") -> str:
         with self.environment._lock:
@@ -1027,7 +1131,7 @@ def _detect_attention_lines(
     self_id: str = "",
 ) -> list[str]:
     signals: list[str] = []
-    name = str(character_name or "").strip()
+    aliases = _self_aliases(character_name)
     self_id = str(self_id or "").strip()
     recent = messages[-12:]
     for msg in recent:
@@ -1038,13 +1142,22 @@ def _detect_attention_lines(
         if not content:
             continue
         reasons: list[str] = []
-        if name and name in content:
-            reasons.append(f"点名{name}")
+        matched_alias = _matched_self_alias(content, aliases)
+        if matched_alias:
+            if _content_is_only_name_call(content, aliases):
+                reasons.append(f"只写了角色称呼：{matched_alias}")
+            else:
+                reasons.append(f"提到角色称呼：{matched_alias}")
         if self_id and f"[CQ:at,qq={self_id}]" in content:
             reasons.append("@了她")
-        if re.search(r"[?？]|怎么|什么|为啥|为什么|吗|呢", content):
-            reasons.append("像是在抛问题")
-        if re.search(r"雪吱|小雪|吱吱|你", content) and len(content) <= 40:
+        has_name = bool(matched_alias)
+        has_self_at = bool(self_id and f"[CQ:at,qq={self_id}]" in content)
+        has_selfish_pronoun = bool(matched_alias)
+        if msg.message_type == "private" and re.search(r"[?？]|怎么|什么|为啥|为什么|吗|呢", content):
+            reasons.append("私聊里像是在抛问题")
+        elif (has_name or has_self_at or has_selfish_pronoun) and re.search(r"[?？]|怎么|什么|为啥|为什么|吗|呢", content):
+            reasons.append("点到她的问题")
+        if (has_name or has_self_at or has_selfish_pronoun or msg.message_type == "private") and (matched_alias or "你" in content) and len(content) <= 40:
             reasons.append("短句像是在向她搭话")
         if reasons:
             unique = ",".join(dict.fromkeys(reasons))
@@ -1065,14 +1178,10 @@ def _detect_relation_lines(
     self_id: str = "",
 ) -> list[str]:
     relations: list[str] = []
-    name = str(character_name or "").strip()
+    aliases = _self_aliases(character_name)
+    participant_names = _participant_names(messages, self_id)
     self_id = str(self_id or "").strip()
     recent = messages[-16:]
-    last_self_index = -1
-    for idx, msg in enumerate(recent):
-        if _is_self_message(msg, self_id):
-            last_self_index = idx
-
     for idx, msg in enumerate(recent[-8:], start=max(0, len(recent) - 8)):
         if _is_self_message(msg, self_id):
             continue
@@ -1081,32 +1190,34 @@ def _detect_relation_lines(
             continue
         speaker = msg.nickname or msg.user_id or "有人"
         direct_reasons: list[str] = []
-        if name and name in content:
-            direct_reasons.append(f"mentions {name}")
+        matched_alias = _matched_self_alias(content, aliases)
+        if matched_alias:
+            if _content_is_only_name_call(content, aliases):
+                direct_reasons.append(f"仅称呼角色:{matched_alias}")
+            else:
+                direct_reasons.append(f"提到角色:{matched_alias}")
         if self_id and f"[CQ:at,qq={self_id}]" in content:
-            direct_reasons.append("@self")
+            direct_reasons.append("@本角色")
         if _reply_targets_self(content, self_id):
-            direct_reasons.append("reply_to_self")
-        if last_self_index >= 0 and 0 < idx - last_self_index <= 3 and len(content) <= 80:
-            direct_reasons.append("near_self_turn")
+            direct_reasons.append("回复本角色")
         if direct_reasons:
-            relations.append(f"direct_to_self: {speaker} ({','.join(dict.fromkeys(direct_reasons))}) -> {content[:70]}")
+            relations.append(f"指向本角色：{speaker}（{','.join(dict.fromkeys(direct_reasons))}） -> {content[:70]}")
             continue
 
-        target = _extract_nonself_target(content, self_id)
+        target = _extract_nonself_target(content, self_id, participants=participant_names, speaker=speaker, self_aliases=aliases)
         if target:
-            relations.append(f"other_thread: {speaker} is addressing/replying to another QQ member ({target}) -> {content[:70]}")
+            relations.append(f"指向其他成员：{speaker} 可能在称呼或回应 {target} -> {content[:70]}")
             continue
 
         if _looks_like_technical_advice(content):
-            relations.append(f"technical_advice_not_self_task: {speaker} may be advising another member; Alice should not answer as executor -> {content[:70]}")
+            relations.append(f"疑似技术建议：{speaker} 的话可能是在给群友建议，不一定是本角色要执行的任务 -> {content[:70]}")
             continue
 
         if idx >= len(recent) - 3:
             if msg.message_type == "private":
-                relations.append(f"private_thread: {speaker} is talking with Alice in private chat -> {content[:70]}")
+                relations.append(f"私聊现场：{speaker} 在私聊中说话 -> {content[:70]}")
             else:
-                relations.append(f"ambient_group_topic: {speaker} contributes to the current group flow -> {content[:70]}")
+                relations.append(f"群聊现场：{speaker} 参与当前群聊流动 -> {content[:70]}")
 
     return relations[-8:]
 
@@ -1125,12 +1236,91 @@ def _reply_targets_self(content: str, self_id: str = "") -> bool:
     return bool(re.search(rf"\[CQ:reply,[^\]]*(?:qq=|user_id=)?{re.escape(self_id)}[^\]]*\]", content))
 
 
-def _extract_nonself_target(content: str, self_id: str = "") -> str:
+def _self_aliases(character_name: str = "") -> list[str]:
+    name = str(character_name or "").strip()
+    return [name] if name else []
+
+
+def _matched_self_alias(content: str, aliases: list[str]) -> str:
+    text = str(content or "")
+    for alias in sorted(aliases, key=len, reverse=True):
+        if alias and alias in text:
+            return alias
+    return ""
+
+
+def _content_is_only_name_call(content: str, aliases: list[str]) -> bool:
+    text = _strip_cq_codes(str(content or "")).strip()
+    text = re.sub(r"^[,，。.!！?？~～\s]+|[,，。.!！?？~～\s]+$", "", text)
+    text = re.sub(r"[（）()]+", "", text).strip()
+    if not text:
+        return False
+    for alias in aliases:
+        if text == alias:
+            return True
+        if re.fullmatch(rf"{re.escape(alias)}+[呀啊哦诶欸嘛呢呐～~!！?？。,.，\s]*", text):
+            return True
+    return False
+
+
+def _strip_cq_codes(content: str) -> str:
+    return re.sub(r"\[CQ:[^\]]+\]", "", str(content or ""))
+
+
+def _participant_names(messages: list[QQRawMessage], self_id: str = "") -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for msg in messages:
+        if _is_self_message(msg, self_id):
+            continue
+        name = (msg.nickname or msg.user_id or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _extract_nonself_target(
+    content: str,
+    self_id: str = "",
+    *,
+    participants: list[str] | None = None,
+    speaker: str = "",
+    self_aliases: list[str] | None = None,
+) -> str:
     for match in re.finditer(r"\[CQ:(?:at|reply),[^\]]*(?:qq|id|user_id)=([^,\]]+)", content):
         target = match.group(1).strip()
         if target and target != self_id:
             return target[:32]
+    text = _strip_cq_codes(str(content or "")).strip()
+    aliases = set(self_aliases or [])
+    for name in sorted(participants or [], key=len, reverse=True):
+        if not name or name == speaker or name in aliases:
+            continue
+        if text == name or re.fullmatch(rf"(?:你叫|叫|是|找|问)?\s*{re.escape(name)}\s*[?？呀啊嘛呢呐。,.，!！]*", text):
+            return name[:32]
+        if name in text and not any(alias in text for alias in aliases):
+            return name[:32]
     return ""
+
+
+def _recent_social_feedback(messages: list[QQRawMessage], self_id: str = "") -> bool:
+    for msg in messages[-8:]:
+        if _is_self_message(msg, self_id):
+            continue
+        if _looks_like_social_feedback(str(msg.content or "")):
+            return True
+    return False
+
+
+def _recent_self_said_quiet(messages: list[QQRawMessage], self_id: str = "") -> bool:
+    for msg in messages[-8:]:
+        if not _is_self_message(msg, self_id):
+            continue
+        text = str(msg.content or "")
+        if any(marker in text for marker in ("先安静", "安静一会", "先不说", "先闭嘴", "你们先聊")):
+            return True
+    return False
 
 
 def _looks_like_technical_advice(text: str) -> bool:
@@ -1178,9 +1368,34 @@ def _looks_like_misowned_task(message: str, packets: list[QQContextPacket]) -> b
     if not any(marker in text for marker in self_task_markers):
         return False
     relation_text = "\n".join(packet.relation_summary for packet in packets)
-    has_direct = "direct_to_self" in relation_text
-    has_other_task = "technical_advice_not_self_task" in relation_text or "other_thread" in relation_text
+    has_direct = "指向本角色" in relation_text
+    has_other_task = "疑似技术建议" in relation_text or "指向其他成员" in relation_text
     return has_other_task and not has_direct
+
+
+def _looks_like_unbacked_action_promise(message: str, packets: list[QQContextPacket]) -> bool:
+    text = str(message or "").strip()
+    if not text:
+        return False
+    promise_markers = (
+        "我再去翻",
+        "我去翻",
+        "我来翻",
+        "我再去看",
+        "我去看看",
+        "我看看日志",
+        "我翻翻日志",
+        "我去查日志",
+        "我查一下日志",
+        "我去翻日志",
+        "我再去查",
+    )
+    if not any(marker in text for marker in promise_markers):
+        return False
+    allowed_search_markers = ("搜索", "搜搜", "查一下", "查查", "百科", "官网", "资料")
+    if any(marker in text for marker in allowed_search_markers) and "日志" not in text:
+        return False
+    return True
 
 
 def _config_int(data: dict, key: str, default: int) -> int:
@@ -1407,6 +1622,7 @@ def _normalize_for_duplicate(text: str) -> str:
     )
     value = "".join(ch for ch in value if ch not in punctuation)
     return value.lower().strip()
+
 
 def _format_packet_for_decision(packet: QQContextPacket) -> str:
     return (

@@ -348,6 +348,13 @@ def inner_stream_search_config() -> dict:
     return section
 
 
+def autonomous_step_config() -> dict:
+    section = get("autonomous_step", {})
+    if not isinstance(section, dict):
+        section = {}
+    return section
+
+
 def inner_memory_config() -> dict:
     section = get("inner_memory", {})
     if not isinstance(section, dict):

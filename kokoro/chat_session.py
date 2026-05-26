@@ -49,6 +49,7 @@ class ChatSession:
     input_registry: object = field(default=None)  # InputTypeRegistry
     event_bus: object = field(default=None)  # InputEventBus
     inner_stream_loop: object = field(default=None)  # InnerStreamLoop
+    autonomous_step: object = field(default=None)  # AutonomousStep
     # Scene type — determines information source layout and guidance prompt
     _scene: object = field(default=None)  # scene_mod.SceneType | None
     # Config overrides — applied on top of the per-character config.toml
@@ -72,7 +73,13 @@ class ChatSession:
         if self.emotion is None:
             self.emotion = EmotionState(self.character_id)
         if self.inner_stream is None:
-            self.inner_stream = InnerStream(self.character_id, self.character_data)
+            from kokoro import config as _cfg
+            section = _cfg.inner_stream_config()
+            self.inner_stream = InnerStream(
+                self.character_id,
+                self.character_data,
+                reset_on_start=bool(section.get("reset_on_start", True)),
+            )
         if self.memory_events is None:
             self.memory_events = MemoryEventStore(self.memory_backend, self.character_id)
         if self.input_registry is None:
@@ -82,43 +89,43 @@ class ChatSession:
         if self.inner_stream_loop is None:
             from kokoro import config as _cfg
             search_section = _cfg.inner_stream_search_config()
-            search_impulse = None
-            if bool(search_section.get("enabled", False)):
-                try:
-                    from kokoro.web_search_impulse import InnerStreamSearchImpulse
-                    search_impulse = InnerStreamSearchImpulse(
-                        character_name=self.character_name,
-                        user_name=self.user_name,
-                        event_callback=self._record_inner_stream_search_event,
-                        section=search_section,
-                    )
-                except Exception as exc:
-                    logger.warning("failed to initialize inner stream search impulse: %s", exc)
             output_handlers = []
+            cognition_reflector = None
             cognition_section = _cfg.inner_cognition_config()
             if bool(cognition_section.get("enabled", True)):
                 try:
                     from kokoro.inner_cognition_reflection import InnerCognitionReflection
-                    output_handlers.append(
-                        InnerCognitionReflection(
-                            session=self,
-                            section=cognition_section,
-                        ).consider
+                    cognition_reflector = InnerCognitionReflection(
+                        session=self,
+                        section=cognition_section,
                     )
                 except Exception as exc:
                     logger.warning("failed to initialize inner cognition reflection: %s", exc)
+            memory_reflector = None
             memory_section = _cfg.inner_memory_config()
             if bool(memory_section.get("enabled", True)):
                 try:
                     from kokoro.inner_memory_reflection import InnerMemoryReflection
-                    output_handlers.append(
-                        InnerMemoryReflection(
-                            session=self,
-                            section=memory_section,
-                        ).consider
+                    memory_reflector = InnerMemoryReflection(
+                        session=self,
+                        section=memory_section,
                     )
                 except Exception as exc:
                     logger.warning("failed to initialize inner memory reflection: %s", exc)
+            try:
+                from kokoro.autonomous_step import AutonomousStep
+                self.autonomous_step = AutonomousStep(
+                    session=self,
+                    section=_cfg.autonomous_step_config(),
+                    search_section=search_section,
+                )
+                self.autonomous_step.attach_reflectors(
+                    memory_reflector=memory_reflector,
+                    cognition_reflector=cognition_reflector,
+                )
+                output_handlers.append(self.autonomous_step.consider_after_inner_stream)
+            except Exception as exc:
+                logger.warning("failed to initialize autonomous step: %s", exc)
             section = _inner_stream_section()
             self.inner_stream_loop = InnerStreamLoop(
                 stream=self.inner_stream,
@@ -127,7 +134,7 @@ class ChatSession:
                 idle_interval_seconds=float(section.get("idle_interval_seconds", 240.0) or 240.0),
                 time_tick_interval_seconds=float(section.get("time_tick_interval_seconds", 900.0) or 900.0),
                 max_batch=int(section.get("event_max_batch", 16) or 16),
-                search_impulse=search_impulse,
+                search_impulse=None,
                 output_handlers=output_handlers,
             )
             self.event_bus.subscribe(self.inner_stream_loop.submit)
@@ -575,24 +582,41 @@ class ChatSession:
             user_name=self.user_name,
             character_name=self.character_name,
         )
+        events = []
+        bus = getattr(self, "event_bus", None)
+        if bus is not None and hasattr(bus, "snapshot"):
+            try:
+                events = bus.snapshot(20)
+            except Exception:
+                events = []
+        event_text = input_events.format_events_for_prompt(events, max_chars=2500) if events else ""
         try:
             query = " ".join(
                 msg.get("content", "")
                 for msg in self.history[-4:]
                 if isinstance(msg, dict)
-            )[:500]
+            )
+            if event_text:
+                query = f"{query}\n{event_text}"
+            query = query[:1000]
             memories = self.memory_backend.get_context_multi(
                 query,
                 memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
             ) if query else ""
         except Exception:
             memories = ""
+        cognition_context = ""
+        try:
+            if self.cognition:
+                cognition_context = self.cognition.get_context_for_text(event_text) if event_text else self.cognition.get_context()
+        except Exception:
+            cognition_context = self.cognition.get_context() if self.cognition else ""
         return {
             "character_name": self.character_name,
             "user_name": self.user_name,
             "summary": self.summary or "",
             "recent_history": recent,
-            "cognition_context": self.cognition.get_context() if self.cognition else "",
+            "cognition_context": cognition_context,
             "emotion_context": self.emotion.get_context() if self.emotion else "",
             "memory_context": memories or "",
             "scene_context": self.scene_guidance or "",

@@ -448,6 +448,11 @@ eval_model = ""
 # 类型: bool
 enabled = true
 
+# 每次启动时是否清空上一轮运行保存的内在叙事流。
+# 这样长期记忆和认知仍保留，但不会把几天前的临时注意力当成当前状态。
+# 类型: bool
+reset_on_start = true
+
 # 更新内在叙事流使用的模型。留空则使用 llm_model。
 # 类型: string
 model = ""
@@ -458,7 +463,7 @@ max_chars = 1200
 
 # 单次更新最大生成 token。
 # 类型: int
-max_tokens = 700
+max_tokens = 420
 
 # 内在叙事流更新日志。用于观察每次思考的触发、输入和更新结果。
 # 类型: bool
@@ -466,15 +471,15 @@ log_updates = true
 
 # 外部/自身事件进入后，最早提前到多少秒后更新内在叙事流。
 # 类型: float
-event_wakeup_delay_seconds = 0.5
+event_wakeup_delay_seconds = 0.8
 
 # 没有强输入时，内在叙事流自己的基础更新周期。
 # 类型: float
-idle_interval_seconds = 5.0
+idle_interval_seconds = 8.0
 
 # 长时间没有事件时，注入低频 time_tick 的周期。0 表示禁用。
 # 类型: float
-time_tick_interval_seconds = 10.0
+time_tick_interval_seconds = 8.0
 
 # 单次节奏更新最多合并的事件数。
 # 类型: int
@@ -522,6 +527,30 @@ consider_interval_seconds = 5.0
 # daemon 请求超时。
 # 类型: float
 timeout = 45.0
+
+# ===========================================================================
+# 统一自主行动决策
+# ===========================================================================
+# 由同一个 AI 决策点在 inner_stream、QQ 现场、记忆、认知和可用能力之间
+# 选择下一步行动。搜索、QQ 发言、记忆和认知更新都应尽量走这里，避免
+# 多套局部自主系统同时抢决策权。
+
+[autonomous_step]
+# 是否启用统一自主行动决策。
+# 类型: bool
+enabled = true
+
+# 使用的模型。留空则使用 dialogue_model/llm_model。
+# 类型: string
+model = ""
+
+# 单次决策最大生成 token。
+# 类型: int
+max_tokens = 512
+
+# 两次统一自主决策的最小间隔。
+# 类型: float
+min_interval_seconds = 3.0
 
 # ===========================================================================
 # 内在叙事流记忆反思
@@ -625,7 +654,7 @@ batch_min_unread = 1
 
 # 没有新 QQ 消息时，多久允许把最近会话作为空闲社交现场交给自主参与判断。
 # 类型: float
-idle_participation_seconds = 30.0
+idle_participation_seconds = 25.0
 
 # 是否启用 QQ 自主参与判断。关闭后 QQ 只进入内在叙事，不主动发消息。
 # 类型: bool

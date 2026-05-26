@@ -128,6 +128,13 @@ class InputEventBus:
                 break
         return events
 
+    def snapshot(self, max_items: int | None = None) -> list[InputEvent]:
+        with self._queue.mutex:
+            events = list(self._queue.queue)
+        if max_items is not None:
+            return events[-max(0, int(max_items)):]
+        return events
+
 
 def build_text_event(
     content: str,
@@ -232,12 +239,16 @@ def build_web_search_event(
 
 def format_events_for_prompt(events: Iterable[InputEvent], *, max_chars: int = 3000) -> str:
     lines: list[str] = []
+    now = datetime.now(timezone.utc).astimezone()
     for event in events:
         meta = []
         if event.metadata.get("speaker"):
             meta.append(f"speaker={event.metadata.get('speaker')}")
         if event.metadata.get("action"):
             meta.append(f"action={event.metadata.get('action')}")
+        age = _event_age_text(event.timestamp, now)
+        if age:
+            meta.append(f"age={age}")
         meta_text = f" ({', '.join(meta)})" if meta else ""
         lines.append(
             f"- [{event.timestamp}] type={event.type} source={event.source} "
@@ -245,6 +256,23 @@ def format_events_for_prompt(events: Iterable[InputEvent], *, max_chars: int = 3
         )
     text = "\n".join(lines)
     return text[:max(200, max_chars)].strip()
+
+
+def _event_age_text(timestamp: str, now: datetime) -> str:
+    try:
+        ts = datetime.fromisoformat(str(timestamp or ""))
+    except Exception:
+        return ""
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=now.tzinfo)
+    seconds = max(0.0, (now - ts.astimezone(now.tzinfo)).total_seconds())
+    if seconds < 1:
+        return "just_now"
+    if seconds < 90:
+        return f"{seconds:.0f}s_ago"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m_ago"
+    return f"{seconds / 3600:.1f}h_ago"
 
 
 def default_registry() -> InputTypeRegistry:
