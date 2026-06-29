@@ -1,0 +1,42 @@
+# Prompt module: qq_image
+# Entry prefix: qq_image.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[qq_image]
+understand = '''
+请理解这张 QQ 群聊图片或表情包，并结合上下文判断它在当前聊天里的作用。
+发送者：{sender}
+QQ摘要：{summary}
+最近群聊：
+{context}
+
+只输出 JSON：{"kind":"meme|sticker|photo|screenshot|unknown","description":"图里有什么","text":"图中文字","tone":"语气/情绪","context_meaning":"结合上下文大概表达什么"}
+'''
+
+understand_default = '''
+请理解这张 QQ 群聊图片或表情包，并结合上下文判断它在当前聊天里的作用。
+发送者：{sender}
+QQ摘要：{summary}
+最近群聊：
+{context}
+
+只输出 JSON：{"kind":"meme|sticker|photo|screenshot|unknown","description":"图里有什么", "text":"图中文字", "tone":"语气/情绪", "context_meaning":"结合上下文大概表达什么"}
+'''
+
+save_sticker = '''
+你正在替角色判断她是否喜欢这张 QQ 表情包，是否想收藏以后自己使用。这不是规则判断，而是她自己的趣味和社交表达。
+
+图片理解：
+{image}
+
+当前内在叙事流：
+{inner_stream}
+
+已有表情包：
+{candidates}
+
+只有当这张图有可复用的明确情绪、梗、反应感、角色表情或独特场景，并且和已有表情包不太重复时，才 save=true。普通截图、信息图、MC 物品/背包/百科界面、网页、命令行、代码、单纯可爱但没有独特情绪的泛用图、不可复用图片、太重复或她不喜欢，均 save=false。
+
+如果保存，desc 要写清楚图像内容和之后怎么理解；tags/emotions/scenes/style 要具体，usage_notes 写出下次什么聊天契机适合发它。
+只输出 JSON：{"save": boolean, "reason":"为什么喜欢或不收藏", "desc":"以后如何理解和使用这张表情", "tags":["标签"], "emotions":["情绪"], "scenes":["适用场景"], "style":["风格"], "intensity":"轻/中/强", "avoid":"不适合的场景", "usage_notes":"具体什么时候发它"}
+'''

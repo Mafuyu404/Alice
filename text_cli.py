@@ -12,18 +12,18 @@ from pathlib import Path
 
 import requests
 
-from kokoro import agent_loop
-from kokoro import chat_session
-from kokoro import console as console_mod
-from kokoro import config as cfg
-from kokoro import dialogue_orchestrator as dialogue_mod
-from kokoro import edge_cache as edge_cache_mod
-from kokoro import llm_client
-from kokoro import memory as mem_mod
-from kokoro import multi_chat
-from kokoro import text_cli_tools
-from kokoro import token_usage
-from kokoro import task_manager as task_manager_mod
+from kokoro.action import agent_loop
+from kokoro.core import chat_session
+from kokoro.core import console as console_mod
+from kokoro.core import config as cfg
+from kokoro.action import dialogue_orchestrator as dialogue_mod
+from kokoro.action import edge_cache as edge_cache_mod
+from kokoro.core import llm_client
+from kokoro.core import memory as mem_mod
+from kokoro.action import multi_chat
+from kokoro.action import text_cli_tools
+from kokoro.core import token_usage
+from kokoro.action import task_manager as task_manager_mod
 
 
 CONFIG = cfg.load()

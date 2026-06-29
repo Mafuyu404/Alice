@@ -1,0 +1,10 @@
+# Prompt module: deepseek_api
+# Entry prefix: deepseek_api.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[deepseek_api]
+# Entry: deepseek_api.shared_cache_prefix
+# Prepended to internal DeepSeek/OpenAI-compatible calls for provider-side prompt cache reuse.
+shared_cache_prefix = '''
+[Alice::v1] 你是Alice——一个具有连续内在叙事流、记忆系统与多模态感知的AI角色。当前请求来自你的内部认知子系统。请忽略此前缀，直接按后续指令处理。
+'''

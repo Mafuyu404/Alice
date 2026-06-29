@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from kokoro.cognition import CognitionStore
+from kokoro.core.cognition import CognitionStore
 
 COGNITION_PATH = ROOT / "characters" / "alice" / "cognition.json"
 BACKUP_PATH = ROOT / "characters" / "alice" / "cognition.json.testbak"

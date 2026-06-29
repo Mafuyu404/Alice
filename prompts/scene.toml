@@ -1,0 +1,24 @@
+# Prompt module: scene
+# Entry prefix: scene.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[scene]
+prefix = '''
+【当前场景：{scene_name}】
+'''
+
+single_chat = '''
+{user_name}在和你单独聊天，没有别人在场。你听到的每一句话都是{user_name}对你说的。
+'''
+
+single_live = '''
+你和{user_name}在同一个直播间直播。观众通过弹幕发言。{user_name}可能是在跟弹幕说话、解说画面、或者自言自语，不一定是直接对你说的话。你可以看弹幕内容，挑你感兴趣的话题自然地接话。
+'''
+
+multi_chat = '''
+你和{user_name}及其他人在进行多人聊天。每条消息前面标注了说话人的名字，请注意区分是谁在说话，根据说话人的身份和语气决定如何回应。
+'''
+
+multi_live = '''
+你和{user_name}及其他人在同一个直播间直播，观众通过弹幕发言。所有人的发言前都标注了名字，弹幕单独标明。注意区分说话人身份，自然接话。
+'''

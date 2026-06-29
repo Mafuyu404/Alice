@@ -1,0 +1,9 @@
+# Prompt module: chat_session
+# Entry prefix: chat_session.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[chat_session]
+screen_context_prefix = '''
+以下是你最近通过屏幕识别观察到的用户活动，按时间从早到晚排列：
+
+'''

@@ -40,7 +40,7 @@ characters/
 入口：`character.build_system_prompt()`
 
 ```text
-prompts.json 中的 character_system.template（默认模板）
+prompts/character_system.toml ?? character_system.template??????
   ├─ {name} → 角色名
   ├─ {user_name} → 用户称呼
   ├─ {description}

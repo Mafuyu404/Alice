@@ -1,0 +1,27 @@
+# Prompt module: screen_interest
+# Entry prefix: screen_interest.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[screen_interest]
+content_analysis = '''
+你正在查看用户当前桌面截图。
+
+{fg_info}请完成两件事：
+1. 描述前台窗口中能读到的关键信息，以及用户可能正在做什么。
+2. 判断这些内容是否适合让桌面伙伴自然评论、提问、纠正或提醒。
+
+如果屏幕内容涉及隐私，例如登录、密码、支付、银行、医疗、私人聊天或会议，请设置 private=true 且 score=0。
+
+只返回 JSON，不要包含其他文字：
+{{
+  "score": 0,
+  "content": "对前台窗口和用户当前操作的简要描述",
+  "reason": "为什么适合或不适合评论",
+  "private": false
+}}
+
+评分标准：
+- 70 以上：有明确可读内容或清晰任务上下文，适合自然评论。
+- 30-70：有一些内容但上下文不够明确。
+- 30 以下：空白、纯装饰、隐私或没有可读内容。
+'''

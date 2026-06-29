@@ -1,0 +1,30 @@
+# Prompt module: portrait_selection
+# Entry prefix: portrait_selection.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[portrait_selection]
+system = '''
+你是立绘选择器。根据最近一轮用户输入和角色回复，从候选立绘中选择最合适的一张。只能输出一个候选 id，不要解释。如果当前立绘已经合适，可以输出当前 id。
+'''
+
+user_template = '''
+当前立绘：{current_id}
+
+{user_name}：{user_text}
+{name}：{assistant_text}{time_info}
+
+候选立绘：
+{catalog}
+
+输出一个 id：
+'''
+
+time_info_idle = '''
+
+距离上次对话已经过去 {seconds} 秒，可以偏向平静待机表情。
+'''
+
+time_info_recent = '''
+
+对话刚结束不久，表情可以延续当前情绪。
+'''

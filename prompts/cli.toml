@@ -1,0 +1,12 @@
+# Prompt module: cli
+# Entry prefix: cli.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[cli]
+waiting_reply_fallback = '''
+好，我看一下。
+'''
+
+bilibili_live_context = '''
+【双人直播中】我们在同一个直播间直播。我刚才说的话可能是对观众说的、在解说、或者自言自语，不一定是直接问你。你可以自己判断是否要接话。
+'''

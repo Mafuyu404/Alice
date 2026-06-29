@@ -1,107 +1,77 @@
 # 提示词系统
 
-## 架构
+## 结构
 
-所有提示词集中在项目根目录的 `prompts.json`，通过 `kokoro/prompts.py` 加载。
+所有 LLM 提示词集中在项目根目录的 `prompts/` 下，不放在程序文件里。
 
-```python
-prompts.get("dialogue_orchestrator.planner_system")  # 点分路径访问
-prompts.format_prompt("impulse.planner_user", name="爱丽丝", ...)  # 带格式化
+```text
+prompts/
+  character_system.toml
+  inner_stream.toml
+  autonomous_step.toml
+  dialogue_orchestrator.toml
+  multi_dialogue_orchestrator.toml
+  ...
+  skills/
+    inner_continuity.md
+    memory_cognition.md
+    social_presence.md
 ```
 
-设计意图：所有与 LLM 交互的文本集中管理，不散落在各模块的字符串字面量中。
+入口：
 
-## 按模块的提示词分类
+```python
+from kokoro.core import prompts
 
-### 角色主提示词
+prompts.get("dialogue_orchestrator.planner_system")
+prompts.format_prompt("character_system.template", name="Alice", user_name="用户")
+prompts.skill("inner_continuity")
+```
 
-| key | 用途 |
+加载器位于 `kokoro/core/prompts.py`。它会读取 `prompts/*.toml` 并合并为一个按点分路径访问的字典；技能类长文档从 `prompts/skills/*.md` 读取。
+
+## TOML 约定
+
+每个 TOML 文件按模块命名，并只放该模块的提示词：
+
+```toml
+# Prompt module: inner_stream
+# Entry prefix: inner_stream.*
+
+[inner_stream]
+# Entry: inner_stream.events_system
+events_system = '''
+...
+'''
+```
+
+约定：
+
+- 文件名与顶层表名一致，例如 `dialogue_orchestrator.toml` 内使用 `[dialogue_orchestrator]`。
+- key 保持稳定，程序只引用 dotted key，例如 `inner_stream.events_user`。
+- 每个重要入口前写 `# Entry: module.key` 注释，说明调用入口。
+- 多行提示词使用 TOML 的 `'''...'''`，避免转义干扰。
+- 程序里只保留变量组装、格式化和调用逻辑；不要写 LLM 身份、输出格式、JSON 约束等提示词正文。
+
+## 主要模块
+
+| 模块 | 用途 |
 |---|---|
-| `character_system.template` | 角色 system prompt 主模板 |
-| `character_system.expression_calibration` | 附加的说话节奏校准 |
-
-模板中使用 `{name}`、`{user_name}`、`{description}`、`{personality}`、`{background}`、`{scene_block}`、`{example_dialogue_block}` 占位。
-
-### 对话调度器
-
-| key | 用途 |
-|---|---|
-| `dialogue_orchestrator.planner_system` | 话轮判断和主动搭话的 planner 系统提示 |
-| `dialogue_orchestrator.planner_user` | planner 用户提示（轮次、角色资料、历史等） |
-| `dialogue_orchestrator.generator_context` | 回复生成时的边界指令 |
-| `dialogue_orchestrator.reply_character_prompt` | 回复生成用的精简角色提示 |
-
-### 多角色调度器
-
-| key | 用途 |
-|---|---|
-| `multi_dialogue_orchestrator.planner_system` | 多角色 planner（决定谁说、对谁说） |
-| `multi_dialogue_orchestrator.planner_user` | 多角色 planner 用户提示 |
-| `multi_dialogue_orchestrator.generator_context` | 多角色生成时的边界指令 |
-| `multi_dialogue_orchestrator.reply_character_prompt` | 多角色生成用的精简角色提示 |
-
-### 情绪层
-
-| key | 用途 |
-|---|---|
-| `emotion.evaluate_system` | 情绪评估系统提示 |
-| `emotion.evaluate_user` | 情绪评估用户提示（当前情绪 + 本轮对话） |
-
-### 认知层
-
-| key | 用途 |
-|---|---|
-| `cognition.evaluate_system` | 认知评估系统提示 |
-| `cognition.evaluate_user` | 认知评估用户提示（现有条目 + 对话 + 摘要 + 记忆） |
-
-### 记忆事件
-
-| key | 用途 |
-|---|---|
-| `memory_events.extract_system` | 事件提取系统提示 |
-| `memory_events.extract_user` | 事件提取用户提示 |
-| `memory_events.summarize_system` | 事件去重合总结系统提示 |
-| `memory_events.summarize_user` | 事件去重合并用户提示 |
-
-### 重叠分类
-
-| key | 用途 |
-|---|---|
-| `overlap.system` | 重叠分类系统提示 |
-| `overlap.user_template` | 重叠分类用户提示 |
-
-### STT 精炼
-
-| key | 用途 |
-|---|---|
-| `stt_refine.system` | 独立精炼系统提示 |
-| `stt_refine.user_template` | 独立精炼用户提示 |
-| `stt_refine_inline.system` | inline 模式下注入聊天上下文的纠错提示 |
-
-### 其他
-
-| key | 用途 |
-|---|---|
-| `impulse.planner_system` / `planner_user` | 旧 impulse planner（兼容保留） |
-| `portrait_selection.system` / `user_template` | 立绘表情选择 |
-| `conversation_summary.system` / `user_template` | 对话摘要 |
-| `memory_importance.user_template` | 记忆重要度判断 |
-| `scene.*` | 场景引导文本 |
-| `user_commands.*` | 用户命令相关 |
-| `tool_calling.*` | 工具调用提示 |
-| `vision.*` | 屏幕识别提示 |
-| `bilibili_live.*` | 直播场景提示 |
+| `character_system.*` | 角色主 system prompt 与说话节奏校准 |
+| `inner_stream.*` | 内在叙事流更新 |
+| `inner_memory_reflection.*` | 从内在叙事流判断是否沉淀记忆 |
+| `autonomous_step.*` | 内在叙事流之后的行动批次选择 |
+| `dialogue_orchestrator.*` | 一对一对话调度、STT 池判断、回复生成边界 |
+| `multi_dialogue_orchestrator.*` | 多角色对话调度与生成边界 |
+| `tool_calling.*` / `tool_handlers.*` | 工具能力说明与工具结果解释 |
+| `vision.*` / `screen_interest.*` | 屏幕与图像理解 |
+| `web_search_impulse.*` | 内在搜索冲动判断 |
+| `deepseek_api.*` | DeepSeek 兼容调用的共享缓存前缀 |
 
 ## 设计原则
 
-1. **框架级提示词尽量通用**：不写项目私货，不把具体角色名硬编码进底层规则
-2. **事实约束和风格约束分开**：`planner_system` 管事实边界，`generator_context` 管语气
-3. **JSON 输出格式**：planner 类提示词要求输出 JSON，`response_format: {"type": "json_object"}`（DeepSeek 兼容模式）
-4. **节制长度**：planner 能看到的角色信息控制在 900 字符内，节 token 的同时减少过时上下文干扰
-
-## 缓存考虑
-
-所有 system prompt 是 DeepSeek 前缀缓存的受益者。设计上：
-- 稳定前缀（角色 system prompt + history）放在 messages 开头
-- 动态内容（记忆、认知、摘要、场景）放在 history 之后
-- 这样缓存命中时覆盖尽可能多的 token
+1. 提示词集中管理：新增 LLM 行为先加 `prompts/<module>.toml`，再在代码里引用 key。
+2. 程序只做信息循环：收集上下文、调用 LLM、执行工具、回流结果。
+3. 内在叙事流优先：对话、搜索、记忆、观察、主动说话都只是围绕内在叙事流展开的行动能力。
+4. JSON 输出要求写在 TOML 中；代码只启用 `json_mode`、解析和兜底。
+5. 技能类长提示放 `prompts/skills/*.md`，由需要的模块显式拼入 system prompt。

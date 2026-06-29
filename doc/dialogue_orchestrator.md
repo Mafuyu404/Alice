@@ -2,83 +2,42 @@
 
 实现文件：`kokoro/dialogue_orchestrator.py`
 
-## 作用
+`DialogueOrchestrator` 是当前一对一语音/文本场景的快速说话路径。它不是生命周期中心；中心是 [生命周期架构](lifecycle.md) 中的“内在叙事流 → 行动能力 → 信息循环”。
 
-统一接管了两个原先分离的职责：
+## 职责
 
-1. **话轮判断** — 用户说完一句后，决定角色应该沉默、短回应、正常说话还是稍后再说
-2. **主动搭话** — 空闲时定期检查屏幕/网页缓存，决定是否值得主动开口
-
-两个职能共用同一个 planner，角色性格同时影响话轮节奏和主动搭话倾向。
-
-## 话轮判断（Turn Decision）
-
-每句用户输入 → `decide(event)` → 返回动作：
+当用户语音或文本进入时，它快速判断是否需要立刻采取 `say` 类行动：
 
 | 动作 | 含义 |
 |---|---|
-| `silence` | 不回应，把这句话记录为"听见了但没接" |
-| `backchannel` | 一句很短的轻回应，不展开话题 |
-| `speak` | 正常生成回复 |
-| `schedule` | 现在不说，延迟一段时间后再说 |
-| `observe` | 记录但不回应 |
-| `cancel_plan` | 取消所有待执行的延迟计划 |
+| `silence` | 听见但不回应，记录为自身行动 |
+| `observe` | 记录为观察，不打断当前状态 |
+| `backchannel` | 很短的轻回应 |
+| `speak` | 生成正常回复 |
+| `schedule` | 稍后再说 |
+| `cancel_plan` | 取消待执行延迟发言 |
 
-### 判断依据
+这些动作本质上都应视为行动能力：`speak/backchannel` 是 `say`，`silence/observe` 是 `wait` 或 `stay_silent`，`schedule` 是延迟行动。
 
-- 事件类型（用户发言、空闲检查、缓存更新）
-- 角色资料（性格影响是否爱接话）
-- 最近对话上下文
-- 认知 / 情绪上下文
-- 已有待执行计划
+## 数据流
 
-### 回退机制
-
-planner 调用失败（网络、JSON 解析等）时使用 `backchannel` 作为安全回退，避免角色在系统故障时沉默。
-
-## 主动搭话（Proactive Speech）
-
-取代了旧的 `kokoro/impulse.py`。由后台线程驱动：
-
-```
-_dialogue_context_worker()
-  └─ 每 idle_context_interval_seconds（默认 30s）
-      ├─ 读取屏幕缓存 + 网页缓存
-      ├─ 调用 decide(event=context_cache)
-      └─ 如果决策为 speak/schedule → 加入计划表
+```text
+用户语音/文本事件
+  ├─ DialogueOrchestrator.decide() 低延迟判断
+  │    ├─ say / backchannel → 立即输出
+  │    └─ silence / observe / schedule → 记录行动
+  └─ InnerStreamLoop 异步吸收同一事件和行动结果
 ```
 
-### 约束
+如果回复过程中启动搜索、看屏幕或长任务，结果不应直接拼接到旧回复；它应作为新的行动结果事件回到 `InputEventBus`，再由内在叙事流和行动层决定下一步。
 
-- 屏幕兴趣度低于 `context_idle_min_score` 时不作为候选
-- 隐私内容跳过
-- 系统忙时不触发
-- 用户说话时立即取消所有待执行计划
+## 与后续重构的关系
 
-### 计划执行（Plan Executor）
+长期目标是把对话调度器收束到统一行动选择层：
 
-`start_plan_executor()` 启动后台线程轮询计划表。到期计划通过 `_execute_dialogue_plan()` 执行，执行时：
+```text
+当前：DialogueOrchestrator 单独判断说不说
+目标：LifeLoop/ActionPolicy 统一选择 say / wait / observe_screen / search_web / write_memory ...
+```
 
-1. 构建回复消息（同正常对话的 build_reply_messages）
-2. 流式生成回复 + TTS
-3. 回复追加到历史
-4. 触发肖像和情绪更新
-
-## 与旧 impulse 的差异
-
-| | 旧 impulse | 当前调度器 |
-|---|---|---|
-| planner 模型 | 独立配置 | 统一 dialogue.planning_model |
-| 系统提示 | 单独一套 planner prompt | 共用 planner_system |
-| 屏幕读取 | 自己调用 screen_interest | 通过 cache overview 读取 |
-| 字符上下文 | 截取 system_prompt[:800] | 完整角色资料 + system_prompt[:900] |
-| 空闲检测 | 独立线程 + 计划表 | 统一调度器 |
-
-## 配置
-
-参见 `config.toml` 的 `[dialogue]` 段：
-
-- `planning_model` — planner 模型，留空则回退到 `impulse_model` 或 `llm_model`
-- `idle_context_interval_seconds` — 空闲检查间隔
-- `context_idle_min_score` — 屏幕兴趣度下限
-- `max_recent_messages` — planner 可见的最近消息数
+在重构完成前，`DialogueOrchestrator` 保留为实时语音体验的快速路径，但它的所有输出都必须回写为事件，让内在叙事流能吸收“我刚刚说了/没说/稍后再说”的经历。

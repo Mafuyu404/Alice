@@ -24,34 +24,34 @@ from urllib.parse import urlparse
 
 import requests
 
-from kokoro import chat_session
-from kokoro import console as console_mod
-from kokoro import config as cfg
-from kokoro import conversation as conversation_mod
-from kokoro import dialogue_orchestrator as dialogue_mod
-from kokoro import llm_client
-from kokoro import prompts
-from kokoro import memory_events
-from kokoro import memory as mem_mod
-from kokoro import multi_chat as multi_chat_mod
-from kokoro import portrait_controller
-from kokoro import qq_input
-from kokoro import screen_interest
-from kokoro import scene as scene_mod
-from kokoro import state_machine as sm
-from kokoro import subtitle as subtitle_mod
-from kokoro import stt as stt_mod
-from kokoro import tts as tts_mod
-from kokoro import user_commands
-from kokoro import agent_loop
-from kokoro import bilibili_live as bilibili_live_mod
-from kokoro import edge_cache as edge_cache_mod
-from kokoro import token_usage
-from kokoro import tool_registry as tool_registry_mod
-from kokoro import task_manager as task_manager_mod
-from kokoro import vts_controller as vts_mod
-from kokoro.vts_body_driver import VTSBodyDriver
-from kokoro.web_search_client import WebSearchClient
+from kokoro.core import chat_session
+from kokoro.core import console as console_mod
+from kokoro.core import config as cfg
+from kokoro.action import conversation as conversation_mod
+from kokoro.action import dialogue_orchestrator as dialogue_mod
+from kokoro.core import llm_client
+from kokoro.core import prompts
+from kokoro.core import memory_events
+from kokoro.core import memory as mem_mod
+from kokoro.action import multi_chat as multi_chat_mod
+from kokoro.action import portrait_controller
+from kokoro.action import qq_input
+from kokoro.action import screen_interest
+from kokoro.core import scene as scene_mod
+from kokoro.core import state_machine as sm
+from kokoro.action import subtitle as subtitle_mod
+from kokoro.action import stt as stt_mod
+from kokoro.action import tts as tts_mod
+from kokoro.action import user_commands
+from kokoro.action import agent_loop
+from kokoro.action import bilibili_live as bilibili_live_mod
+from kokoro.action import edge_cache as edge_cache_mod
+from kokoro.core import token_usage
+from kokoro.action import tool_registry as tool_registry_mod
+from kokoro.action import task_manager as task_manager_mod
+from kokoro.action import vts_controller as vts_mod
+from kokoro.action.vts_body_driver import VTSBodyDriver
+from kokoro.action.web_search_client import WebSearchClient
 
 
 _PAREN_STRIP_RE = re.compile(r"\s*[\uff08(][^\uff09)]*[\uff09)]\s*")
@@ -470,7 +470,7 @@ def main() -> None:
     try:
         session = chat_session.load_session(args.character, memory_backend)
     except KeyError:
-        from kokoro import character
+        from kokoro.core import character
         print(f"[error] Character '{args.character}' not found")
         print(f"Available characters: {', '.join(character.load().keys())}")
         return
@@ -496,7 +496,7 @@ def main() -> None:
     _aec_processor = None
     if cfg.aec_enabled() and tts_engine is not None:
         try:
-            from kokoro.aec import AECProcessor
+            from kokoro.action.aec import AECProcessor
 
             tts_sr = tts_mod.SAMPLE_RATE
             _aec_processor = AECProcessor(
@@ -1556,7 +1556,7 @@ def main() -> None:
         Runs back-to-back.  watch_interval is the *minimum* delay between
         captures; if analysis takes longer no extra wait is added.
         """
-        from kokoro.screen_interest import get_cache
+        from kokoro.action.screen_interest import get_cache
         sc = get_cache()
         while not machine.is_shutting_down:
             if not screen_watch_enabled:
@@ -1774,9 +1774,9 @@ def _run_multi_cli(args):
         print("[error] --multi needs at least 2 character IDs")
         return
 
-    from kokoro import character as char_mod
-    from kokoro import config as cfg
-    from kokoro import memory as mem_mod
+    from kokoro.core import character as char_mod
+    from kokoro.core import config as cfg
+    from kokoro.core import memory as mem_mod
 
     runtime_cfg = cfg.load()
     _web_search_proc = _start_web_search_daemon(runtime_cfg)
@@ -1819,7 +1819,7 @@ def _run_multi_cli(args):
     _aec_processor = None
     if cfg.aec_enabled() and tts_map:
         try:
-            from kokoro.aec import AECProcessor
+            from kokoro.action.aec import AECProcessor
 
             tts_sr = tts_mod.SAMPLE_RATE
             _aec_processor = AECProcessor(

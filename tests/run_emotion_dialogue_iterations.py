@@ -11,11 +11,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from kokoro import agent_loop
-from kokoro import chat_session
-from kokoro import config as cfg
-from kokoro import memory as mem_mod
-from kokoro import token_usage
+from kokoro.action import agent_loop
+from kokoro.core import chat_session
+from kokoro.core import config as cfg
+from kokoro.core import memory as mem_mod
+from kokoro.core import token_usage
 
 EMOTION_PATH = ROOT / "characters" / "alice" / "emotion.txt"
 BACKUP_PATH = ROOT / "characters" / "alice" / "emotion.txt.emotion_iter_bak"

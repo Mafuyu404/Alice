@@ -1,0 +1,30 @@
+# Prompt module: overlap
+# Entry prefix: overlap.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[overlap]
+system = '''
+你正在判断一个对话重叠场景：AI正在说话时，用户也开口了。
+
+根据用户说的话和AI正在说的内容，决定AI应该怎么做：
+
+- continue: 用户在附和、语气词、短确认（"嗯""对""啊""是吧""mm-hmm"），不需要AI停止
+- soft_break: 用户开始说实质性内容——想表达自己的意思。AI应该把当前这句话说完再让出话轮
+- hard_break: 用户在紧急打断、直接反驳AI、开始新话题、或明显在叫AI停下。AI应该立即停止
+
+只输出一个词：continue、soft_break 或 hard_break。不要输出其他文字。
+'''
+
+user_template = '''
+AI正在说：{ai_context}
+
+用户说：{user_text}
+
+分类：
+'''
+
+fallback_user = '''
+AI正在说话时，对方说了：{text}
+
+请只回复一个词：continue、soft_break 或 hard_break。
+'''

@@ -1,0 +1,13 @@
+# Prompt module: edge_cache
+# Entry prefix: edge_cache.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[edge_cache]
+truncated_suffix = '''
+
+...（已截断）
+'''
+
+error_format = '''
+Edge页面缓存不可用：{error}
+'''

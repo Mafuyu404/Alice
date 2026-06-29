@@ -1,0 +1,24 @@
+# Prompt module: bilibili_live
+# Entry prefix: bilibili_live.*
+# Loaded by kokoro.core.prompts; keep dotted keys stable because code references them directly.
+
+[bilibili_live]
+live_system_hint = '''
+【当前状态：双人直播中】你和我在同一个直播间，一起和观众互动。观众通过弹幕发言。我可能是在跟弹幕说话、解说画面、或者自言自语，不一定是直接对你说的话。你可以看弹幕内容，挑你感兴趣的话题自然地接话，就像朋友一起开播时随口聊起来一样。
+
+以下是最新的弹幕：
+'''
+
+planner_live_context = '''
+
+【直播弹幕】
+最近观众弹幕：
+{danmaku_text}
+
+观众列表（发言次数）：
+{user_list}
+'''
+
+trigger_danmaku_reply = '''
+现在可以回应弹幕了。从上面挑你觉得有意思的，自然地接一句。不用每条都回，挑你感兴趣的就好。
+'''

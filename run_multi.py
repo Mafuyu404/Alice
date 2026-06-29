@@ -3,7 +3,7 @@
 import subprocess
 import sys
 
-from kokoro import console as console_mod
+from kokoro.core import console as console_mod
 
 
 def main():
