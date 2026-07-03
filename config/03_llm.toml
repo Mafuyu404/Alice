@@ -1,0 +1,39 @@
+# ===========================================================================
+# LLM 路由
+# ===========================================================================
+
+# LLM 服务地址（兼容 OpenAI / Ollama 格式）。
+# 类型: string (URL)
+# Ollama 默认: http://127.0.0.1:11434
+# OpenAI 兼容服务: http://127.0.0.1:8000/v1（程序会自动补 /v1）
+# DeepSeek 等云端 API 不需要在此填地址，由模型名自动路由。
+llm_url = "http://127.0.0.1:11434"
+
+# 默认对话模型名称。
+# 类型: string（模型名）
+# 使用 Ollama: "qwen2.5:7b", "deepseek-v4-flash" 等
+# 使用 OpenAI 兼容服务: 按服务支持的模型名填写
+# 使用 DeepSeek: 模型名以 "deepseek" 开头时自动走 DeepSeek API
+# 可通过启动参数 --model 临时覆盖。
+llm_model = "deepseek-v4-flash"
+
+# 主对话生成模型。
+# 类型: string（模型名）
+# 留空时复用 llm_model；若角色卡里填写 llm_model，启动参数 --model 仍优先覆盖。
+dialogue_model = "deepseek-v4-flash"
+
+# DeepSeek API 密钥。模型名以 deepseek 开头时自动使用 DeepSeek 云端 API。
+# 也可以通过环境变量 DEEPSEEK_API_KEY 设置（环境变量优先级更高）。
+# 留空时从 config.json 的 deepseek_api_key 读取。
+# 类型: string
+deepseek_api_key = ""
+
+# 智谱 CharGLM API 密钥。使用 charglm 模型时需要。
+# 留空时从 config.json 的 charglm_api_key 读取。
+# 类型: string
+charglm_api_key = ""
+
+# 本地 transformers 模型名，作为 LLM 不可用时的后备。
+# 仅在 local_llm.py 中使用，直接加载 HuggingFace 模型到内存。
+# 类型: string（HuggingFace 模型 ID）
+local_model = "Qwen/Qwen2.5-1.5B-Instruct"

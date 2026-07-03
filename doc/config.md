@@ -4,12 +4,12 @@
 
 | 文件 | 用途 | 提交 |
 |---|---|---|
-| `config.toml` | 主配置，所有可调参数 | 可以 |
+| `config/*.toml` | 主配置分片，按文件名顺序合并 | 可以 |
 | `config.json` | 本地密钥和局部覆盖，与 toml 同结构 | 不可以 |
 
-优先级：`config.toml` > `config.json`。toml 中已设置的值不会被 json 覆盖，只填充 toml 中为空的项。
+优先级：`config/*.toml` > `config.json`。toml 中已设置的值不会被 json 覆盖，只填充 toml 中为空的项。
 
-配置加载入口：`kokoro/config.py` 中的 `load()`，合并逻辑见 `_merge_fallback()`。
+配置加载入口：`kokoro/core/config.py` 中的 `load()`，分片合并逻辑见 `_merge_override()`，本地 fallback 合并逻辑见 `_merge_fallback()`。
 
 ---
 
@@ -317,4 +317,4 @@ buffer_max_age = 60.0
 }
 ```
 
-密钥来源优先级：环境变量 > `config.json` > 空的 `config.toml` 占位。
+密钥来源优先级：环境变量 > `config.json` > 空的 `config/*.toml` 占位。

@@ -19,10 +19,9 @@ from typing import Callable
 import requests
 
 from kokoro.core import config as cfg
-from kokoro.action import edge_cache
+from kokoro.action.tools import observe_screen
 from kokoro.core import prompts
 from kokoro.core import scene as scene_mod
-from kokoro.action import screen_interest
 from kokoro.core import token_usage
 
 _AGENT_CAPABILITY_CACHE: str = ""
@@ -166,7 +165,7 @@ class DialogueOrchestrator:
         self.page_context_max_chars = max(500, int(section.get("page_context_max_chars", 2500)))
         self.idle_context_interval_seconds = max(5.0, float(section.get("idle_context_interval_seconds", 30.0)))
         self.context_idle_min_score = max(0.0, float(section.get("context_idle_min_score", 70.0)))
-        self.edge_cache_config = edge_cache.config_from_dict(config)
+        self.edge_cache_config = observe_screen.edge_cache_config_from_dict(config)
         self.random_mc_enabled = scene_mod.random_mc_enabled(config)
         self._last_random_mc_signature = ""
         self.session = session
@@ -432,7 +431,7 @@ class DialogueOrchestrator:
     def _page_signature(self) -> str:
         if not self.edge_cache_config.enabled:
             return ""
-        data = edge_cache.read_cache(self.edge_cache_config.cache_file)
+        data = observe_screen.read_edge_cache(self.edge_cache_config.cache_file)
         if not data or data.get("error"):
             return ""
         tab = data.get("tab") if isinstance(data.get("tab"), dict) else {}
@@ -527,7 +526,7 @@ class DialogueOrchestrator:
     def _cache_overview_for_planner(self) -> str:
         parts: list[str] = []
         try:
-            result, timestamp = screen_interest.get_cache().get()
+            result, timestamp = observe_screen.get_cached_screen_interest()
         except Exception:
             result, timestamp = None, 0.0
         if result and result.content and result.score >= self.context_idle_min_score:
@@ -556,7 +555,7 @@ class DialogueOrchestrator:
 
     def _screen_context_for_generator(self) -> str:
         try:
-            result, timestamp = screen_interest.get_cache().get()
+            result, timestamp = observe_screen.get_cached_screen_interest()
         except Exception:
             return ""
         if not result or result.private or not result.content:
@@ -568,7 +567,7 @@ class DialogueOrchestrator:
         if not self.edge_cache_config.enabled:
             return ""
         try:
-            return edge_cache.format_for_prompt(
+            return observe_screen.format_edge_cache_for_prompt(
                 self.edge_cache_config.cache_file,
                 max_chars=self.page_context_max_chars,
             )

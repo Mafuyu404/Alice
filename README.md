@@ -47,7 +47,7 @@ ollama pull bge-m3:latest
 
 ## 最小配置
 
-`config.toml`：
+`config/*.toml`：
 
 ```toml
 llm_url = "http://127.0.0.1:11434"
@@ -111,7 +111,7 @@ kokoro/action/   行动模型、行动批次与行动运行时
 kokoro/          包根目录，仅包含 core 和 action
 mem0_data/       本地长期记忆数据
 logs/            CLI 日志
-config.toml      主配置
+config/*.toml    按功能分片的主配置
 config.json      本地密钥覆盖
 ```
 
@@ -167,6 +167,6 @@ config.json      本地密钥覆盖
 ## 注意
 
 - 不要提交真实 API key
-- `config.toml` 可提交，`config.json` 仅本地使用
+- `config/*.toml` 可提交，`config.json` 仅本地使用
 - Windows 非 UTF-8 控制台可能把中文显示成 `?`；优先使用浏览器或 UTF-8 输出查看中文内容
 - `text_cli.py` 的文件工具只允许访问项目目录内文件

@@ -1,0 +1,132 @@
+  # ===========================================================================
+  # 记忆后端
+# ===========================================================================
+
+# 记忆后端类型。
+# 类型: string
+# 可选值:
+#   "none"        - 禁用记忆功能
+#   "mem0"        - 本地向量记忆库（当前推荐使用 mem0 + Ollama embedding + 本地 Qdrant）
+#   "kokoromemo"  - 外部 KokoroMemo 记忆服务（需要单独启动 kokoromemo 服务）
+memory_backend = "mem0"
+
+# KokoroMemo 外部记忆服务地址和仓库路径。
+# 仅 memory_backend = "kokoromemo" 时需要。
+kokoromo_url = "http://127.0.0.1:14514"
+kokoromo_dir = "D:/program/kokoromemo"
+
+# ===========================================================================
+# 记忆事件系统 — LLM 驱动的结构化记忆提取与总结
+# ===========================================================================
+# 代替原始对话存储，每轮对话由 LLM 提取为结构化事件（desc + tags），
+# 在缓存中积累，定期总结合并后再写入向量记忆库（mem0）。
+# 对话进程关闭时，缓存中所有事件自动刷入 mem0。
+
+[memory_events]
+# 是否启用事件式记忆。
+# 类型: bool (true/false)
+enabled = true
+
+# 事件总结周期（每 N 轮对话总结一次）。
+# 类型: int
+# 提取的事件先在 pending_events 中积累，每 N 轮进行去重合并、
+# 判断哪些事件已过时（写入 mem0）、哪些仍需缓存。
+# 推荐范围: 2 ~ 5。
+eval_interval = 2
+
+# 事件提取和总结使用的模型。留空则使用 llm_model。
+# 类型: string
+eval_model = ""
+
+# ===========================================================================
+# 主动对话记忆提示
+# ===========================================================================
+# 空闲时定期检查日期事件和长期记忆，作为候选上下文交给对话调度器。
+
+[proactive_memory]
+
+# 同一记忆事件的冷却时间（秒）。
+# 类型: float
+# 一条记忆事件触发后在此时间内不会再次触发。
+# 默认 21600 秒 = 6 小时。
+memory_cooldown_seconds = 21600.0  # 6 小时
+
+# 日期匹配的记忆事件参考分数。
+# 类型: float
+memory_date_score = 50.0
+
+# 定期记忆查询返回结果的参考分数。
+# 类型: float
+memory_lookup_score = 70.0
+
+# 用于定期记忆查询的 LLM 提示语。
+# 类型: string（英文，传给记忆后端的搜索查询）
+# 预设查询会传入记忆后端进行语义搜索。
+# 可修改为关注特定类型记忆，如 "user's hobbies, recent plans"
+memory_lookup_query = "user's detailed preferences, specific life events, past conversations topics, hobbies, plans, opinions, personal experiences, goals, and important dates"
+# 是否开启周期性记忆事件轮询。
+# 类型: bool
+# 独立于屏幕监控，另外开一个线程轮询记忆事件（纪念日匹配、定期记忆查询）。
+memory_events_enabled = true
+
+# 记忆事件轮询间隔（秒）。
+# 类型: float
+# 每 memory_check_interval 秒检查一次是否有记忆事件触发。
+# 推荐范围: 120 ~ 600（2 分钟 ~ 10 分钟）。
+memory_check_interval = 300.0
+
+# 预约日期记忆事件示例（可按需添加更多）：
+# 每个事件是一个 TOML 数组元素，结构固定：
+#   date  - 月-日格式，每年匹配
+#   label - 事件名称（显示和去重用）
+#   note  - 给 LLM 的提醒（如何/何时提起）
+# [[proactive_memory.memory_date_events]]
+# date = "05-04"
+# label = "Alice project anniversary"
+# note = "Mention it only if the user seems idle and the mood is relaxed."
+
+# ===========================================================================
+# mem0 — 内部记忆服务配置
+# ===========================================================================
+# 仅 memory_backend = "mem0" 时生效。
+# mem0 管理对话记忆的存储、语义检索和生命周期。
+
+[mem0.llm]
+# mem0 用于记忆提取和摘要的 LLM 配置。
+# 复用已有 LLM 服务，不需要单独部署。
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+# mem0 内部调用用的小模型。1.5b 足够，不需要大模型。
+model = "qwen2.5:1.5b"
+
+[mem0.embedder]
+# 向量搜索用的嵌入模型配置。
+# 使用 Ollama 本地嵌入模型，避免 fastembed 的 Hugging Face 下载链。
+# 数据统一保存在项目根目录下的 mem0_data/ 中；不同嵌入模型使用不同子目录和 collection。
+provider = "ollama"
+# 本地 Ollama 地址。
+base_url = "http://127.0.0.1:11434"
+# 更偏中文/多语检索的 embedding 模型。
+model = "bge-m3:latest"
+# 嵌入向量的维度数，必须与模型匹配。
+# bge-m3:latest -> 1024
+embedding_dims = 1024
+
+[mem0.lifecycle]
+# 重要度模式。决定哪些对话值得存入长期记忆。
+# 类型: string
+# "auto"  - LLM 每次对话后判断是否重要（调用量较多但准确）。
+# "always" - 所有对话都存入（记忆膨胀快，需要手动清理）。
+importance_mode = "auto"
+# 记忆召回的最小相似度阈值（0.0 ~ 1.0）。
+# 类型: float
+# 语义搜索时，相似度低于此值的记忆不被召回。
+# 越高：召回的记忆越精准但可能漏掉相关记忆。
+# 越低：召回更多但可能包含不相关的噪音。
+# 推荐范围: 0.2 ~ 0.5。
+search_threshold = 0.2
+# 每次召回返回的最大记忆条数。
+# 类型: int
+# 召回的记忆会注入到对话上下文中，太多会让 LLM 分心。
+# 推荐范围: 3 ~ 12。
+search_top_k = 12

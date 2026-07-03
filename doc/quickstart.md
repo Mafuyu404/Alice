@@ -32,7 +32,7 @@ pip install cartesia
 复制最小配置：
 
 ```toml
-# config.toml
+# config/03_llm.toml, config/04_tts.toml, config/06_memory.toml
 llm_url = "http://127.0.0.1:11434"
 llm_model = "deepseek-v4-flash"
 memory_backend = "mem0"
@@ -97,7 +97,7 @@ python run_multi.py --watch --chars alice,penglai --topic "我们一起随便聊
 msedge.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\alice-edge-debug"
 ```
 
-确保 `config.toml` 中：
+确保 `config/*.toml` 中：
 
 ```toml
 [edge_page_cache]

@@ -13,13 +13,12 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-_CHARACTERS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "characters",
-)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CHARACTERS_DIR = str(_PROJECT_ROOT / "characters")
 
 
 class EmotionState:

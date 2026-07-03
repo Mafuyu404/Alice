@@ -1,4 +1,4 @@
-"""LLM 驱动的智能体/工具路由。"""
+﻿"""LLM 驱动的智能体/工具路由。"""
 
 from __future__ import annotations
 
@@ -12,45 +12,26 @@ from kokoro.core import config as cfg
 from kokoro.core import llm_client
 from kokoro.core import prompts
 from kokoro.core import token_usage
+from kokoro.action.tools import qq as qq_tool
+from kokoro.action.tools import vts as vts_tool
 
 logger = logging.getLogger(__name__)
 
 
 def _looks_like_qq_message_request(text: str) -> bool:
-    compact = re.sub(r"[\s\W_]+", "", text or "").lower()
-    if "qq" not in compact and "q" not in compact:
-        return False
-    return any(marker in text for marker in ("消息", "群", "聊天", "看", "收到", "发"))
+    return qq_tool.looks_like_message_request(text)
 
 
 def _direct_vts_route(text: str, available_tools: list[str]) -> AgentRouteDecision | None:
-    compact = re.sub(r"[\s\W_]+", "", text or "").lower()
-    if not compact:
+    route = vts_tool.direct_route(text, available_tools)
+    if route is None:
         return None
-    vts_markers = ("vts", "live2d", "皮套", "表情", "身体", "动起来", "动作", "摇头", "晃脑", "点头", "笑一笑", "笑一下")
-    if not any(marker.lower() in compact for marker in vts_markers):
-        return None
-    if "vts_motion" in available_tools and any(marker in compact for marker in ("摇头", "晃脑", "身体", "动起来", "动作", "点头")):
-        motion = "shake" if any(marker in compact for marker in ("摇头", "晃脑", "晃一晃")) else "nod" if "点头" in compact else "sway"
-        return AgentRouteDecision(
-            True,
-            "vts_motion",
-            reason="direct_vts_motion_request",
-            arguments={"motion": motion, "intensity": 0.9, "duration_seconds": 4.0, "reason": "用户要求测试 Live2D 身体动作"},
-        )
-    if "vts_expression" in available_tools and any(marker in compact for marker in ("笑", "表情", "眨眼", "撇嘴")):
-        expression = "smile"
-        if "撇嘴" in compact:
-            expression = "pout"
-        elif "眨眼" in compact:
-            expression = "wink"
-        return AgentRouteDecision(
-            True,
-            "vts_expression",
-            reason="direct_vts_expression_request",
-            arguments={"expression": expression, "intensity": 0.9, "duration_seconds": 3.0},
-        )
-    return None
+    return AgentRouteDecision(
+        True,
+        str(route.get("tool_name") or ""),
+        reason=str(route.get("reason") or ""),
+        arguments=dict(route.get("arguments") or {}),
+    )
 
 
 def _text(message: dict) -> str:
@@ -212,3 +193,4 @@ class AgentRouter:
         except Exception as exc:
             logger.debug("agent router failed: %s", exc)
             return ""
+

@@ -13,16 +13,16 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 from kokoro.core import input_events
+from kokoro.core import lifecycle_debug
 
 logger = logging.getLogger(__name__)
 
-_CHARACTERS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)),
-    "characters",
-)
-_LOGS_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_CHARACTERS_DIR = str(_PROJECT_ROOT / "characters")
+_LOGS_DIR = str(_PROJECT_ROOT / "logs")
 
 
 class InnerStream:
@@ -38,6 +38,13 @@ class InnerStream:
         self.character_id = character_id
         self.character_data = character_data or {}
         self._path = os.path.join(_CHARACTERS_DIR, character_id, "inner_stream.txt")
+        lifecycle_debug.log(
+            "inner_stream.init",
+            character_id=character_id,
+            path=self._path,
+            reset_on_start=reset_on_start,
+            has_character_data=bool(character_data),
+        )
         self.text: str = ""
         self._last_event_digest: str = ""
         if reset_on_start:
@@ -85,6 +92,7 @@ class InnerStream:
 
         section = cfg.inner_stream_config()
         if not section.get("enabled", True):
+            lifecycle_debug.log("inner_stream.evaluate.disabled", character_id=self.character_id)
             return debug
 
         system_prompt = prompts.format_prompt(
@@ -116,6 +124,15 @@ class InnerStream:
         try:
             from kokoro.core import deepseek_api
 
+            lifecycle_debug.log(
+                "inner_stream.evaluate.llm.start",
+                character_id=self.character_id,
+                model=model,
+                max_tokens=max_tokens,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                before=self.text,
+            )
             result = deepseek_api.chat(
                 [
                     {"role": "system", "content": system_prompt},
@@ -129,15 +146,32 @@ class InnerStream:
             text = result["content"]
 
             debug["raw_response"] = text
+            lifecycle_debug.log(
+                "inner_stream.evaluate.llm.result",
+                character_id=self.character_id,
+                raw_response=text,
+            )
             cleaned = _clean_stream_text(text, max_chars=int(section.get("max_chars", 1200) or 1200))
             if cleaned and _looks_complete(cleaned):
                 self.text = cleaned
                 self._save()
                 debug["after"] = self.text
                 debug["saved"] = True
+            lifecycle_debug.log(
+                "inner_stream.evaluate.done",
+                character_id=self.character_id,
+                saved=debug["saved"],
+                error=debug["error"],
+                after=debug["after"],
+            )
         except Exception as exc:
             debug["error"] = str(exc)
             logger.debug("inner stream evaluation failed: %s", exc)
+            lifecycle_debug.log(
+                "inner_stream.evaluate.error",
+                character_id=self.character_id,
+                error=str(exc),
+            )
         return debug
 
     def evaluate_events(
@@ -173,6 +207,12 @@ class InnerStream:
 
         section = cfg.inner_stream_config()
         if not section.get("enabled", True) or not events:
+            lifecycle_debug.log(
+                "inner_stream.events.disabled_or_empty",
+                character_id=self.character_id,
+                enabled=section.get("enabled", True),
+                event_count=len(events or []),
+            )
             return debug
 
         # Skip guard: if all meaningful events are identical to the previous batch
@@ -190,10 +230,25 @@ class InnerStream:
         )
         if not has_meaningful and self.text.strip():
             debug["skipped"] = "all events are ambient ticks, skipping"
+            lifecycle_debug.log(
+                "inner_stream.events.skip",
+                character_id=self.character_id,
+                skipped=debug["skipped"],
+                events=events,
+                trigger_reason=trigger_reason,
+            )
             return debug
         digest = _events_digest(events)
         if digest == self._last_event_digest and self.text.strip():
             debug["skipped"] = "events unchanged since last update, skipping"
+            lifecycle_debug.log(
+                "inner_stream.events.skip",
+                character_id=self.character_id,
+                skipped=debug["skipped"],
+                digest=digest,
+                events=events,
+                trigger_reason=trigger_reason,
+            )
             return debug
         self._last_event_digest = digest
 
@@ -233,6 +288,17 @@ class InnerStream:
         try:
             from kokoro.core import deepseek_api
 
+            lifecycle_debug.log(
+                "inner_stream.events.llm.start",
+                character_id=self.character_id,
+                model=model,
+                max_tokens=max_tokens,
+                trigger_reason=trigger_reason,
+                events=events,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                before=self.text,
+            )
             result = deepseek_api.chat(
                 [
                     {"role": "system", "content": system_prompt},
@@ -246,12 +312,27 @@ class InnerStream:
             text = result["content"]
 
             debug["raw_response"] = text
+            lifecycle_debug.log(
+                "inner_stream.events.llm.result",
+                character_id=self.character_id,
+                trigger_reason=trigger_reason,
+                raw_response=text,
+            )
             cleaned = _clean_stream_text(text, max_chars=int(section.get("max_chars", 1200) or 1200))
             if cleaned and _looks_complete(cleaned):
                 self.text = cleaned
                 self._save()
                 debug["after"] = self.text
                 debug["saved"] = True
+            lifecycle_debug.log(
+                "inner_stream.events.done",
+                character_id=self.character_id,
+                trigger_reason=trigger_reason,
+                saved=debug["saved"],
+                error=debug["error"],
+                before=debug["before"],
+                after=debug["after"],
+            )
             _log_inner_stream_update(
                 self.character_id,
                 enabled=bool(section.get("log_updates", True)),
@@ -266,6 +347,14 @@ class InnerStream:
         except Exception as exc:
             debug["error"] = str(exc)
             logger.debug("inner stream event evaluation failed: %s", exc)
+            lifecycle_debug.log(
+                "inner_stream.events.error",
+                character_id=self.character_id,
+                trigger_reason=trigger_reason,
+                events=events,
+                error=str(exc),
+                raw_response=debug["raw_response"],
+            )
             _log_inner_stream_update(
                 self.character_id,
                 enabled=bool(section.get("log_updates", True)),
@@ -282,21 +371,46 @@ class InnerStream:
     def _load(self) -> None:
         if not os.path.exists(self._path):
             self.text = ""
+            lifecycle_debug.log("inner_stream.load.missing", character_id=self.character_id, path=self._path)
             return
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 self.text = _clean_stream_text(f.read(), max_chars=1600)
+            lifecycle_debug.log(
+                "inner_stream.load.done",
+                character_id=self.character_id,
+                path=self._path,
+                text=self.text,
+            )
         except Exception as exc:
             logger.warning("failed to load inner stream: %s", exc)
             self.text = ""
+            lifecycle_debug.log(
+                "inner_stream.load.error",
+                character_id=self.character_id,
+                path=self._path,
+                error=str(exc),
+            )
 
     def _save(self) -> None:
         try:
             os.makedirs(os.path.dirname(self._path), exist_ok=True)
             with open(self._path, "w", encoding="utf-8") as f:
                 f.write(self.text.strip() + "\n")
+            lifecycle_debug.log(
+                "inner_stream.save.done",
+                character_id=self.character_id,
+                path=self._path,
+                text=self.text,
+            )
         except Exception as exc:
             logger.warning("failed to save inner stream: %s", exc)
+            lifecycle_debug.log(
+                "inner_stream.save.error",
+                character_id=self.character_id,
+                path=self._path,
+                error=str(exc),
+            )
 
 
 def _clean_stream_text(text: str, *, max_chars: int) -> str:
@@ -366,8 +480,18 @@ class InnerStreamLoop:
             return
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        lifecycle_debug.log(
+            "inner_stream_loop.start",
+            character_id=self.stream.character_id,
+            event_delay_seconds=self.event_delay_seconds,
+            idle_interval_seconds=self.idle_interval_seconds,
+            time_tick_interval_seconds=self.time_tick_interval_seconds,
+            max_batch=self.max_batch,
+            output_handlers=[getattr(h, "__qualname__", repr(h)) for h in self.output_handlers],
+        )
 
     def stop(self, *, flush: bool = True) -> None:
+        lifecycle_debug.log("inner_stream_loop.stop", character_id=self.stream.character_id, flush=flush)
         if flush:
             self.flush()
         self._stop.set()
@@ -377,12 +501,26 @@ class InnerStreamLoop:
         with self._lock:
             self._events.append(event)
             self._schedule_for_event_locked(event)
+            pending = len(self._events)
+            next_due = self._next_due
+        lifecycle_debug.log(
+            "inner_stream_loop.submit",
+            character_id=self.stream.character_id,
+            event=event,
+            pending_count=pending,
+            next_due_monotonic=round(next_due, 6),
+        )
         self._wakeup.set()
 
     def flush(self) -> None:
         events = self._pop_events()
         if not events:
             events = [self._time_tick_event(reason="manual flush")]
+        lifecycle_debug.log(
+            "inner_stream_loop.flush",
+            character_id=self.stream.character_id,
+            events=events,
+        )
         self._evaluate(events, trigger_reason="manual flush")
 
     def evaluate_now(
@@ -414,6 +552,13 @@ class InnerStreamLoop:
             elif events:
                 reason = "事件唤醒后的节奏更新"
             if events:
+                lifecycle_debug.log(
+                    "inner_stream_loop.due",
+                    character_id=self.stream.character_id,
+                    reason=reason,
+                    events=events,
+                    pending_after_pop=self.pending_count(),
+                )
                 self._evaluate(events, trigger_reason=reason)
             self._schedule_next_idle()
 
@@ -438,9 +583,27 @@ class InnerStreamLoop:
 
     def _evaluate(self, events: list[input_events.InputEvent], *, trigger_reason: str) -> None:
         try:
+            lifecycle_debug.log(
+                "inner_stream_loop.evaluate.start",
+                character_id=self.stream.character_id,
+                trigger_reason=trigger_reason,
+                events=events,
+            )
             context = self.context_provider() or {}
+            lifecycle_debug.log(
+                "inner_stream_loop.context",
+                character_id=self.stream.character_id,
+                trigger_reason=trigger_reason,
+                context=context,
+            )
             result = self.stream.evaluate_events(events=events, trigger_reason=trigger_reason, **context)
             self._last_update = time.monotonic()
+            lifecycle_debug.log(
+                "inner_stream_loop.evaluate.result",
+                character_id=self.stream.character_id,
+                trigger_reason=trigger_reason,
+                result=result,
+            )
             if result.get("skipped"):
                 return  # nothing changed, don't fire output handlers
             if self.search_impulse is not None and hasattr(self.search_impulse, "consider"):
@@ -453,16 +616,40 @@ class InnerStreamLoop:
                 )
             for handler in self.output_handlers:
                 try:
+                    lifecycle_debug.log(
+                        "inner_stream_loop.output_handler.start",
+                        character_id=self.stream.character_id,
+                        handler=getattr(handler, "__qualname__", repr(handler)),
+                        trigger_reason=trigger_reason,
+                        events=events,
+                    )
                     handler(
                         inner_stream=self.stream.text,
                         events=events,
                         context=context,
                         trigger_reason=trigger_reason,
                     )
+                    lifecycle_debug.log(
+                        "inner_stream_loop.output_handler.done",
+                        character_id=self.stream.character_id,
+                        handler=getattr(handler, "__qualname__", repr(handler)),
+                    )
                 except Exception as exc:
                     logger.debug("inner stream output handler failed: %s", exc)
+                    lifecycle_debug.log(
+                        "inner_stream_loop.output_handler.error",
+                        character_id=self.stream.character_id,
+                        handler=getattr(handler, "__qualname__", repr(handler)),
+                        error=str(exc),
+                    )
         except Exception as exc:
             logger.warning("inner stream loop failed: %s", exc)
+            lifecycle_debug.log(
+                "inner_stream_loop.evaluate.error",
+                character_id=self.stream.character_id,
+                trigger_reason=trigger_reason,
+                error=str(exc),
+            )
 
     def _schedule_for_event_locked(self, event: input_events.InputEvent) -> None:
         now = time.monotonic()

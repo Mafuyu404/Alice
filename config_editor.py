@@ -1,7 +1,7 @@
 """Alice 配置可视化编辑器 — 桌面应用
 
 参考 overlay_slideshow.py 的 PySide6 实现风格，
-提供图形化界面编辑 config.toml / config.json / characters.json / prompts.json。
+提供图形化界面编辑 config/*.toml / config.json / characters.json / prompts.json。
 
 用法:
     python config_editor.py
@@ -51,7 +51,9 @@ from PySide6.QtWidgets import (
 # ── paths ────────────────────────────────────────────────────────────────────
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_TOML = ROOT / "config.toml"
+CONFIG_DIR = ROOT / "config"
+CONFIG_TOML = CONFIG_DIR / "99_editor_overrides.toml"
+LEGACY_CONFIG_TOML = ROOT / "config.toml"
 CONFIG_JSON = ROOT / "config.json"
 CHARACTERS_JSON = ROOT / "characters.json"
 PROMPTS_JSON = ROOT / "prompts.json"
@@ -69,6 +71,27 @@ def load_toml(path: Path) -> dict:
     if raw[:3] == b"\xef\xbb\xbf":
         raw = raw[3:]
     return tomllib.loads(raw.decode("utf-8"))
+
+
+def merge_override(base: dict, override: dict) -> dict:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(result.get(key), dict) and isinstance(value, dict):
+            result[key] = merge_override(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def load_config_toml() -> dict:
+    if CONFIG_DIR.is_dir():
+        paths = sorted(path for path in CONFIG_DIR.glob("*.toml") if path.is_file())
+        if paths:
+            data: dict = {}
+            for path in paths:
+                data = merge_override(data, load_toml(path))
+            return data
+    return load_toml(LEGACY_CONFIG_TOML)
 
 
 def load_json_file(path: Path) -> dict:
@@ -548,7 +571,7 @@ def toml_tool_calling(cfg: dict) -> str:
 
 
 def write_config_toml(path: Path, cfg: dict) -> None:
-    """Write config.toml from the merged config dict.
+    """Write a TOML override fragment from the merged config dict.
 
     ⚠ TOML rule: all top-level (non-section) keys must come before any
     [section] headers.  Flat-key functions first, section functions last.
@@ -588,6 +611,7 @@ def write_config_toml(path: Path, cfg: dict) -> None:
         toml_mem0_lifecycle(cfg),
         toml_tool_calling(cfg),
     ]
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(parts), encoding="utf-8")
 
 
@@ -1506,7 +1530,7 @@ class ConfigEditorWindow(QMainWindow):
         self.setStyleSheet(self.STYLE)
 
         # ── Load all config data ──
-        self.toml_cfg = load_toml(CONFIG_TOML)
+        self.toml_cfg = load_config_toml()
         self.json_cfg = load_json_file(CONFIG_JSON)
         self.merged_cfg = {**self.json_cfg, **self.toml_cfg}
 
@@ -1737,7 +1761,7 @@ class ConfigEditorWindow(QMainWindow):
                 if mem0_merged:
                     toml_updates["mem0"] = mem0_merged
 
-            # Write config.toml
+            # Write TOML override fragment
             write_config_toml(CONFIG_TOML, toml_updates)
 
             # ── Secrets page ──
@@ -1774,7 +1798,7 @@ class ConfigEditorWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        self.toml_cfg = load_toml(CONFIG_TOML)
+        self.toml_cfg = load_config_toml()
         self.json_cfg = load_json_file(CONFIG_JSON)
         self.merged_cfg = {**self.json_cfg, **self.toml_cfg}
         self.prompts_data = load_json_file(PROMPTS_JSON)

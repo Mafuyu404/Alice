@@ -6,6 +6,7 @@ for _name in ("kokoro.stt", "kokoro.pool", "kokoro.tts", "kokoro.memory", "kokor
     sys.modules.setdefault(_name, types.ModuleType(_name))
 
 from kokoro.action import Action, ActionBatch, ActionRuntime
+from kokoro.action.autonomous_step import AutonomousStep
 from kokoro.core import input_events
 
 
@@ -97,3 +98,36 @@ def test_public_action_started_is_recorded():
 
     assert any(event.type == "self_action" and event.metadata.get("status") == "started" for event in events)
     assert any(event.type == "action_result" and event.metadata.get("status") == "success" for event in events)
+
+
+def test_suppressed_record_only_result_does_not_feed_back():
+    session = _Session()
+    runtime = ActionRuntime(
+        session=session,
+        merge_window_seconds=0,
+        handlers={"wait": lambda action: "waiting"},
+    )
+    batch = ActionBatch(
+        cycle_id="cycle_wait",
+        causality_id="cause_wait",
+        actions=[
+            Action(
+                action="wait",
+                args={"suppress_feedback": True},
+                result_policy="record_only",
+            )
+        ],
+    )
+
+    runtime.execute_batch(batch)
+    events = session.event_bus.snapshot()
+
+    assert not [event for event in events if event.type == "action_result"]
+
+
+def test_autonomous_wait_defaults_to_record_only_suppressed():
+    step = object.__new__(AutonomousStep)
+    action = step._normalize_wait_action(Action(action="wait", result_policy="feed_back"))
+
+    assert action.result_policy == "record_only"
+    assert action.args["suppress_feedback"] is True

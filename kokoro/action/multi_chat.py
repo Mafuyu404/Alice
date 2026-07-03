@@ -18,13 +18,16 @@ from dataclasses import dataclass, field
 import requests
 
 from kokoro.action import agent_loop
+from kokoro.action import model as action_model
+from kokoro.action import runtime as action_runtime
+from kokoro.action import tool_spec
+from kokoro.action.tools import memory as memory_tool
+from kokoro.action.tools import observe_screen
 from kokoro.core import chat_session
 from kokoro.core import config as _cfg
-from kokoro.action import edge_cache
 from kokoro.core import memory as _mem
 from kokoro.core import prompts
 from kokoro.core import scene as _scene
-from kokoro.action import screen_interest
 from kokoro.core import token_usage
 
 logger = logging.getLogger(__name__)
@@ -166,7 +169,7 @@ class MultiChatOrchestrator:
         self.screen_context_max_chars = max(200, int(multi_section.get("screen_context_max_chars", 1200)))
         self.page_context_max_chars = max(500, int(multi_section.get("page_context_max_chars", 2500)))
         self.context_idle_min_score = max(0.0, float(multi_section.get("context_idle_min_score", 70.0)))
-        self.edge_cache_config = edge_cache.config_from_dict(self.runtime_config)
+        self.edge_cache_config = observe_screen.edge_cache_config_from_dict(self.runtime_config)
         self.random_mc_enabled = _scene.random_mc_enabled(self.runtime_config)
         self._last_random_mc_signature = ""
         self._last_page_refresh_error = ""
@@ -673,7 +676,7 @@ class MultiChatOrchestrator:
         return min(candidates, key=lambda cid: recent_counts.get(cid, 0))
 
     def _page_topic_hint(self) -> str:
-        data = edge_cache.read_cache(self.edge_cache_config.cache_file)
+        data = observe_screen.read_edge_cache(self.edge_cache_config.cache_file)
         if not isinstance(data, dict):
             return "random MC page"
         tab = data.get("tab")
@@ -821,7 +824,33 @@ class MultiChatOrchestrator:
             elif counterpart == self.user_name and trigger_text:
                 memory_trigger = f"{self.user_name}说：{trigger_text}"
         try:
-            session.remember(memory_trigger, reply, async_store=True)
+            batch = action_model.ActionBatch(
+                actions=[
+                    action_model.Action(
+                        action="write_conversation_memory",
+                        reason="multi dialogue turn completed",
+                        args={
+                            "trigger_text": memory_trigger,
+                            "reply": reply,
+                            "speaker_id": speaker_id,
+                        },
+                        mode="sync",
+                        visibility="private",
+                        result_policy="record_only",
+                    )
+                ],
+                reason="multi dialogue memory sedimentation",
+            )
+            registry = tool_spec.ActionToolRegistry()
+            memory_tool.register(registry)
+            runtime = action_runtime.ActionRuntime(
+                session=session,
+                handlers={},
+                registry=registry,
+                merge_window_seconds=0,
+            )
+            runtime.execute_batch(batch)
+            registry.shutdown()
         except Exception:
             logger.exception("multi dialogue remember failed for %s", speaker_id)
 
@@ -876,7 +905,7 @@ class MultiChatOrchestrator:
     def _cache_overview_for_planner(self) -> str:
         parts: list[str] = []
         try:
-            result, timestamp = screen_interest.get_cache().get()
+            result, timestamp = observe_screen.get_cached_screen_interest()
         except Exception:
             result, timestamp = None, 0.0
         if result and result.content and result.score >= self.context_idle_min_score:
@@ -902,7 +931,7 @@ class MultiChatOrchestrator:
 
     def _screen_context_for_generator(self) -> str:
         try:
-            result, timestamp = screen_interest.get_cache().get()
+            result, timestamp = observe_screen.get_cached_screen_interest()
         except Exception:
             return ""
         if not result or result.private or not result.content:
@@ -915,7 +944,7 @@ class MultiChatOrchestrator:
             return ""
         self._refresh_page_cache()
         try:
-            return edge_cache.format_for_prompt(
+            return observe_screen.format_edge_cache_for_prompt(
                 self.edge_cache_config.cache_file,
                 max_chars=self.page_context_max_chars,
             )
@@ -926,7 +955,7 @@ class MultiChatOrchestrator:
         if not self.edge_cache_config.enabled:
             return ""
         self._refresh_page_cache()
-        data = edge_cache.read_cache(self.edge_cache_config.cache_file)
+        data = observe_screen.read_edge_cache(self.edge_cache_config.cache_file)
         if not data or data.get("error"):
             return ""
         tab = data.get("tab") if isinstance(data.get("tab"), dict) else {}
@@ -942,7 +971,7 @@ class MultiChatOrchestrator:
         if not self.edge_cache_config.enabled:
             return
         try:
-            edge_cache.capture_and_save(self.edge_cache_config)
+            observe_screen.capture_edge_cache(self.edge_cache_config)
             self._last_page_refresh_error = ""
         except Exception as exc:
             self._last_page_refresh_error = f"{type(exc).__name__}: {exc}"

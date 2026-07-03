@@ -1,0 +1,7 @@
+[debug_input]
+enabled = true
+inbox = "data/debug/inbox.jsonl"
+outbox = "data/debug/outbox.jsonl"
+poll_seconds = 0.2
+allow_interrupt = true
+default_mode = "turn"

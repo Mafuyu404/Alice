@@ -33,9 +33,11 @@ bilive-danmaku
 
 vts_token.txt
 
+test_runs
 tests
 !tests/
 !tests/test_action_batch_runtime.py
 scripts
 
 characters/lerwa
+/tests

@@ -1,0 +1,92 @@
+# ===========================================================================
+# 视觉 / 屏幕识别
+# ===========================================================================
+
+# 视觉后端选择。
+# 类型: string
+# 可选值:
+#   "dashscope"   - 阿里云 DashScope（qwen-vl-plus 等），需要 API Key，识别能力强
+#   "ollama"      - 本地 Ollama 多模态模型（如 llava），免费但识别能力较弱
+vision_backend = "dashscope"
+
+# 视觉模型名。
+# 类型: string
+# DashScope: "qwen-vl-plus"（推荐）, "qwen-vl-max"
+# Ollama: "llava", "bakllava" 等本地已安装的多模态模型
+vision_model = "qwen-vl-plus"
+
+# DashScope API 密钥。
+# 也可以通过环境变量 DASHSCOPE_API_KEY 设置（优先级更高）。
+# 留空时从 config.json 的 vision_api_key 读取。
+# 仅 vision_backend = "dashscope" 时需要。
+vision_api_key = ""
+
+# 截图缩放上限（像素总数）。超过此值会等比缩小。
+# 类型: int。设为 0 禁用缩放，使用原始分辨率。
+# 默认 921600 = 1280×720。减小可节省带宽和 visual token，增大可提升识别精细度。
+vision_max_pixels = 921600
+
+
+# ===========================================================================
+# Edge 网页缓存 — 周期性读取当前 Edge 标签页正文
+# ===========================================================================
+# 由 cli.py 启动的后台线程，通过 Microsoft Edge DevTools Protocol
+# 读取当前前台 Edge 网页的 document.body.innerText，并覆盖写入同一个缓存文件。
+#
+# 使用前需要用远程调试端口启动 Edge，例如：
+# msedge.exe --remote-debugging-port=9222 --user-data-dir="%TEMP%\alice-edge-debug"
+
+[edge_page_cache]
+# 是否开启 Edge 网页正文缓存。
+enabled = true
+
+# 抓取间隔（秒）。
+interval_seconds = 1.0
+
+# Edge DevTools 地址。
+devtools_host = "127.0.0.1"
+devtools_port = 9222
+
+# 缓存文件路径。相对路径基于项目根目录。
+cache_file = "data/edge_page_cache.json"
+
+# 最大保存字符数，防止超长网页撑爆上下文。
+max_chars = 12000
+
+# DevTools 请求超时（秒）。
+request_timeout = 3.0
+
+
+# ===========================================================================
+# 屏幕监控 — 周期性截图 + 视觉分析
+# ===========================================================================
+# 由 cli.py 启动的后台线程，定时截图并通过视觉 API 分析内容，
+# 判断是否有趣、是否隐私。结果作为主动对话候选缓存和对话历史注入。
+
+[screen_watch]
+# 是否开启持续屏幕截图分析。
+enabled = false
+
+# 截图分析的最小间隔（秒）。
+# 类型: float
+# 截图分析头尾相连不断执行：完成一次后立即开始下一次。
+# watch_interval 是最小间隔：如果一次分析耗时少于这个值，则等待差值后再开始下一次。
+# 如果分析耗时超过这个值，则不等待立即开始下一次。
+# 太短：视觉 API 调用频繁（可能产生费用或负载）。
+# 太长：缓存更新慢，AI 看到的屏幕内容可能过时。
+# 推荐范围: 30 ~ 120。
+watch_interval = 3.0
+
+# 内容兴趣度最低分数（0-100）。
+# 类型: float
+# 视觉 API 对截图打分的兴趣度达到此值才会进入主动对话候选。
+# 越高：只有非常有趣的内容才会成为候选。
+# 越低：微小变化也可能触发（可能话多）。
+# 推荐范围: 50 ~ 80。
+interest_threshold = 70.0
+
+# 单次视觉分析的最大超时（秒）。
+# 类型: int
+# 如果视觉 API 在超时内未返回，此次截图分析被跳过。
+# DashScope 云端通常 10~30 秒，Ollama 本地可能更长。
+vision_timeout = 45

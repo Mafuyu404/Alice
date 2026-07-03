@@ -1,6 +1,7 @@
 """Central runtime configuration.
 
-Primary config file: config.toml.
+Primary config files: config/*.toml, merged by filename order.
+Legacy fallback: config.toml.
 Local secrets override: config.json (gitignored, for API keys and local-only values).
 TOML values take precedence; JSON fills in empty/missing entries.
 """
@@ -13,23 +14,47 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-_ROOT = Path(__file__).resolve().parent.parent
+_ROOT = Path(__file__).resolve().parents[2]
+_CONFIG_DIR = _ROOT / "config"
 _CONFIG_TOML_PATH = _ROOT / "config.toml"
 _CONFIG_JSON_PATH = _ROOT / "config.json"
+
+
 def _clean_proxy() -> None:
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         os.environ.pop(key, None)
     os.environ["NO_PROXY"] = "*"
 
 
-def _load_toml() -> dict:
-    if not _CONFIG_TOML_PATH.exists():
-        return {}
-    raw = _CONFIG_TOML_PATH.read_bytes()
+def _load_toml_file(path: Path) -> dict:
+    raw = path.read_bytes()
     # Strip UTF-8 BOM if present (Python 3.12 tomllib doesn't handle it)
     if raw[:3] == b"\xef\xbb\xbf":
         raw = raw[3:]
     return tomllib.loads(raw.decode("utf-8"))
+
+
+def _merge_override(base: dict, override: dict) -> dict:
+    result = dict(base)
+    for key, value in override.items():
+        if isinstance(result.get(key), dict) and isinstance(value, dict):
+            result[key] = _merge_override(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def _load_toml() -> dict:
+    if _CONFIG_DIR.is_dir():
+        config: dict = {}
+        paths = sorted(path for path in _CONFIG_DIR.glob("*.toml") if path.is_file())
+        if paths:
+            for path in paths:
+                config = _merge_override(config, _load_toml_file(path))
+            return config
+    if not _CONFIG_TOML_PATH.exists():
+        return {}
+    return _load_toml_file(_CONFIG_TOML_PATH)
 
 
 def _load_json() -> dict:

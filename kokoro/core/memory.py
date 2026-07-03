@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import warnings
+from pathlib import Path
 from typing import Any
 
 from . import config as cfg_mod
@@ -14,6 +15,8 @@ from . import prompts
 from . import token_usage
 
 logger = logging.getLogger("memory")
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 warnings.filterwarnings(
     "ignore",
@@ -114,8 +117,8 @@ class Mem0Backend(MemoryBackend):
         model = str(embedder_cfg.get("config", {}).get("model", "")).strip() or "default"
         dims = int(embedder_cfg.get("config", {}).get("embedding_dims", 0) or 0)
         slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", model.replace(":", "_")).strip("._-") or "default"
-        base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "mem0_data")
-        return os.path.join(base_dir, f"{slug}_{dims}d")
+        base_dir = _PROJECT_ROOT / "mem0_data"
+        return str(base_dir / f"{slug}_{dims}d")
 
     @staticmethod
     def _history_db_path(embedder_cfg: dict) -> str:
@@ -346,12 +349,41 @@ class Mem0Backend(MemoryBackend):
     def close(self) -> None:
         if self._mem is None:
             return
+        self._close_qdrant_clients()
         try:
             close = getattr(self._mem, "close", None)
             if callable(close):
                 close()
         except Exception as exc:
             logger.debug("mem0 close failed: %s", exc)
+        finally:
+            self._mem = None
+
+    def _close_qdrant_clients(self) -> None:
+        """Close local Qdrant clients before interpreter teardown.
+
+        qdrant-client's ``__del__`` calls ``close()`` again during shutdown. On
+        Windows that can happen after ``msvcrt`` has been unloaded, producing a
+        noisy exception and occasionally leaving local lock files behind.
+        """
+        for attr in ("vector_store", "entity_store"):
+            store = getattr(self._mem, attr, None)
+            client = getattr(store, "client", None)
+            if client is None:
+                continue
+            try:
+                client.close()
+            except Exception as exc:
+                logger.debug("qdrant client close failed for %s: %s", attr, exc)
+            try:
+                if hasattr(client, "_client"):
+                    delattr(client, "_client")
+            except Exception:
+                pass
+            try:
+                setattr(store, "client", None)
+            except Exception:
+                pass
 
     def delete_all(self, user_id: str = "default") -> int:
         if not self._ok:
@@ -394,19 +426,16 @@ def normalize_entity_label(name: str) -> str:
 
 
 def scoped_user_id(owner_id: str, counterpart: str | None = None) -> str:
-    owner = normalize_entity_label(owner_id)
-    if counterpart:
-        return f"{owner}::counterpart::{normalize_entity_label(counterpart)}"
-    return f"{owner}::general"
+    """Return the single memory namespace for a character.
+
+    Memory belongs to the character, not to a counterpart/session dimension.
+    The counterpart argument is kept for compatibility with older callers.
+    """
+    return normalize_entity_label(owner_id)
 
 
 def context_user_ids(owner_id: str, counterpart: str | None = None) -> list[str]:
-    ids: list[str] = []
-    if counterpart:
-        ids.append(scoped_user_id(owner_id, counterpart))
-    ids.append(scoped_user_id(owner_id))
-    ids.append(str(owner_id or "default"))
-    return ids
+    return [scoped_user_id(owner_id)]
 
 
 def create_backend(config: dict) -> MemoryBackend:

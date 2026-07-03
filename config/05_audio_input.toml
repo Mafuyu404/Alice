@@ -1,0 +1,183 @@
+# ===========================================================================
+# AEC — 声学回声消除
+# ===========================================================================
+# 通过 WebRTC AEC 算法消除 TTS 扬声器输出被麦克风拾取造成的回声/啸叫。
+# 使用 aec-audio-processing 库，基于 WebRTC AudioProcessing 模块。
+#
+# 启用后，STT 输入会与 TTS 播放的参考信号做相关性抵消，
+# 从而在麦克风音频中去除扬声器发出的声音。这样即使不戴耳机也不会产生
+# 回声反馈循环，同时 STT 在 TTS 播放期间也不需要暂停。
+#
+# 如果开启后回声仍未消除，请尝试调整 delay_ms 参数。
+
+[aec]
+# 是否启用回声消除。
+# 类型: bool (true/false)
+# true: STT 和 TTS 可同时运行，外放无回声
+# false: 使用传统方式（戴耳机或 stt_pause_during_tts）
+enabled = true
+
+# 麦克风采集到扬声器播放之间的预估延迟（毫秒）。
+# 类型: int
+# 包括音频缓冲区延迟 + 空气传播延迟。
+# 值越大，AEC 使用越"旧"的参考信号做抵消。
+# 一般桌面场景 60 ~ 110ms。外放防回灌建议从 85 开始调试。
+# 如果回声听起来像"重叠/双份"，说明延迟偏大。
+# 如果回声残留明显，说明延迟偏小或声道延迟不稳定。
+delay_ms = 85
+
+# 噪声抑制等级（0 ~ 4）。
+# 类型: int
+# 0 = 关闭（仅回声消除）
+# 1 = 轻度
+# 2 = 中等（耳机或轻度外放）
+# 3 = 激进（推荐外放防回灌）
+# 4 = 非常激进（适合麦克风底噪大的场景）
+ns_level = 3
+
+# TTS 完成后重置 AEC 自适应滤波状态。
+# 类型: bool (true/false)
+# true: 避免多轮播放后滤波器漂移导致偶发回灌（推荐）
+# false: 保留连续自适应状态，适合稳定固定设备链路
+auto_reset_on_tts_done = true
+
+
+# ===========================================================================
+# STT — 语音转文字
+# ===========================================================================
+
+[stt]
+
+# 是否启用麦克风 STT 输入。
+# 类型: bool (true/false)
+# false: 主动闭麦，不加载 STT 模型，不打开麦克风；QQ、内在叙事流和其他输入继续运行。
+enabled = false
+
+# 流式 ASR 模型的存放目录。
+# 类型: string（目录路径）
+# 程序首次运行会自动下载模型到此目录。
+stt_model_dir = "models/stt"
+
+# 用于精炼 STT 原始识别结果的小模型。
+# 类型: string（模型名）
+# STT 输出碎片化短文本，此模型负责修正同音错字和去除口吃重复。
+# 模型越强精炼效果越好，但延迟也越高。建议 1.5b ~ 7b。
+# 设为 "" 可跳过精炼（直接使用原始 STT 结果）。
+stt_refine_model = "qwen2.5:1.5b"
+
+# 认知层评估用模型。留空则使用 llm_model。
+# 类型: string（模型名）
+# 用于上下文总结时对认知层（cognition.json）的全量评估。
+# 建议用小模型（如 qwen2.5:1.5b）控制成本。
+cognition_model = ""
+
+# 认知层评估频率。每 N 轮对话评估一次。
+# 类型: int
+# 设为 0 禁用周期性评估（仅保留摘要时的评估）。
+# 推荐范围: 3 ~ 10。
+cognition_eval_interval = 5
+
+# 情绪层评估用模型。留空则使用 llm_model。
+# 类型: string（模型名）
+# 当前对话 prompt 不再直接注入 emotion；情绪/短期动机由 inner_stream 吸收。
+# 此配置主要保留给 VTS/表情等外部兼容路径。
+emotion_model = ""
+
+# STT 精炼模式。
+# 类型: string
+# 可选值:
+#   "separate" - 独立精炼 LLM 调用（默认，当前行为），精炼完再聊天
+#   "inline"   - 本地正则预清洗 + 聊天 LLM 隐式纠错，一次调用完成
+#   "none"     - 仅本地正则预清洗，不调用任何 LLM 精炼
+# separate 质量最高但延迟最大（精炼 LLM 串行阻塞）。
+# inline 延迟最低，聊天 LLM 在回复时自然纠正少量同音错字。
+# none 零 LLM 开销，适合 STT 准确率已经很高的场景。
+stt_refine_mode = "inline"
+
+# STT 文本稳定判定间隔（秒）。
+# 类型: float
+# 收到最后一段 STT 片段的静默时长超过此值后，触发精炼和推送。
+# 太短：用户话没说完就推送，对话不完整。
+# 太长：响应迟钝，需要等待更久。
+# 根据用户说话习惯调整。一般 0.8 ~ 2.0 秒。
+stt_refine_stable_seconds = 0.6
+
+# STT 端点候选提交等待（秒）。
+# 类型: float
+# 识别到静音端点后不会立刻提交，而是等待一个短窗口。
+# 如果用户继续说话，会合并为同一句，避免”我给你 / 我说 / 给你安装”被拆成多轮。
+# 注意: 此值 + stt_refine_stable_seconds 构成端点检测的总等待。
+#       stt_turn_merge_seconds 是 CLI 层额外的小合并窗口。
+stt_utterance_commit_seconds = 0.15
+
+# 短句额外等待时间（秒）。
+# 类型: float
+# 短片段更可能是半句话，提交前额外等待，提升自然对话稳定性。
+stt_short_utterance_extra_seconds = 0.5
+
+# 触发短句额外等待的最大字符数。
+# 类型: int
+stt_short_utterance_max_chars = 8
+
+# 用户轮次合并窗口（秒）。
+# 类型: float
+# ConversationManager 端点检测完成并 dispatch 后，CLI 层保留一个短窗口
+# 以便合并紧急打断等场景下连续到达的短片段。
+# 减小此值可减少从说话结束到 AI 响应的延迟。
+# 设为 0.0 则 ConversationManager 检测完毕后立即 dispatch。
+stt_turn_merge_seconds = 0.0
+
+# 是否启用 Dialogue 统一处理 STT 池。
+# 类型: bool (true/false)
+# true: STT 只累积文本；明显停顿后由 Dialogue LLM 一次决定 wait/speak、提炼用户内容并生成回复。
+# false: 使用旧路径，合并窗口结束后直接把文本作为用户输入交给 dialogue。
+stt_dialogue_pool_enabled = false
+
+# 重叠（同时说话）分类模型。
+# 类型: string（Ollama 模型名）
+# 用户插话时，用此模型判断AI应继续说话、软打断还是硬打断。
+# 推荐 qwen2.5:0.5b 等小模型，延迟是关键。
+overlap_model = "qwen2.5:0.5b"
+
+# 对话池轮询间隔（秒）。
+# 类型: float
+# 后台线程检查是否有稳定文本的频率。越小越及时，但 CPU 开销略高。
+# 建议保持 0.05（50ms），不需要改动。
+stt_pool_tick_seconds = 0.05
+
+# STT 精炼 LLM 调用的最大 token 数。
+# 类型: int
+# 限制精炼模型的输出长度，防止胡言乱语消耗过多算力。
+# STT 原文通常很短，64 ~ 128 足够。
+stt_refine_max_tokens = 128
+
+# 是否跳过短文本的精炼。
+# 类型: bool (true/false)
+# true: 短文本（长度 ≤ stt_skip_short_refine_max_chars）且无明显 ASR 异常时不调 LLM 精炼。
+# false: 所有文本都走精炼。
+# 开启可减少 LLM 调用次数和延迟，适合短文本较多的场景。
+stt_skip_short_refine = true
+
+# 跳过精炼的最大字符数（仅 stt_skip_short_refine = true 时生效）。
+# 类型: int
+# 超过此长度的文本即使无异常也会走 LLM 精炼。
+stt_skip_short_refine_max_chars = 18
+
+# TTS 播放期间暂停麦克风输入。
+# 类型: bool (true/false)
+# true: TTS 播放时关闭麦克风输入，防止扬声器声音被麦克风捕获造成回声/混乱。
+# false: 不暂停，TTS 和 STT 同时运行（需要物理回声消除或用下方的 [aec] 配置）。
+# 注：若 [aec].enabled = true，此配置无效（由 AEC 替代）。
+stt_pause_during_tts = false
+
+  # TTS 回声文本过滤窗口（秒）。AEC 漏掉的外放回声会在 STT 提交前用最近 TTS 文本兜底过滤。
+  # 类型: float
+  stt_echo_filter_seconds = 45.0
+
+  # TTS 回声文本过滤的最短字符数。太短的片段容易误杀正常短回应。
+  # 类型: int
+  stt_echo_filter_min_chars = 3
+
+  # TTS 回声文本过滤相似度阈值。越低越激进，越高越保守。
+  # 类型: float
+  stt_echo_filter_similarity = 0.68

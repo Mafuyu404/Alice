@@ -1,4 +1,4 @@
-"""Agent loop: orchestrates LLM streaming + tool execution cycles.
+﻿"""Agent loop: orchestrates LLM streaming + tool execution cycles.
 
 When tools are configured, the loop:
   1. Sends messages + tool schemas to the LLM
@@ -22,9 +22,9 @@ import requests
 
 from kokoro.core import config as cfg
 from kokoro.action import agent_guard
+from kokoro.action import runtime as action_runtime
 from kokoro.core import llm_client
 from kokoro.action import model as action_model
-from kokoro.core import input_events
 from kokoro.action.tool_parser import (
     CompletedToolCall,
     ToolCallAccumulator,
@@ -101,7 +101,7 @@ def agent_chat(
 ) -> AgentResult:
     """Run the agent loop.
 
-    Tool context kwargs are forwarded to tool_registry.execute():
+    Tool context kwargs are forwarded to ActionRuntime:
       session, memory_backend, character_id
 
     Returns AgentResult with .reply, .cancelled, .tool_calls_made.
@@ -186,8 +186,9 @@ def _agent_chat_impl(
                 "content": (
                     "【当前正在执行的智能体任务】\n"
                     + "\n".join(t.to_prompt_line() for t in active_tasks[:5])
-                    + "\n如果用户只是在催促、表达着急、询问好了没有、问为什么有多个任务，"
-                    "应优先调用 check_task_progress，不要重复启动相同任务。"
+                    + "\n如果用户只是在催促、表达着急、询问好了没有、"
+                    "或问为什么有多个任务，应优先调用 check_task_progress，"
+                    "不要重复启动相同任务。"
                 ),
             })
     route_model = cfg.tool_router_model() or model
@@ -209,47 +210,39 @@ def _agent_chat_impl(
             on_tool_call(route_to_execute.tool_name, args)
         print(f"\n  [tool] {route_to_execute.tool_name} {json.dumps(args, ensure_ascii=False)[:240]}")
         t0 = time.perf_counter()
-        result = registry.execute(route_to_execute.tool_name, args, **tool_context)
-        elapsed = time.perf_counter() - t0
-        _publish_tool_action_result(
+        result = _execute_tool_action(
+            registry,
             tool_context,
             tool_name=route_to_execute.tool_name,
             arguments=args,
-            result=str(result),
-            status=_tool_result_status(str(result)),
-            elapsed=elapsed,
             cycle_id=cycle_id,
             causality_id=causality_id,
         )
+        elapsed = time.perf_counter() - t0
         print(f"  [tool] {route_to_execute.tool_name} done ({elapsed:.1f}s)")
         if result:
             print(f"  [tool] {route_to_execute.tool_name} result={result[:160]}")
         result_text = str(result)
-        is_pending_result = any(marker in result_text for marker in ("后台处理中", "任务已创建", "pending", "running"))
-        is_failed_result = any(marker in result_text.lower() for marker in ("failed", "失败", "错误", "error", "退出码"))
+        lower_result = result_text.lower()
+        is_pending_result = any(marker in lower_result for marker in ("pending", "running", "in progress", "background"))
+        is_failed_result = any(marker in lower_result for marker in ("failed", "error", "timeout", "exception"))
         followup_messages = list(messages)
+        status_guard = ""
+        if is_failed_result:
+            status_guard = "\n强约束：工具返回显示任务失败或出错。必须承认没有完成，并简短说明错误；禁止说已经完成、已经创建、已经保存或弄好了。"
+        elif is_pending_result:
+            status_guard = "\n强约束：工具返回显示任务仍在处理中。只能说正在处理或正在查看进度；禁止说任务已经最终完成。"
         followup_messages.append({
             "role": "system",
             "content": (
                 "【智能体调用结果】\n"
-                f"你刚刚已经通过自己的智能体能力调用了 {route_to_execute.tool_name}。"
-                "这不是别人替你做事，也不是传话；这是你通过系统拥有的真实电脑操作能力的一部分。"
-                "你应该把它理解为自己能够做的事：决定、执行、等待结果、核对结果，然后对用户负责。\n"
+                f"你刚刚通过自身的智能体能力调用了 {route_to_execute.tool_name}。"
+                "这不是别人替你做事，也不是传话；这是系统拥有的真实电脑操作能力的一部分。"
+                "你应把它理解为自己能够做的事：决定、执行、等待结果、核对结果，然后对用户负责。\n"
                 f"任务描述：{route_to_execute.task}\n"
                 f"工具返回：{result}\n\n"
-                "请基于这个事实自然回应用户。不要说自己只是传话或让别人去做；"
-                + (
-                    "强约束：工具返回显示任务失败或出错。你必须承认没有完成，并简短说明错误；"
-                    "禁止说已经完成、已经创建、已经保存、弄好了。\n"
-                    if is_failed_result else ""
-                )
-                + (
-                    "强约束：工具只返回了任务已创建/后台处理中，任务还没有完成。"
-                    "你必须说正在做、正在处理或等完成后确认，禁止说已经完成、已经创建、已经保存、弄好了。\n"
-                    if is_pending_result else ""
-                )
-                + "如果工具返回只是任务已创建/后台处理中，就只能说正在处理或正在查看进度；"
-                "不要声称任务已经最终完成，除非工具返回明确说明 completed 或成功结果。"
+                "请基于这个事实自然回应用户，不要说自己只是传话或让别人去做。"
+                f"{status_guard}"
             ),
         })
         reply, cancelled = _simple_stream(
@@ -386,19 +379,16 @@ def _agent_chat_impl(
             print(f"\n  [tool] {tc.name} {json.dumps(tc.arguments, ensure_ascii=False)}")
             t0 = time.perf_counter()
 
-            result = registry.execute(tc.name, tc.arguments, **tool_context)
-
-            elapsed = time.perf_counter() - t0
-            _publish_tool_action_result(
+            result = _execute_tool_action(
+                registry,
                 tool_context,
                 tool_name=tc.name,
                 arguments=tc.arguments,
-                result=str(result),
-                status=_tool_result_status(str(result)),
-                elapsed=elapsed,
                 cycle_id=cycle_id,
                 causality_id=causality_id,
             )
+
+            elapsed = time.perf_counter() - t0
             print(f"  [tool] {tc.name} done ({elapsed:.1f}s)")
             total_tool_calls += 1
 
@@ -427,55 +417,45 @@ def _enrich_agent_task(task: str, messages: list[dict]) -> str:
     recent_text = "\n".join(recent[-12:])
     return (
         f"{task}\n\n"
-        "执行时请参考下面最近对话。如果任务要求写入聊天记录、整理刚才内容、继续处理“这个文件”等，"
-        "必须从这里提取实际内容和目标文件，不要把占位符或函数名当成任务本身。\n"
+        "执行时请参考下面最近对话。如果任务要求写入聊天记录、整理刚才内容、"
+        "继续处理某个文件或延续当前上下文，必须从这里提取真实内容和目标文件，"
+        "不要把占位符或函数名当成任务本身。\n"
         f"【最近对话】\n{recent_text}"
     )
 
 
-def _publish_tool_action_result(
+def _execute_tool_action(
+    registry: object,
     tool_context: dict,
     *,
     tool_name: str,
     arguments: dict,
-    result: str,
-    status: str,
-    elapsed: float,
     cycle_id: str,
     causality_id: str,
-) -> None:
+) -> str:
     session = tool_context.get("session")
-    bus = getattr(session, "event_bus", None)
-    if bus is None or not hasattr(bus, "publish"):
-        return
-    event = input_events.build_action_result_event(
-        f"工具 {tool_name} 返回：{result}",
-        source=tool_name,
-        metadata={
-            "cycle_id": cycle_id,
-            "action_id": f"tool_{tool_name}",
-            "causality_id": causality_id,
-            "action": tool_name,
-            "arguments": arguments,
-            "status": status,
-            "elapsed_seconds": round(max(0.0, elapsed), 3),
-            "mode": "sync",
-            "visibility": "private",
-            "result_policy": "feed_back",
-        },
-        priority="normal",
-        lifetime="session",
+    batch = action_model.ActionBatch(
+        actions=[],
+        reason=f"agent tool call: {tool_name}",
+        cycle_id=cycle_id,
+        causality_id=causality_id,
     )
-    bus.publish(event)
-
-
-def _tool_result_status(result: str) -> str:
-    text = str(result or "").lower()
-    if any(marker in text for marker in ("failed", "失败", "错误", "error", "退出码", "超时", "timeout")):
-        return "failed"
-    if any(marker in text for marker in ("后台处理中", "任务已创建", "pending", "running")):
-        return "pending"
-    return "success"
+    action = action_model.Action(
+        action=tool_name,
+        reason=f"agent requested tool: {tool_name}",
+        args=dict(arguments),
+        mode="sync",
+        visibility="private",
+        result_policy="feed_back",
+    )
+    runtime = action_runtime.ActionRuntime(
+        session=session,
+        handlers={},
+        registry=registry,
+        tool_context=tool_context,
+        merge_window_seconds=0,
+    )
+    return runtime.execute_action_for_result(batch, action)
 
 
 def _simple_stream(

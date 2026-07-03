@@ -1,0 +1,68 @@
+# ===========================================================================
+# 工具调用 (Tool Calling / Function Calling)
+# ===========================================================================
+# 启用后，LLM 可以调用预定义的工具（如查看屏幕、搜索记忆等）。
+# 工具调用采用 OpenAI 兼容的 function calling 格式。
+# 关闭后使用旧版正则命令匹配（user_commands.py）。
+
+[tool_calling]
+# 总开关。设为 false 时使用旧版正则命令匹配。
+# 类型: bool (true/false)
+enabled = true
+
+# 启用的工具列表。
+# 类型: string 数组
+# 可选: "look_at_screen", "search_memory", "get_current_time", "get_current_app",
+#        "save_to_memory", "send_qq_message", "retire_sticker", "vts_expression", "vts_motion", "claude_code_exec",
+#        "check_task_progress", "list_active_tasks", "cancel_task"
+tools = [
+  "look_at_screen",
+  "search_memory",
+  "get_current_time",
+  "get_current_app",
+  "save_to_memory",
+  "send_qq_message",
+  "retire_sticker",
+  "vts_expression",
+  "vts_motion",
+  "claude_code_exec",
+  "check_task_progress",
+  "list_active_tasks",
+  "cancel_task",
+]
+
+# 单次对话中工具调用的最大循环次数（防止死循环）。
+# 类型: int。建议 3 ~ 8。
+max_iterations = 5
+
+# 单次工具调用超时（秒）。
+# 类型: float
+tool_timeout = 180.0
+
+
+# ===========================================================================
+# 智能体 (Agent) — Claude Code 外部工具
+# ===========================================================================
+# AI 角色可以通过 claude_code_exec 工具调用 Claude Code 来执行文件操作、
+# 代码编写、文本处理等任务。任务在后台执行，AI 角色可以查询进度。
+
+[agent]
+# 总开关。设为 false 时禁用智能体调用。
+# 类型: bool (true/false)
+enabled = true
+
+# Claude Code 可执行文件路径。留空则自动在 PATH 中查找。
+# 类型: string（文件路径）
+# 如果通过 npm 全局安装，一般会自动找到。
+# Windows 常见路径: "C:/Users/<用户名>/AppData/Roaming/npm/claude"
+# macOS/Linux: 通常已在 PATH 中
+claude_code_path = ""
+
+# 智能体任务超时（秒）。
+# 类型: float
+# 超过此时间未完成的任务将被强制终止。
+timeout = 120.0
+
+# 默认工作目录。留空使用项目根目录。
+# 类型: string（目录路径）
+working_dir = ""

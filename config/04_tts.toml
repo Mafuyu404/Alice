@@ -1,0 +1,60 @@
+# ===========================================================================
+# TTS — 文本转语音
+# ===========================================================================
+
+# TTS 后端选择。
+# 类型: string
+# 可选值: "minimax"（推荐，低延迟流式）, "cartesia"
+# 切换后端后会自动加载 kokoro/tts_{后端名}.py。
+tts_backend = "minimax"
+
+# TTS 播放音量倍率。
+# 类型: float
+# 1.0 = 原始音量，0.5 = 一半音量，0 = 静音，最大 2.0。
+# 超过 1.0 可能产生削波失真，建议优先使用 0.3 ~ 1.0。
+tts_volume = 1.25
+
+# ── Cartesia 配置 ──
+# Cartesia 海外 TTS 服务。需要海外网络访问和有效 API Key。
+cartesia_api_key = ""
+# Cartesia 语音 ID。可在 Cartesia 控制台获取。
+tts_voice_id = ""
+# Cartesia TTS 音频采样率（Hz）。
+# 类型: int（可选 8000, 16000, 22050, 24000, 44100, 48000）
+# 越高音质越好，但数据量也越大。建议 24000。
+tts_sample_rate = 24000
+
+# ── MiniMax 配置 ──
+# MiniMax TTS 服务。国内可用，WebSocket 流式合成，延迟低。
+minimax_api_key = ""
+# MiniMax 语音模型名。
+# 类型: string
+# 可选: "speech-2.8-turbo"（推荐，快速）, "speech-2.8-pro"（高质量）
+minimax_model = "speech-2.8-turbo"
+# MiniMax TTS 音频采样率（Hz）。
+# 类型: int，可选 8000/16000/22050/24000/32000/44100/48000
+minimax_sample_rate = 32000
+# 语速倍率。
+# 类型: float
+# 1.0 = 正常语速，>1 加快（最大约 2.0），<1 减慢（最小约 0.5）。
+# 推荐范围: 0.9 ~ 1.2。
+minimax_tts_speed = 1.1
+# 播放前预缓冲的音频秒数。
+# 类型: float
+# 值越大播放越流畅（减少卡顿），但首音延迟越高。
+# 敏感场景（需要快速响应）设 0.05 ~ 0.15，流畅优先设 0.3 ~ 0.5。
+minimax_tts_buffer_seconds = 0.3
+# 播放线程写入声卡前聚合的小音频块时长。
+# 类型: float
+# 值过小可能出现逐字卡顿；值过大增加播放延迟。推荐 0.06 ~ 0.12。
+minimax_tts_write_buffer_seconds = 0.08
+# LLM 流式输出累积多少字符后强制刷新 TTS 缓冲区。
+# 类型: int
+# 较小值让 TTS 更快开始说话（但可能断句不自然），较大值等待更完整句子。
+# 推荐范围: 20 ~ 40。
+tts_stream_chunk_chars = 28
+# TTS 流式输出时，触发句子刷新的最小字符数（需配合句末标点）。
+# 类型: int
+# 低于此长度的句子即使有句末标点也不刷新，避免吐出过短的碎片。
+# 推荐范围: 6 ~ 12。
+tts_stream_sentence_min_chars = 8

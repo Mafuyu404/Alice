@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Iterable, Literal
 
+from kokoro.core import lifecycle_debug
+
 
 InputPriority = Literal["low", "normal", "high", "urgent"]
 InputLifetime = Literal["ephemeral", "session", "memorize_candidate"]
@@ -102,10 +104,16 @@ class InputEventBus:
     def subscribe(self, callback: EventSubscriber) -> None:
         with self._lock:
             self._subscribers.append(callback)
+        lifecycle_debug.log(
+            "event_bus.subscribe",
+            callback=getattr(callback, "__qualname__", repr(callback)),
+            subscriber_count=len(self._subscribers),
+        )
 
     def publish(self, event: InputEvent) -> None:
         if not isinstance(event, InputEvent):
             raise TypeError("event must be InputEvent")
+        lifecycle_debug.log("event_bus.publish.start", event=event)
         try:
             self._queue.put_nowait(event)
         except queue.Full:
@@ -116,7 +124,17 @@ class InputEventBus:
             self._queue.put_nowait(event)
         with self._lock:
             subscribers = list(self._subscribers)
+        lifecycle_debug.log(
+            "event_bus.publish.dispatch",
+            event=event,
+            subscriber_count=len(subscribers),
+        )
         for callback in subscribers:
+            lifecycle_debug.log(
+                "event_bus.subscriber.call",
+                event_id=event.id,
+                callback=getattr(callback, "__qualname__", repr(callback)),
+            )
             callback(event)
 
     def drain(self, max_items: int | None = None) -> list[InputEvent]:

@@ -9,15 +9,18 @@ import threading
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Optional
 
 from kokoro.core import character
 from kokoro.core import input_events
+from kokoro.core import lifecycle_debug
 from kokoro.core import memory as memory_mod
 from kokoro.core import prompts
 from kokoro.core import scene as scene_mod
 
 logger = logging.getLogger(__name__)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
@@ -64,6 +67,12 @@ class ChatSession:
         return cfg
 
     def __post_init__(self) -> None:
+        lifecycle_debug.log(
+            "chat_session.init.start",
+            character_id=self.character_id,
+            character_name=self.character_data.get("name", ""),
+            user_name=self.user_name,
+        )
         from kokoro.core.cognition import CognitionStore
         from kokoro.core.emotion import EmotionState
         from kokoro.core.inner_stream import InnerStream, InnerStreamLoop
@@ -78,6 +87,11 @@ class ChatSession:
             self.inner_stream = InnerStream(
                 self.character_id,
                 self.character_data,
+                reset_on_start=bool(section.get("reset_on_start", True)),
+            )
+            lifecycle_debug.log(
+                "chat_session.inner_stream.created",
+                character_id=self.character_id,
                 reset_on_start=bool(section.get("reset_on_start", True)),
             )
         if self.memory_events is None:
@@ -99,8 +113,10 @@ class ChatSession:
                         session=self,
                         section=cognition_section,
                     )
+                    lifecycle_debug.log("chat_session.inner_cognition_reflector.created", character_id=self.character_id)
                 except Exception as exc:
                     logger.warning("failed to initialize inner cognition reflection: %s", exc)
+                    lifecycle_debug.log("chat_session.inner_cognition_reflector.error", character_id=self.character_id, error=str(exc))
             memory_reflector = None
             memory_section = _cfg.inner_memory_config()
             if bool(memory_section.get("enabled", True)):
@@ -110,8 +126,10 @@ class ChatSession:
                         session=self,
                         section=memory_section,
                     )
+                    lifecycle_debug.log("chat_session.inner_memory_reflector.created", character_id=self.character_id)
                 except Exception as exc:
                     logger.warning("failed to initialize inner memory reflection: %s", exc)
+                    lifecycle_debug.log("chat_session.inner_memory_reflector.error", character_id=self.character_id, error=str(exc))
             try:
                 from kokoro.action.autonomous_step import AutonomousStep
                 self.autonomous_step = AutonomousStep(
@@ -124,8 +142,10 @@ class ChatSession:
                     cognition_reflector=cognition_reflector,
                 )
                 output_handlers.append(self.autonomous_step.consider_after_inner_stream)
+                lifecycle_debug.log("chat_session.autonomous_step.created", character_id=self.character_id)
             except Exception as exc:
                 logger.warning("failed to initialize autonomous step: %s", exc)
+                lifecycle_debug.log("chat_session.autonomous_step.error", character_id=self.character_id, error=str(exc))
             section = _inner_stream_section()
             self.inner_stream_loop = InnerStreamLoop(
                 stream=self.inner_stream,
@@ -139,9 +159,19 @@ class ChatSession:
             )
             self.event_bus.subscribe(self.inner_stream_loop.submit)
             self.inner_stream_loop.start()
+            lifecycle_debug.log(
+                "chat_session.inner_stream_loop.created",
+                character_id=self.character_id,
+                section=section,
+            )
         if self._scene is None:
             from kokoro.core import config as _cfg
             self._scene = scene_mod.resolve(_cfg.load())
+        lifecycle_debug.log(
+            "chat_session.init.done",
+            character_id=self.character_id,
+            scene=str(self._scene),
+        )
 
     @property
     def character_name(self) -> str:
@@ -190,7 +220,7 @@ class ChatSession:
             return ""
         if filepath is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+            log_dir = str(_PROJECT_ROOT / "logs")
             os.makedirs(log_dir, exist_ok=True)
             filepath = os.path.join(log_dir, f"chat-{self.character_id}-{stamp}.log")
         lines: list[str] = []
@@ -492,6 +522,15 @@ class ChatSession:
                 priority=priority,
                 lifetime=lifetime,
             )
+            lifecycle_debug.log(
+                "chat_session.record_input_event",
+                character_id=self.character_id,
+                event=event,
+            )
+            autonomous = getattr(self, "autonomous_step", None)
+            note_external = getattr(autonomous, "note_external_event", None)
+            if callable(note_external):
+                note_external(event)
             self.event_bus.publish(event)
             return event
         except Exception as exc:
@@ -517,6 +556,15 @@ class ChatSession:
                 metadata=metadata or {},
                 lifetime=lifetime,
             )
+            lifecycle_debug.log(
+                "chat_session.record_self_action",
+                character_id=self.character_id,
+                event=event,
+            )
+            autonomous = getattr(self, "autonomous_step", None)
+            note_external = getattr(autonomous, "note_external_event", None)
+            if callable(note_external):
+                note_external(event)
             self.event_bus.publish(event)
             return event
         except Exception as exc:
@@ -577,6 +625,7 @@ class ChatSession:
             loop.flush()
 
     def _inner_stream_event_context(self) -> dict:
+        lifecycle_debug.log("chat_session.inner_stream_context.start", character_id=self.character_id)
         recent = _format_recent_history(
             self.history[-10:],
             user_name=self.user_name,
@@ -611,7 +660,15 @@ class ChatSession:
                 cognition_context = self.cognition.get_context_for_text(event_text) if event_text else self.cognition.get_context()
         except Exception:
             cognition_context = self.cognition.get_context() if self.cognition else ""
-        return {
+        activity_context = ""
+        autonomous = getattr(self, "autonomous_step", None)
+        activity_provider = getattr(autonomous, "activity_context", None)
+        if callable(activity_provider):
+            try:
+                activity_context = activity_provider()
+            except Exception:
+                activity_context = ""
+        result = {
             "character_name": self.character_name,
             "user_name": self.user_name,
             "summary": self.summary or "",
@@ -620,8 +677,16 @@ class ChatSession:
             "emotion_context": self.emotion.get_context() if self.emotion else "",
             "memory_context": memories or "",
             "scene_context": self.scene_guidance or "",
-            "activity_context": "",
+            "activity_context": activity_context,
         }
+        lifecycle_debug.log(
+            "chat_session.inner_stream_context.done",
+            character_id=self.character_id,
+            event_snapshot_count=len(events),
+            query=query if "query" in locals() else "",
+            context=result,
+        )
+        return result
 
     def _call_summary_llm(self, existing_summary: str, conversation: str) -> str | None:
         prompt = prompts.format_prompt(

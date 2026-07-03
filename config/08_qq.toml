@@ -1,0 +1,111 @@
+# ===========================================================================
+# QQ 环境输入
+# ===========================================================================
+# QQ 接入层只负责把群聊/私聊整理成环境输入，是否发言交给 LLM 结合
+# 内在叙事流自主判断。旧的 qq_adapter.py 已弃用。
+
+[qq]
+# 是否让 cli.py 启动本地 QQ 输入 WebSocket server。
+# 也可用 cli.py --qq 临时开启。
+# 类型: bool
+enabled = true
+
+# qq_client.py 连接到 cli.py 的本地地址。
+# 类型: string / int
+alice_ws_url = "ws://127.0.0.1:58911"
+alice_host = "127.0.0.1"
+alice_port = 58911
+
+# qq_client.py 直接连接 NapCat OneBot WebSocket 的默认地址。
+# 类型: string
+napcat_ws_url = "ws://127.0.0.1:3001"
+
+# 旧桥接模式兼容地址。正常不需要启动 napcat_bridge.py。
+# 类型: string
+bridge_url = "ws://127.0.0.1:58888"
+
+# 每个群/私聊保留的最近原始消息数。
+# 类型: int
+max_messages_per_conversation = 200
+
+# 每次交给内在叙事/自主参与判断的最大消息行数。
+# 类型: int
+packet_max_lines = 40
+
+# QQ 环境包只取最近多少秒内的消息；0 表示不按时间过滤。
+# 类型: float
+packet_max_age_seconds = 180.0
+
+# 空闲社交探测只取最近多少秒内的消息；0 表示不按时间过滤。
+# 类型: float
+idle_packet_max_age_seconds = 90.0
+
+# 消息停止多久后才把当前窗口合成一个环境包，避免每条消息都触发。
+# 类型: float
+batch_quiet_seconds = 1.0
+
+# 每个环境包至少包含多少条新消息。
+# 类型: int
+batch_min_unread = 1
+
+# 没有新 QQ 消息时，多久允许把最近会话作为空闲社交现场交给自主参与判断。
+# 类型: float
+idle_participation_seconds = 25.0
+
+# 是否启用 QQ 自主参与判断。关闭后 QQ 只进入内在叙事，不主动发消息。
+# 类型: bool
+autonomous_participation_enabled = true
+
+# QQ 自主参与判断前是否同步等待内在叙事流吸收本轮 QQ 环境。
+# false 时 QQ 先快速决策，内在叙事流异步吸收，回复会更快。
+# 类型: bool
+absorb_before_decide = false
+
+# QQ 自主参与判断模型。留空则使用 dialogue_model/llm_model。
+# 类型: string
+participation_model = "deepseek-v4-flash"
+
+# 同一会话两次主动发言的最小间隔。只是外层防刷屏边界，不代表兴趣规则。
+# 类型: float
+participation_cooldown_seconds = 8.0
+
+# QQ 单条发送内容最大字符数。
+# 类型: int
+max_message_chars = 260
+
+[qq.image_understanding]
+# 是否识别 QQ 收到的图片/表情包。
+# 类型: bool
+enabled = true
+
+# 是否允许角色在喜欢某张表情包时自动收藏到本地表情包库。
+# 类型: bool
+auto_save_stickers = true
+
+# 是否允许把截图收藏为表情包。默认关闭；截图仍会被识别并进入内在叙事流。
+# 类型: bool
+save_screenshots = false
+
+# 是否允许把普通照片收藏为表情包。
+# 类型: bool
+save_photos = false
+
+# 表情包库目录。
+# 类型: string
+sticker_dir = "data/stickers"
+
+# 下载 QQ 图片的最大字节数。
+# 类型: int
+max_image_bytes = 8000000
+
+# 图片下载超时。
+# 类型: float
+download_timeout = 15.0
+
+# 图片理解超时。
+# 类型: int
+vision_timeout = 45
+
+# 留空时复用全局 vision_backend / vision_model。
+backend = ""
+model = ""

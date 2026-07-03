@@ -17,13 +17,13 @@ from kokoro.core import chat_session
 from kokoro.core import console as console_mod
 from kokoro.core import config as cfg
 from kokoro.action import dialogue_orchestrator as dialogue_mod
-from kokoro.action import edge_cache as edge_cache_mod
 from kokoro.core import llm_client
 from kokoro.core import memory as mem_mod
 from kokoro.action import multi_chat
-from kokoro.action import text_cli_tools
 from kokoro.core import token_usage
-from kokoro.action import task_manager as task_manager_mod
+from kokoro.action.tools.observe_screen import edge_cache as edge_cache_mod
+from kokoro.action.tools.task import manager as task_manager_mod
+from kokoro.action.tools.text_cli import file_tools as text_cli_tools
 
 
 CONFIG = cfg.load()
