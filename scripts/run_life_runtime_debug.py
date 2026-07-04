@@ -18,6 +18,7 @@ from kokoro.core import config as cfg
 from kokoro.core import input_events
 from kokoro.core import lifecycle_debug
 from kokoro.core import memory as memory_mod
+from kokoro.action.tools import search_web as search_web_tool
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
 
 
@@ -119,6 +120,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run a LifeRuntime debug trace for one character.")
     parser.add_argument("--character", default="lerwa")
     parser.add_argument("--ticks", type=int, default=3)
+    parser.add_argument("--duration-seconds", type=float, default=0.0, help="Run the LifeRuntime background loop for this many seconds instead of manual ticks.")
     parser.add_argument("--out-dir", default="")
     parser.add_argument("--real-llm", action="store_true", help="Use configured local/remote LLM instead of deterministic scripted responses.")
     parser.add_argument("--llm-model", default="", help="Override LifeRuntime local thinking model for --real-llm.")
@@ -132,6 +134,8 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     trace_path = out_dir / "lifecycle_trace.jsonl"
     os.environ["KOKORO_LIFECYCLE_TRACE"] = str(trace_path)
+    full_config = cfg.load()
+    web_search_runtime = _start_web_search_runtime(full_config, out_dir=out_dir)
 
     section = {
         "enabled": True,
@@ -180,6 +184,7 @@ def main() -> int:
         "life_debug.start",
         character=args.character,
         ticks=args.ticks,
+        duration_seconds=args.duration_seconds,
         out_dir=str(out_dir),
         scripted=not args.real_llm,
     )
@@ -195,36 +200,38 @@ def main() -> int:
     results = []
     error = ""
     try:
-        for index in range(max(1, args.ticks)):
-            try:
-                result = runtime.tick_once(force=index > 0)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                lifecycle_debug.log("life_debug.tick_error", tick=index + 1, error=error)
-                break
-            results.append(
-                {
-                    "tick": index + 1,
-                    "processed_events": result.processed_events,
-                    "patch_applied": result.patch_applied,
-                    "thinking_intensity": result.thinking_intensity,
-                    "action_plan": result.action_plan,
-                    "action_plan_status": result.action_plan_status,
-                    "action_plan_error": result.action_plan_error,
-                }
-            )
-            time.sleep(0.05)
+        if args.duration_seconds and args.duration_seconds > 0:
+            runtime.start()
+            deadline = time.monotonic() + float(args.duration_seconds)
+            while time.monotonic() < deadline:
+                time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+        else:
+            for index in range(max(1, args.ticks)):
+                try:
+                    result = runtime.tick_once(force=index > 0)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    lifecycle_debug.log("life_debug.tick_error", tick=index + 1, error=error)
+                    break
+                results.append(_tick_result_summary(index + 1, result))
+                time.sleep(0.05)
     finally:
         runtime.stop(wait=True, timeout=5.0)
+        _stop_runtime(web_search_runtime)
         close = getattr(backend, "close", None)
         if callable(close):
             close()
+
+    if args.duration_seconds and args.duration_seconds > 0:
+        results = _tick_summaries_from_trace(trace_path)
 
     summary = {
         "character": args.character,
         "scripted": not args.real_llm,
         "error": error,
+        "duration_seconds": float(args.duration_seconds or 0.0),
         "ticks": results,
+        "trace_counts": _trace_counts(trace_path),
         "trace_path": str(trace_path),
         "inner_stream": getattr(getattr(session, "inner_stream", None), "text", ""),
         "context_digest": runtime.compactor.recent_digest(),
@@ -235,6 +242,79 @@ def main() -> int:
     lifecycle_debug.log("life_debug.done", summary=summary)
     print(str(out_dir))
     return 0
+
+
+def _tick_result_summary(index: int, result) -> dict:
+    return {
+        "tick": index,
+        "processed_events": result.processed_events,
+        "patch_applied": result.patch_applied,
+        "thinking_intensity": result.thinking_intensity,
+        "action_plan": result.action_plan,
+        "action_plan_status": result.action_plan_status,
+        "action_plan_error": result.action_plan_error,
+    }
+
+
+def _start_web_search_runtime(config: dict, *, out_dir: Path):
+    runtime = search_web_tool.start_runtime(config, root=out_dir)
+    section = config.get("inner_stream_search") if isinstance(config, dict) else {}
+    lifecycle_debug.log(
+        "life_debug.transport.web_search",
+        enabled=bool(section.get("enabled", False)) if isinstance(section, dict) else False,
+        has_runtime=runtime is not None,
+        process_started=bool(getattr(runtime, "process", None)),
+    )
+    return runtime
+
+
+def _stop_runtime(runtime: object) -> None:
+    stop = getattr(runtime, "stop", None)
+    if callable(stop):
+        stop()
+
+
+def _tick_summaries_from_trace(trace_path: Path) -> list[dict]:
+    summaries: list[dict] = []
+    if not trace_path.exists():
+        return summaries
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except Exception:
+            continue
+        if record.get("event") != "life.runtime.tick_done":
+            continue
+        summaries.append(
+            {
+                "tick": len(summaries) + 1,
+                "processed_events": record.get("processed_events"),
+                "patch_applied": record.get("patch_applied"),
+                "thinking_intensity": record.get("thinking_intensity"),
+                "has_action_plan": record.get("has_action_plan"),
+                "action_plan_status": record.get("action_plan_status", ""),
+                "action_plan_error": record.get("action_plan_error", ""),
+            }
+        )
+    return summaries
+
+
+def _trace_counts(trace_path: Path) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if not trace_path.exists():
+        return counts
+    for line in trace_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = str(json.loads(line).get("event") or "")
+        except Exception:
+            continue
+        if event:
+            counts[event] = counts.get(event, 0) + 1
+    return counts
 
 
 if __name__ == "__main__":

@@ -80,6 +80,28 @@ def test_action_runtime_merges_parallel_results():
     assert "result b" in event.content
 
 
+def test_action_runtime_shutdown_flushes_pending_results():
+    session = _Session()
+    runtime = ActionRuntime(
+        session=session,
+        merge_window_seconds=60.0,
+        handlers={"tool": lambda action: "pending result"},
+    )
+    batch = ActionBatch(
+        cycle_id="cycle_shutdown",
+        causality_id="cause_shutdown",
+        actions=[Action(action="tool")],
+    )
+
+    runtime.execute_batch(batch)
+    assert not [event for event in session.event_bus.snapshot() if event.type == "action_result"]
+    runtime.shutdown(wait=False)
+    result_events = [event for event in session.event_bus.snapshot() if event.type == "action_result"]
+
+    assert len(result_events) == 1
+    assert result_events[0].content == "pending result"
+
+
 def test_public_action_started_is_recorded():
     session = _Session()
     runtime = ActionRuntime(

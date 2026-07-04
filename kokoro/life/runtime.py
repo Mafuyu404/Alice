@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import urllib.error
 
 from kokoro.action import runtime as action_runtime_mod
 from kokoro.action import tool_spec
@@ -61,6 +63,7 @@ class LifeRuntime:
         self.tool_registry = tool_spec.ActionToolRegistry()
         action_tools.register_all(self.tool_registry)
         self.action_runtime = action_runtime or self._create_action_runtime()
+        self._availability_cache: dict[str, tuple[float, bool]] = {}
         self._available_actions = self._resolve_available_actions()
         self.compactor = ContextCompactor(
             character_id=getattr(session, "character_id", "default"),
@@ -160,11 +163,43 @@ class LifeRuntime:
             digest=digest,
             event_text=event_text,
         )
+        data = _extract_json(thought)
+        lifecycle_debug.log(
+            "life.runtime.thought_raw",
+            chars=len(thought or ""),
+            text=thought,
+            json_ok=isinstance(data, dict),
+        )
+        if not isinstance(data, dict):
+            parse_reason = _json_parse_error(thought)
+            lifecycle_debug.log(
+                "life.runtime.thought_parse_failed",
+                reason=parse_reason,
+                text=thought,
+            )
+            repaired = self._repair_json_thought(thought, parse_reason=parse_reason)
+            if repaired:
+                repaired_data = _extract_json(repaired)
+                lifecycle_debug.log(
+                    "life.runtime.thought_repair_raw",
+                    chars=len(repaired),
+                    text=repaired,
+                    json_ok=isinstance(repaired_data, dict),
+                )
+                if isinstance(repaired_data, dict):
+                    thought = repaired
+                    data = repaired_data
+                    lifecycle_debug.log("life.runtime.thought_repair_applied")
+                else:
+                    lifecycle_debug.log(
+                        "life.runtime.thought_repair_failed",
+                        reason=_json_parse_error(repaired),
+                    )
         self.time.mark_llm_thought()
-        patch_applied = self._apply_patch_from_thought(thought, inner_stream=inner_stream)
-        self._record_pending_threads_from_thought(thought)
-        action_plan = _extract_action_plan(thought)
-        intensity = _extract_intensity(thought)
+        patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
+        self._record_pending_threads_from_data(data)
+        action_plan = _extract_action_plan_from_data(data)
+        intensity = _extract_intensity_from_data(data)
         action_plan_status = ""
         action_plan_error = ""
         if action_plan:
@@ -243,6 +278,7 @@ class LifeRuntime:
                     "life_runtime.tick_user",
                     name=character_name,
                     inner_stream=inner_stream or "(empty)",
+                    inner_stream_version=self._inner_stream_version,
                     time_context=time_context or "(none)",
                     context_digest=digest or "(none)",
                     tool_capabilities=self._tool_capabilities_text(),
@@ -259,6 +295,32 @@ class LifeRuntime:
                 "max_tokens": int(self.section.get("tick_max_tokens", 640) or 640),
             },
         )
+
+    def _repair_json_thought(self, raw: str, *, parse_reason: str) -> str:
+        if not str(raw or "").strip():
+            return ""
+        messages = [
+            {"role": "system", "content": prompts.get("life_runtime.json_repair_system", "")},
+            {
+                "role": "user",
+                "content": prompts.format_prompt(
+                    "life_runtime.json_repair_user",
+                    parse_reason=parse_reason or "(unknown)",
+                    raw_output=raw,
+                ),
+            },
+        ]
+        try:
+            return self.llm.chat(
+                messages,
+                {
+                    "function": "life_tick_json_repair",
+                    "max_tokens": int(self.section.get("json_repair_max_tokens", 900) or 900),
+                },
+            ).strip()
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.thought_repair_error", error=str(exc))
+            return ""
 
     def _tool_capabilities_text(self) -> str:
         actions = sorted(self._available_actions)
@@ -295,7 +357,22 @@ class LifeRuntime:
         memory_backend = context.get("memory_backend")
         if memory_backend is None or not getattr(memory_backend, "ready", False):
             unavailable.update({"search_memory", "save_to_memory"})
+        if not self._cached_availability("search_web", lambda: _web_search_available(context.get("web_search_client"))):
+            unavailable.add("search_web")
+        if context.get("task_manager") is None:
+            unavailable.update({"claude_code_exec", "check_task_progress", "list_active_tasks", "cancel_task"})
         return actions - unavailable
+
+    def _cached_availability(self, key: str, probe) -> bool:
+        now = time.monotonic()
+        ttl = float(self.section.get("availability_check_seconds", 30.0) or 30.0)
+        cached = self._availability_cache.get(key)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+        available = bool(probe())
+        self._availability_cache[key] = (now, available)
+        lifecycle_debug.log("life.runtime.tool_availability", tool=key, available=available)
+        return available
 
     def _missing_required_args(self, action_name: str, args: dict[str, Any]) -> list[str]:
         missing: list[str] = []
@@ -312,6 +389,7 @@ class LifeRuntime:
         return []
 
     def _validate_action_plan(self, plan: ActionPlan) -> str:
+        self._available_actions = self._resolve_available_actions()
         for node in plan.nodes:
             if node.tool not in self._available_actions:
                 return f"action is not available in this runtime: {node.tool}"
@@ -323,7 +401,9 @@ class LifeRuntime:
         return ""
 
     def _apply_patch_from_thought(self, thought: str, *, inner_stream: str) -> bool:
-        data = _extract_json(thought)
+        return self._apply_patch_from_data(_extract_json(thought), inner_stream=inner_stream)
+
+    def _apply_patch_from_data(self, data: dict[str, Any] | None, *, inner_stream: str) -> bool:
         if not isinstance(data, dict):
             return False
         raw_patch = data.get("inner_stream_patch")
@@ -431,7 +511,9 @@ class LifeRuntime:
         return applied
 
     def _record_pending_threads_from_thought(self, thought: str) -> None:
-        data = _extract_json(thought)
+        self._record_pending_threads_from_data(_extract_json(thought))
+
+    def _record_pending_threads_from_data(self, data: dict[str, Any] | None) -> None:
         if not isinstance(data, dict):
             return
         value = data.get("pending_threads")
@@ -463,8 +545,29 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def _json_parse_error(text: str) -> str:
+    raw = re.sub(r"```(?:json)?\s*\n?(.*?)```", r"\1", str(text or ""), flags=re.DOTALL).strip()
+    try:
+        json.loads(raw)
+    except Exception as exc:
+        first_error = f"{type(exc).__name__}: {exc}"
+    else:
+        return "json root is not an object"
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if not match:
+        return f"no json object found; {first_error}"
+    try:
+        json.loads(match.group(0))
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return "json root is not an object"
+
+
 def _extract_action_plan(text: str) -> dict[str, Any] | None:
-    data = _extract_json(text)
+    return _extract_action_plan_from_data(_extract_json(text))
+
+
+def _extract_action_plan_from_data(data: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         return None
     plan = data.get("action_plan")
@@ -477,7 +580,10 @@ def _extract_action_plan(text: str) -> dict[str, Any] | None:
 
 
 def _extract_intensity(text: str) -> int | None:
-    data = _extract_json(text)
+    return _extract_intensity_from_data(_extract_json(text))
+
+
+def _extract_intensity_from_data(data: dict[str, Any] | None) -> int | None:
     if not isinstance(data, dict):
         return None
     value = data.get("thinking_intensity")
@@ -485,3 +591,15 @@ def _extract_intensity(text: str) -> int | None:
         return max(0, min(100, int(value)))
     except Exception:
         return None
+
+
+def _web_search_available(client: object) -> bool:
+    if client is None or not hasattr(client, "health"):
+        return False
+    try:
+        client.health()
+        return True
+    except (ConnectionError, OSError, urllib.error.URLError, RuntimeError):
+        return False
+    except Exception:
+        return False
