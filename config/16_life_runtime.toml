@@ -1,0 +1,65 @@
+# ===========================================================================
+# AI life runtime skeleton
+# ===========================================================================
+# This is the new prompt-engineering-oriented runtime described in
+# doc/life_runtime_redesign.md.
+#
+# The program is only the skeleton: event pooling, context compaction,
+# patch application, tool execution, logs, timeout and recovery. LLM prompts
+# decide rhythm, attention, thinking intensity, and tool plans.
+
+[life_runtime]
+# Disabled by default while the old InnerStreamLoop remains the active runtime.
+# Enable after wiring the new runtime into the selected CLI/lifecycle entry.
+enabled = false
+
+# When true, LifeRuntime owns autonomous inner-stream/action cycling and the
+# old InnerStreamLoop/AutonomousStep is not started for the session.
+primary = true
+
+# Max events retained in the high-throughput information pool.
+pool_max_events = 512
+
+# Max events sent to one high-frequency thinking tick.
+batch_max_events = 32
+
+# Max event text chars sent to one thinking tick.
+batch_max_chars = 4000
+
+# Max compressed context chars retained per character.
+context_max_chars = 8000
+
+# Max completion tokens for one life tick.
+tick_max_tokens = 640
+
+# Max completion tokens when patch-first fails and asks for a full rewrite.
+fallback_max_tokens = 640
+
+# Tool execution feedback merge window.
+result_merge_window_seconds = 1.0
+
+# Default tool timeout passed to ToolSpec execution context.
+tool_timeout = 45.0
+
+# Background loop interval before the LLM has chosen a thinking_intensity.
+idle_tick_seconds = 2.0
+
+# Runtime maps LLM-chosen thinking_intensity onto this interval range.
+min_tick_seconds = 0.25
+max_tick_seconds = 8.0
+
+[life_runtime.local_thinking]
+# Local/high-frequency thinking is the intended default. The model defaults to
+# stt_refine_model from 05_audio_input.toml when this value is empty.
+enabled = true
+model = ""
+
+# auto tries Ollama first, then OpenAI-compatible on 404. Use "ollama" or
+# "openai" to force a protocol.
+api_style = "auto"
+
+# Empty means llm_url from 03_llm.toml. For local_llm.py use
+# "http://127.0.0.1:14515/v1" and api_style = "openai".
+base_url = ""
+temperature = 0.4
+timeout = 20

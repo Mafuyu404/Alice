@@ -13,6 +13,7 @@ CORE_MODULE_NAMES: set[str] = {
     "model",
     "multi_chat",
     "multi_cli_runtime",
+    "plan",
     "runtime",
     "single_cli_runtime",
     "tool_handlers",
@@ -31,6 +32,7 @@ from .model import (
     new_causality_id,
     new_cycle_id,
 )
+from .plan import ActionPlan, ActionPlanNode, execute_action_plan
 from .runtime import ActionHandler, ActionRuntime
 from .tool_spec import (
     ActionToolRegistry,
@@ -44,6 +46,8 @@ __all__ = [
     "Action",
     "ActionBatch",
     "ActionHandler",
+    "ActionPlan",
+    "ActionPlanNode",
     "ActionToolRegistry",
     "ActionRuntime",
     "COMPAT_FACADE_MODULE_NAMES",
@@ -52,6 +56,7 @@ __all__ = [
     "ToolContext",
     "ToolResult",
     "ToolSpec",
+    "execute_action_plan",
     "new_action_id",
     "new_causality_id",
     "new_cycle_id",

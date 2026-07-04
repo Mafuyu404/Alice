@@ -58,6 +58,48 @@ class InnerStream:
             return ""
         return "【内在叙事流】\n" + self.text.strip()
 
+    def apply_patch(self, raw_patch: object, *, max_chars: int | None = None) -> dict:
+        """Apply an LLM-produced patch without parsing stream semantics."""
+        from kokoro.core import config as cfg
+        from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
+
+        before = self.text
+        debug = {
+            "before": before,
+            "after": before,
+            "applied": False,
+            "error": "",
+            "reason": "",
+        }
+        try:
+            patch = InnerStreamPatch.from_raw(raw_patch)
+            limit = int(max_chars or cfg.inner_stream_config().get("max_chars", 1200) or 1200)
+            result = apply_inner_stream_patch(before, patch, max_chars=limit)
+            debug["reason"] = result.reason
+            if result.applied:
+                self.text = result.text
+                self._save()
+                debug["after"] = self.text
+                debug["applied"] = True
+            lifecycle_debug.log(
+                "inner_stream.patch",
+                character_id=self.character_id,
+                applied=debug["applied"],
+                reason=debug["reason"],
+                before=before,
+                after=debug["after"],
+                patch=raw_patch,
+            )
+        except Exception as exc:
+            debug["error"] = str(exc)
+            lifecycle_debug.log(
+                "inner_stream.patch.error",
+                character_id=self.character_id,
+                error=str(exc),
+                patch=raw_patch,
+            )
+        return debug
+
     def evaluate(
         self,
         *,

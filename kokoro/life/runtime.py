@@ -1,0 +1,487 @@
+"""Autonomous life runtime skeleton."""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from kokoro.action import runtime as action_runtime_mod
+from kokoro.action import tool_spec
+from kokoro.action import tools as action_tools
+from kokoro.action.plan import ActionPlan, execute_action_plan
+from kokoro.action.tools import search_web as search_web_tool
+from kokoro.core import config as cfg
+from kokoro.core import input_events
+from kokoro.core import lifecycle_debug
+from kokoro.core import prompts
+from kokoro.life.context_compactor import ContextCompactor
+from kokoro.life.event_pool import InformationPool
+from kokoro.life.local_thinking import LocalThinking
+from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
+from kokoro.life.time_awareness import TimeAwareness
+
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+@dataclass
+class LifeTickResult:
+    processed_events: int
+    thought: str = ""
+    patch_applied: bool = False
+    thinking_intensity: int | None = None
+    action_plan: dict[str, Any] | None = None
+    action_plan_status: str = ""
+    action_plan_error: str = ""
+
+
+class LifeRuntime:
+    """Carries the life loop without taking judgment away from the LLM."""
+
+    def __init__(
+        self,
+        *,
+        session,
+        section: dict[str, Any] | None = None,
+        llm=None,
+        action_runtime=None,
+        root: Path | None = None,
+    ) -> None:
+        self.session = session
+        self.section = dict(section if section is not None else cfg.life_runtime_config())
+        self.enabled = bool(self.section.get("enabled", False))
+        self.root = Path(root or _ROOT)
+        self.pool = InformationPool(max_events=int(self.section.get("pool_max_events", 512) or 512))
+        self.time = TimeAwareness()
+        self.llm = llm or LocalThinking(self.section.get("local_thinking", {}))
+        self.tool_registry = tool_spec.ActionToolRegistry()
+        action_tools.register_all(self.tool_registry)
+        self.action_runtime = action_runtime or self._create_action_runtime()
+        self._available_actions = self._resolve_available_actions()
+        self.compactor = ContextCompactor(
+            character_id=getattr(session, "character_id", "default"),
+            root=self.root,
+            llm_call=self.llm.chat,
+            max_chars=int(self.section.get("context_max_chars", 8000) or 8000),
+        )
+        self._last_processed_sequence = 0
+        self._inner_stream_version = 0
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._loop_interval = float(self.section.get("idle_tick_seconds", 2.0) or 2.0)
+        lifecycle_debug.log(
+            "life.runtime.init",
+            character_id=getattr(session, "character_id", ""),
+            enabled=self.enabled,
+        )
+
+    def _create_action_runtime(self):
+        search_section = cfg.inner_stream_search_config()
+        search_client = search_web_tool.create_client(search_section)
+        merge_window = self.section.get("result_merge_window_seconds", 1.0)
+        if merge_window is None:
+            merge_window = 1.0
+        return action_runtime_mod.ActionRuntime(
+            session=self.session,
+            handlers={},
+            registry=self.tool_registry,
+            tool_context={
+                "tool_timeout": float(self.section.get("tool_timeout", 45.0) or 45.0),
+                "character_id": getattr(self.session, "character_id", "default"),
+                "memory_backend": getattr(self.session, "memory_backend", None),
+                "web_search_client": search_client,
+                "search_max_results": int(search_section.get("max_results", 5) or 5),
+                "search_max_event_chars": int(search_section.get("max_event_chars", 6000) or 6000),
+            },
+            merge_window_seconds=float(merge_window),
+        )
+
+    def start(self) -> None:
+        if not self.enabled:
+            lifecycle_debug.log("life.runtime.start.disabled")
+            return
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name=f"life-runtime-{getattr(self.session, 'character_id', 'unknown')}",
+        )
+        self._thread.start()
+        lifecycle_debug.log("life.runtime.start", interval=self._loop_interval)
+
+    def stop(self, *, wait: bool = True, timeout: float = 5.0) -> None:
+        self._stop.set()
+        self._wake.set()
+        thread = self._thread
+        if wait and thread and thread.is_alive():
+            thread.join(timeout=max(0.0, float(timeout)))
+        flush_pending = getattr(self.action_runtime, "flush_pending", None)
+        if callable(flush_pending):
+            flush_pending()
+        shutdown = getattr(self.action_runtime, "shutdown", None)
+        if callable(shutdown):
+            shutdown(wait=False)
+        lifecycle_debug.log("life.runtime.stop", wait=wait)
+
+    def submit(self, event: input_events.InputEvent) -> None:
+        self.time.mark_event(event_type=event.type)
+        pooled = self.pool.add(event)
+        self.compactor.append_event(event, self.pool.format_batch([pooled], max_chars=1200))
+        self._wake.set()
+
+    def attach_action_runtime(self, action_runtime) -> None:
+        self.action_runtime = action_runtime
+        self._available_actions = self._resolve_available_actions()
+        lifecycle_debug.log("life.runtime.action_runtime_attached", has_runtime=action_runtime is not None)
+
+    def tick_once(self, *, force: bool = False) -> LifeTickResult:
+        batch = self.pool.batch_since(
+            self._last_processed_sequence,
+            max_items=int(self.section.get("batch_max_events", 32) or 32),
+        )
+        if not batch and not force:
+            return LifeTickResult(processed_events=0)
+        if batch:
+            self._last_processed_sequence = max(item.sequence for item in batch)
+        inner_stream = _inner_stream_text(self.session)
+        time_context = self.time.render()
+        digest = self.compactor.compact_once(time_context=time_context, inner_stream=inner_stream)
+        event_text = self.pool.format_batch(batch, max_chars=int(self.section.get("batch_max_chars", 4000) or 4000))
+        thought = self._think(
+            inner_stream=inner_stream,
+            time_context=time_context,
+            digest=digest,
+            event_text=event_text,
+        )
+        self.time.mark_llm_thought()
+        patch_applied = self._apply_patch_from_thought(thought, inner_stream=inner_stream)
+        self._record_pending_threads_from_thought(thought)
+        action_plan = _extract_action_plan(thought)
+        intensity = _extract_intensity(thought)
+        action_plan_status = ""
+        action_plan_error = ""
+        if action_plan:
+            action_plan_status, action_plan_error = self._execute_action_plan(action_plan)
+        lifecycle_debug.log(
+            "life.runtime.tick_done",
+            processed_events=len(batch),
+            patch_applied=patch_applied,
+            thinking_intensity=intensity,
+            has_action_plan=bool(action_plan),
+            action_plan_status=action_plan_status,
+            action_plan_error=action_plan_error,
+        )
+        if intensity is not None:
+            self._loop_interval = self._interval_from_intensity(intensity)
+        return LifeTickResult(
+            processed_events=len(batch),
+            thought=thought,
+            patch_applied=patch_applied,
+            thinking_intensity=intensity,
+            action_plan=action_plan,
+            action_plan_status=action_plan_status,
+            action_plan_error=action_plan_error,
+        )
+
+    def _execute_action_plan(self, raw_plan: dict[str, Any]) -> tuple[str, str]:
+        if self.action_runtime is None:
+            lifecycle_debug.log("life.runtime.action_plan.no_runtime", action_plan=raw_plan)
+            return "rejected", "action runtime is not available"
+        try:
+            plan = ActionPlan.from_dict(raw_plan)
+            validation_error = self._validate_action_plan(plan)
+            if validation_error:
+                lifecycle_debug.log(
+                    "life.runtime.action_plan.rejected",
+                    plan=plan,
+                    error=validation_error,
+                )
+                return "rejected", validation_error
+            lifecycle_debug.log("life.runtime.action_plan.execute", plan=plan)
+            results = execute_action_plan(plan, self.action_runtime)
+            lifecycle_debug.log("life.runtime.action_plan.done", plan=plan, results=results)
+            return "executed", ""
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.action_plan.error", action_plan=raw_plan, error=str(exc))
+            return "error", str(exc)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            woke = self._wake.wait(timeout=max(0.05, self._loop_interval))
+            self._wake.clear()
+            if self._stop.is_set():
+                break
+            try:
+                self.tick_once(force=not woke)
+            except Exception as exc:
+                lifecycle_debug.log("life.runtime.loop_error", error=str(exc))
+
+    def _interval_from_intensity(self, intensity: int) -> float:
+        min_seconds = float(self.section.get("min_tick_seconds", 0.25) or 0.25)
+        max_seconds = float(self.section.get("max_tick_seconds", 8.0) or 8.0)
+        value = max(0, min(100, int(intensity)))
+        ratio = 1.0 - (value / 100.0)
+        return max(min_seconds, min(max_seconds, min_seconds + (max_seconds - min_seconds) * ratio))
+
+    def _think(self, *, inner_stream: str, time_context: str, digest: str, event_text: str) -> str:
+        character_name = str(getattr(self.session, "character_name", "") or getattr(self.session, "character_id", "AI"))
+        messages = [
+            {
+                "role": "system",
+                "content": str(prompts.get("life_runtime.tick_system", "")).replace("{name}", character_name),
+            },
+            {
+                "role": "user",
+                "content": prompts.format_prompt(
+                    "life_runtime.tick_user",
+                    name=character_name,
+                    inner_stream=inner_stream or "(empty)",
+                    time_context=time_context or "(none)",
+                    context_digest=digest or "(none)",
+                    tool_capabilities=self._tool_capabilities_text(),
+                    event_batch=event_text or "(no new external event; this can be time passing or continued thinking)",
+                    pending_threads=self.compactor.pending_threads() or "(none)",
+                    tool_results_digest=self.compactor.tool_results_digest() or "(none)",
+                ),
+            },
+        ]
+        return self.llm.chat(
+            messages,
+            {
+                "function": "life_tick",
+                "max_tokens": int(self.section.get("tick_max_tokens", 640) or 640),
+            },
+        )
+
+    def _tool_capabilities_text(self) -> str:
+        actions = sorted(self._available_actions)
+        schemas = self.tool_registry.enabled_schemas()
+        lines = ["Registered action names: " + ", ".join(actions)]
+        if schemas:
+            lines.append("Tool schemas:")
+            for schema in schemas:
+                fn = schema.get("function", {}) if isinstance(schema, dict) else {}
+                name = str(fn.get("name") or "").strip()
+                if name not in self._available_actions:
+                    continue
+                description = str(fn.get("description") or "").strip()
+                required = fn.get("parameters", {}).get("required", []) if isinstance(fn.get("parameters"), dict) else []
+                required_text = f" Required args: {', '.join(required)}." if required else ""
+                if name:
+                    lines.append(f"- {name}: {description}{required_text}")
+        return "\n".join(lines)
+
+    def _resolve_available_actions(self) -> set[str]:
+        actions = set(self.tool_registry.registered_actions())
+        context = getattr(self.action_runtime, "tool_context", {}) if self.action_runtime is not None else {}
+        unavailable: set[str] = set()
+        if context.get("say_resources") is None:
+            unavailable.update({"say", "say_precomputed"})
+        if not callable(context.get("qq_send_message")):
+            unavailable.add("send_qq_message")
+        if context.get("vts_controller") is None:
+            unavailable.add("vts_expression")
+        if context.get("vts_body_driver") is None and context.get("vts_arbiter") is None:
+            unavailable.add("vts_motion")
+        if context.get("retire_sticker_store") is None:
+            unavailable.add("retire_sticker")
+        memory_backend = context.get("memory_backend")
+        if memory_backend is None or not getattr(memory_backend, "ready", False):
+            unavailable.update({"search_memory", "save_to_memory"})
+        return actions - unavailable
+
+    def _missing_required_args(self, action_name: str, args: dict[str, Any]) -> list[str]:
+        missing: list[str] = []
+        for schema in self.tool_registry.enabled_schemas():
+            fn = schema.get("function", {}) if isinstance(schema, dict) else {}
+            if fn.get("name") != action_name:
+                continue
+            params = fn.get("parameters", {})
+            required = params.get("required", []) if isinstance(params, dict) else []
+            for key in required:
+                if not str(args.get(str(key)) or "").strip():
+                    missing.append(str(key))
+            return missing
+        return []
+
+    def _validate_action_plan(self, plan: ActionPlan) -> str:
+        for node in plan.nodes:
+            if node.tool not in self._available_actions:
+                return f"action is not available in this runtime: {node.tool}"
+            missing = self._missing_required_args(node.tool, node.args)
+            if node.tool == "write_conversation_memory" and not str(node.args.get("trigger_text") or "").strip():
+                missing.append("trigger_text")
+            if missing:
+                return f"action {node.tool} missing required args: {', '.join(dict.fromkeys(missing))}"
+        return ""
+
+    def _apply_patch_from_thought(self, thought: str, *, inner_stream: str) -> bool:
+        data = _extract_json(thought)
+        if not isinstance(data, dict):
+            return False
+        raw_patch = data.get("inner_stream_patch")
+        if not raw_patch:
+            return False
+        try:
+            patch = InnerStreamPatch.from_raw(raw_patch)
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.patch_parse_error", error=str(exc), raw_patch=raw_patch)
+            return False
+        if patch.base_version and patch.base_version != self._inner_stream_version:
+            lifecycle_debug.log(
+                "life.runtime.patch_version_mismatch",
+                expected=self._inner_stream_version,
+                actual=patch.base_version,
+            )
+        max_chars = int(cfg.inner_stream_config().get("max_chars", 1200) or 1200)
+        result = apply_inner_stream_patch(inner_stream, patch, max_chars=max_chars)
+        if not result.applied:
+            lifecycle_debug.log("life.runtime.patch_not_applied", reason=result.reason, patch=patch)
+            return self._rewrite_inner_stream_fallback(
+                inner_stream=inner_stream,
+                raw_patch=raw_patch,
+                failure_reason=result.reason,
+                max_chars=max_chars,
+            )
+        stream = getattr(self.session, "inner_stream", None)
+        if stream is None:
+            return False
+        before = getattr(stream, "text", "")
+        apply_patch = getattr(stream, "apply_patch", None)
+        if callable(apply_patch):
+            debug = apply_patch(raw_patch)
+            if not debug.get("applied"):
+                return False
+        else:
+            stream.text = result.text
+            save = getattr(stream, "_save", None)
+            if callable(save):
+                save()
+        self._inner_stream_version += 1
+        self.time.mark_inner_stream()
+        lifecycle_debug.log(
+            "life.runtime.patch_applied",
+            version=self._inner_stream_version,
+            before=before,
+            after=getattr(stream, "text", result.text),
+            reason=patch.reason,
+        )
+        return True
+
+    def _rewrite_inner_stream_fallback(
+        self,
+        *,
+        inner_stream: str,
+        raw_patch: object,
+        failure_reason: str,
+        max_chars: int,
+    ) -> bool:
+        stream = getattr(self.session, "inner_stream", None)
+        if stream is None:
+            return False
+        messages = [
+            {"role": "system", "content": prompts.get("life_runtime.patch_fallback_system", "")},
+            {
+                "role": "user",
+                "content": prompts.format_prompt(
+                    "life_runtime.patch_fallback_user",
+                    inner_stream=inner_stream or "(empty)",
+                    raw_patch=json.dumps(raw_patch, ensure_ascii=False, indent=2),
+                    failure_reason=failure_reason or "(unknown)",
+                ),
+            },
+        ]
+        text = self.llm.chat(
+            messages,
+            {
+                "function": "life_inner_stream_patch_fallback",
+                "max_tokens": int(self.section.get("fallback_max_tokens", 640) or 640),
+            },
+        ).strip()
+        if not text:
+            return False
+        debug = None
+        apply_patch = getattr(stream, "apply_patch", None)
+        full_patch = {"full_text": text[-max(200, int(max_chars)) :]}
+        if callable(apply_patch):
+            debug = apply_patch(full_patch, max_chars=max_chars)
+            applied = bool(debug.get("applied"))
+        else:
+            stream.text = full_patch["full_text"]
+            save = getattr(stream, "_save", None)
+            if callable(save):
+                save()
+            applied = True
+        if applied:
+            self._inner_stream_version += 1
+            self.time.mark_inner_stream()
+        lifecycle_debug.log(
+            "life.runtime.patch_fallback",
+            applied=applied,
+            failure_reason=failure_reason,
+            debug=debug,
+        )
+        return applied
+
+    def _record_pending_threads_from_thought(self, thought: str) -> None:
+        data = _extract_json(thought)
+        if not isinstance(data, dict):
+            return
+        value = data.get("pending_threads")
+        if isinstance(value, list):
+            text = "\n".join(str(item).strip() for item in value if str(item).strip())
+        else:
+            text = str(value or "").strip()
+        if text:
+            self.compactor.record_pending_threads(text)
+
+
+def _inner_stream_text(session) -> str:
+    stream = getattr(session, "inner_stream", None)
+    return str(getattr(stream, "text", "") or "").strip()
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    raw = re.sub(r"```(?:json)?\s*\n?(.*?)```", r"\1", str(text or ""), flags=re.DOTALL).strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_action_plan(text: str) -> dict[str, Any] | None:
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        return None
+    plan = data.get("action_plan")
+    if not isinstance(plan, dict):
+        return None
+    actions = plan.get("actions") or plan.get("nodes") or []
+    if not actions:
+        return None
+    return plan
+
+
+def _extract_intensity(text: str) -> int | None:
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        return None
+    value = data.get("thinking_intensity")
+    try:
+        return max(0, min(100, int(value)))
+    except Exception:
+        return None

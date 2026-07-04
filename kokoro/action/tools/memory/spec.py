@@ -53,15 +53,15 @@ WRITE_CONVERSATION_MEMORY_SCHEMA = {
     "type": "function",
     "function": {
         "name": "write_conversation_memory",
-        "description": "Queue a completed conversation turn for memory sedimentation.",
+        "description": "Queue a completed external conversation turn for memory sedimentation. Do not use this to save inner_stream text.",
         "parameters": {
             "type": "object",
             "properties": {
-                "trigger_text": {"type": "string"},
-                "reply": {"type": "string"},
+                "trigger_text": {"type": "string", "description": "The external input or conversation text that triggered the reply."},
+                "reply": {"type": "string", "description": "The actual outward reply that was said in that conversation turn."},
                 "speaker_id": {"type": "string"},
             },
-            "required": ["reply"],
+            "required": ["trigger_text", "reply"],
         },
     },
 }

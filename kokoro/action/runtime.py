@@ -253,6 +253,19 @@ class ActionRuntime:
         lifecycle_debug.log("action_runtime.result.merge_flush_many", causality_id=key, events=events, merged=merged)
         self._publish(merged)
 
+    def flush_pending(self) -> None:
+        with self._lock:
+            keys = list(self._pending)
+            timers = list(self._timers.values())
+        for timer in timers:
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        lifecycle_debug.log("action_runtime.result.flush_pending", keys=keys)
+        for key in keys:
+            self._flush_key(key)
+
     def _publish(self, event: input_events.InputEvent) -> None:
         bus = getattr(self.session, "event_bus", None)
         if bus is not None and hasattr(bus, "publish"):
@@ -263,6 +276,7 @@ class ActionRuntime:
 
     def shutdown(self, *, wait: bool = True, timeout: float = 5.0) -> None:
         lifecycle_debug.log("action_runtime.shutdown.start", wait=wait, timeout=timeout)
+        self.flush_pending()
         with self._lock:
             timers = list(self._timers.values())
             threads = list(self._threads)

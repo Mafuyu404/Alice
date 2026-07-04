@@ -380,6 +380,13 @@ def autonomous_step_config() -> dict:
     return section
 
 
+def life_runtime_config() -> dict:
+    section = get("life_runtime", {})
+    if not isinstance(section, dict):
+        section = {}
+    return section
+
+
 def inner_memory_config() -> dict:
     section = get("inner_memory", {})
     if not isinstance(section, dict):

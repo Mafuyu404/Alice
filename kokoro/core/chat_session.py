@@ -53,6 +53,7 @@ class ChatSession:
     event_bus: object = field(default=None)  # InputEventBus
     inner_stream_loop: object = field(default=None)  # InnerStreamLoop
     autonomous_step: object = field(default=None)  # AutonomousStep
+    life_runtime: object = field(default=None)  # LifeRuntime
     # Scene type — determines information source layout and guidance prompt
     _scene: object = field(default=None)  # scene_mod.SceneType | None
     # Config overrides — applied on top of the per-character config.toml
@@ -100,7 +101,25 @@ class ChatSession:
             self.input_registry = input_events.default_registry()
         if self.event_bus is None:
             self.event_bus = input_events.InputEventBus()
-        if self.inner_stream_loop is None:
+        life_primary = False
+        if self.life_runtime is None:
+            from kokoro.core import config as _cfg
+            life_section = _cfg.life_runtime_config()
+            if bool(life_section.get("enabled", False)):
+                try:
+                    from kokoro.life import LifeRuntime
+                    self.life_runtime = LifeRuntime(session=self, section=life_section)
+                    life_primary = bool(life_section.get("primary", True))
+                    self.event_bus.subscribe(self.life_runtime.submit)
+                    self.life_runtime.start()
+                    lifecycle_debug.log("chat_session.life_runtime.created", character_id=self.character_id)
+                except Exception as exc:
+                    logger.warning("failed to initialize life runtime: %s", exc)
+                    lifecycle_debug.log("chat_session.life_runtime.error", character_id=self.character_id, error=str(exc))
+        if self.life_runtime is not None:
+            from kokoro.core import config as _cfg
+            life_primary = bool(_cfg.life_runtime_config().get("primary", True))
+        if self.inner_stream_loop is None and not life_primary:
             from kokoro.core import config as _cfg
             search_section = _cfg.inner_stream_search_config()
             output_handlers = []
@@ -141,6 +160,11 @@ class ChatSession:
                     memory_reflector=memory_reflector,
                     cognition_reflector=cognition_reflector,
                 )
+                life_runtime = getattr(self, "life_runtime", None)
+                attach_action_runtime = getattr(life_runtime, "attach_action_runtime", None)
+                action_runtime = getattr(self.autonomous_step, "_runtime", None)
+                if callable(attach_action_runtime) and action_runtime is not None:
+                    attach_action_runtime(action_runtime)
                 output_handlers.append(self.autonomous_step.consider_after_inner_stream)
                 lifecycle_debug.log("chat_session.autonomous_step.created", character_id=self.character_id)
             except Exception as exc:
