@@ -19,12 +19,14 @@ from kokoro.action.tools import search_web as search_web_tool
 from kokoro.core import config as cfg
 from kokoro.core import input_events
 from kokoro.core import lifecycle_debug
-from kokoro.core import prompts
 from kokoro.life.context_compactor import ContextCompactor
 from kokoro.life.event_pool import InformationPool
 from kokoro.life.local_thinking import LocalThinking
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
 from kokoro.life.time_awareness import TimeAwareness
+from kokoro.prompt import PromptContext, PromptManager
+from kokoro.prompt.contracts import LIFE_JSON_REPAIR_SCENE, LIFE_PATCH_FALLBACK_SCENE, LIFE_TICK_SCENE
+from kokoro.prompt.tools import discover_tool_prompt_specs, render_tool_catalog
 
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -60,8 +62,17 @@ class LifeRuntime:
         self.pool = InformationPool(max_events=int(self.section.get("pool_max_events", 512) or 512))
         self.time = TimeAwareness()
         self.llm = llm or LocalThinking(self.section.get("local_thinking", {}))
+        memory_system = getattr(self.session, "memory_system", None)
+        consolidator = getattr(memory_system, "consolidator", None)
+        if consolidator is not None and getattr(consolidator, "llm_call", None) is None:
+            consolidator.llm_call = self.llm.chat
+        set_lifecycle_llm = getattr(memory_system, "set_lifecycle_llm", None)
+        if callable(set_lifecycle_llm):
+            set_lifecycle_llm(self.llm.chat)
+        self.prompt_manager = PromptManager()
         self.tool_registry = tool_spec.ActionToolRegistry()
         action_tools.register_all(self.tool_registry)
+        self.tool_prompt_specs = discover_tool_prompt_specs(self.root / "kokoro" / "action" / "tools")
         self.action_runtime = action_runtime or self._create_action_runtime()
         self._availability_cache: dict[str, tuple[float, bool]] = {}
         self._available_actions = self._resolve_available_actions()
@@ -70,6 +81,7 @@ class LifeRuntime:
             root=self.root,
             llm_call=self.llm.chat,
             max_chars=int(self.section.get("context_max_chars", 8000) or 8000),
+            prompt_manager=self.prompt_manager,
         )
         self._last_processed_sequence = 0
         self._inner_stream_version = 0
@@ -77,6 +89,7 @@ class LifeRuntime:
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop_interval = float(self.section.get("idle_tick_seconds", 2.0) or 2.0)
+        self._last_prompt_trace_dir: str | None = None
         lifecycle_debug.log(
             "life.runtime.init",
             character_id=getattr(session, "character_id", ""),
@@ -96,6 +109,7 @@ class LifeRuntime:
             tool_context={
                 "tool_timeout": float(self.section.get("tool_timeout", 45.0) or 45.0),
                 "character_id": getattr(self.session, "character_id", "default"),
+                "memory_system": getattr(self.session, "memory_system", None),
                 "memory_backend": getattr(self.session, "memory_backend", None),
                 "web_search_client": search_client,
                 "search_max_results": int(search_section.get("max_results", 5) or 5),
@@ -117,6 +131,14 @@ class LifeRuntime:
             name=f"life-runtime-{getattr(self.session, 'character_id', 'unknown')}",
         )
         self._thread.start()
+        memory_system = getattr(self.session, "memory_system", None)
+        start_lifecycle = getattr(memory_system, "start_lifecycle_worker", None)
+        if callable(start_lifecycle):
+            memory_section = dict(self.section.get("memory_lifecycle", {}) or {})
+            start_lifecycle(
+                interval_seconds=float(memory_section.get("interval_seconds", 20.0) or 20.0),
+                max_batches_per_wake=int(memory_section.get("max_batches_per_wake", 3) or 3),
+            )
         lifecycle_debug.log("life.runtime.start", interval=self._loop_interval)
 
     def stop(self, *, wait: bool = True, timeout: float = 5.0) -> None:
@@ -131,6 +153,10 @@ class LifeRuntime:
         shutdown = getattr(self.action_runtime, "shutdown", None)
         if callable(shutdown):
             shutdown(wait=False)
+        memory_system = getattr(self.session, "memory_system", None)
+        stop_lifecycle = getattr(memory_system, "stop_lifecycle_worker", None)
+        if callable(stop_lifecycle):
+            stop_lifecycle(wait=wait)
         lifecycle_debug.log("life.runtime.stop", wait=wait)
 
     def submit(self, event: input_events.InputEvent) -> None:
@@ -164,6 +190,7 @@ class LifeRuntime:
             event_text=event_text,
         )
         data = _extract_json(thought)
+        self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=None)
         lifecycle_debug.log(
             "life.runtime.thought_raw",
             chars=len(thought or ""),
@@ -199,6 +226,7 @@ class LifeRuntime:
         patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
         self._record_pending_threads_from_data(data)
         action_plan = _extract_action_plan_from_data(data)
+        self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
         intensity = _extract_intensity_from_data(data)
         action_plan_status = ""
         action_plan_error = ""
@@ -267,27 +295,41 @@ class LifeRuntime:
 
     def _think(self, *, inner_stream: str, time_context: str, digest: str, event_text: str) -> str:
         character_name = str(getattr(self.session, "character_name", "") or getattr(self.session, "character_id", "AI"))
-        messages = [
-            {
-                "role": "system",
-                "content": str(prompts.get("life_runtime.tick_system", "")).replace("{name}", character_name),
+        character_profile = _character_profile_text(self.session)
+        cognition_context = _cognition_context_text(self.session, event_text=event_text)
+        memory_context = self._memory_context(event_text=event_text, inner_stream=inner_stream, digest=digest)
+        trace_dir = None
+        debug_dir = self.section.get("prompt_trace_dir")
+        if debug_dir:
+            trace_dir = str(Path(debug_dir) / f"{int(time.time() * 1000)}_life_tick")
+        self._last_prompt_trace_dir = trace_dir
+        ctx = PromptContext(
+            scene=LIFE_TICK_SCENE,
+            character_id=str(getattr(self.session, "character_id", "") or ""),
+            character_name=character_name,
+            debug_mode=bool(self.section.get("debug", False)),
+            trace_dir=trace_dir,
+            values={
+                "character_profile": character_profile or "(none)",
+                "cognition_context": cognition_context or "(none)",
+                "memory_context": memory_context or "(none)",
+                "inner_stream": inner_stream or "(empty)",
+                "inner_stream_version": self._inner_stream_version,
+                "time_context": time_context or "(none)",
+                "context_digest": digest or "(none)",
+                "tool_capabilities": self._tool_capabilities_text(),
+                "event_batch": event_text or "(no new external event; this can be time passing or continued thinking)",
+                "pending_threads": self.compactor.pending_threads() or "(none)",
+                "tool_results_digest": self.compactor.tool_results_digest() or "(none)",
             },
-            {
-                "role": "user",
-                "content": prompts.format_prompt(
-                    "life_runtime.tick_user",
-                    name=character_name,
-                    inner_stream=inner_stream or "(empty)",
-                    inner_stream_version=self._inner_stream_version,
-                    time_context=time_context or "(none)",
-                    context_digest=digest or "(none)",
-                    tool_capabilities=self._tool_capabilities_text(),
-                    event_batch=event_text or "(no new external event; this can be time passing or continued thinking)",
-                    pending_threads=self.compactor.pending_threads() or "(none)",
-                    tool_results_digest=self.compactor.tool_results_digest() or "(none)",
-                ),
-            },
-        ]
+        )
+        messages = self.prompt_manager.render(LIFE_TICK_SCENE, ctx)
+        lifecycle_debug.log(
+            "life.runtime.prompt_rendered",
+            scene=LIFE_TICK_SCENE,
+            messages=len(messages),
+            trace_dir=trace_dir or "",
+        )
         return self.llm.chat(
             messages,
             {
@@ -296,20 +338,70 @@ class LifeRuntime:
             },
         )
 
+    def _memory_context(self, *, event_text: str, inner_stream: str, digest: str) -> str:
+        memory_system = getattr(self.session, "memory_system", None)
+        if memory_system is not None:
+            try:
+                return str(
+                    memory_system.default_context(
+                        event_text=event_text,
+                        inner_stream=inner_stream,
+                        recent_digest=digest,
+                        pending_threads=self.compactor.pending_threads(),
+                    )
+                    or ""
+                ).strip()
+            except Exception as exc:
+                lifecycle_debug.log("life.runtime.memory_system_context_error", error=str(exc))
+
+        backend = getattr(self.session, "memory_backend", None)
+        if backend is None or not getattr(backend, "ready", False):
+            return ""
+        query = "\n".join(
+            part
+            for part in (
+                str(event_text or "").strip(),
+                str(inner_stream or "").strip(),
+                str(digest or "").strip(),
+            )
+            if part
+        )[:1200]
+        if not query:
+            character_data = getattr(self.session, "character_data", {}) or {}
+            query = " ".join(
+                str(character_data.get(key) or "")
+                for key in ("description", "personality", "background", "relationship")
+            )[:1200]
+        if not query:
+            return ""
+        try:
+            from kokoro.core import memory as memory_mod
+
+            user_ids = memory_mod.context_user_ids(
+                str(getattr(self.session, "character_id", "default") or "default"),
+            )
+            if hasattr(backend, "get_context_multi"):
+                return str(backend.get_context_multi(query, user_ids) or "").strip()
+            return str(backend.get_context(query, user_id=user_ids[0]) or "").strip()
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.memory_context_error", error=str(exc))
+            return ""
+
     def _repair_json_thought(self, raw: str, *, parse_reason: str) -> str:
         if not str(raw or "").strip():
             return ""
-        messages = [
-            {"role": "system", "content": prompts.get("life_runtime.json_repair_system", "")},
-            {
-                "role": "user",
-                "content": prompts.format_prompt(
-                    "life_runtime.json_repair_user",
-                    parse_reason=parse_reason or "(unknown)",
-                    raw_output=raw,
-                ),
-            },
-        ]
+        messages = self.prompt_manager.render(
+            LIFE_JSON_REPAIR_SCENE,
+            PromptContext(
+                scene=LIFE_JSON_REPAIR_SCENE,
+                character_id=str(getattr(self.session, "character_id", "") or ""),
+                character_name=str(getattr(self.session, "character_name", "") or ""),
+                values={
+                    "parse_reason": parse_reason or "(unknown)",
+                    "raw_output": raw,
+                },
+            ),
+        )
         try:
             return self.llm.chat(
                 messages,
@@ -322,10 +414,38 @@ class LifeRuntime:
             lifecycle_debug.log("life.runtime.thought_repair_error", error=str(exc))
             return ""
 
+    def _write_prompt_trace_result(
+        self,
+        *,
+        llm_raw: str,
+        parsed: dict[str, Any] | None,
+        tool_plan: dict[str, Any] | None,
+    ) -> None:
+        if not self._last_prompt_trace_dir:
+            return
+        try:
+            trace_path = Path(self._last_prompt_trace_dir)
+            trace_path.mkdir(parents=True, exist_ok=True)
+            (trace_path / "llm_raw.txt").write_text(str(llm_raw or ""), encoding="utf-8")
+            (trace_path / "parsed.json").write_text(
+                json.dumps(parsed or {}, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            (trace_path / "tool_plan.json").write_text(
+                json.dumps(tool_plan or {}, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.prompt_trace_write_error", error=str(exc))
+
     def _tool_capabilities_text(self) -> str:
         actions = sorted(self._available_actions)
         schemas = self.tool_registry.enabled_schemas()
         lines = ["Registered action names: " + ", ".join(actions)]
+        prompt_catalog = render_tool_catalog(self.tool_prompt_specs, actions)
+        if prompt_catalog:
+            lines.append("Tool prompt catalog:")
+            lines.append(prompt_catalog)
         if schemas:
             lines.append("Tool schemas:")
             for schema in schemas:
@@ -354,8 +474,9 @@ class LifeRuntime:
             unavailable.add("vts_motion")
         if context.get("retire_sticker_store") is None:
             unavailable.add("retire_sticker")
+        memory_system = context.get("memory_system")
         memory_backend = context.get("memory_backend")
-        if memory_backend is None or not getattr(memory_backend, "ready", False):
+        if memory_system is None and (memory_backend is None or not getattr(memory_backend, "ready", False)):
             unavailable.update({"search_memory", "save_to_memory"})
         if not self._cached_availability("search_web", lambda: _web_search_available(context.get("web_search_client"))):
             unavailable.add("search_web")
@@ -466,18 +587,19 @@ class LifeRuntime:
         stream = getattr(self.session, "inner_stream", None)
         if stream is None:
             return False
-        messages = [
-            {"role": "system", "content": prompts.get("life_runtime.patch_fallback_system", "")},
-            {
-                "role": "user",
-                "content": prompts.format_prompt(
-                    "life_runtime.patch_fallback_user",
-                    inner_stream=inner_stream or "(empty)",
-                    raw_patch=json.dumps(raw_patch, ensure_ascii=False, indent=2),
-                    failure_reason=failure_reason or "(unknown)",
-                ),
-            },
-        ]
+        messages = self.prompt_manager.render(
+            LIFE_PATCH_FALLBACK_SCENE,
+            PromptContext(
+                scene=LIFE_PATCH_FALLBACK_SCENE,
+                character_id=str(getattr(self.session, "character_id", "") or ""),
+                character_name=str(getattr(self.session, "character_name", "") or ""),
+                values={
+                    "inner_stream": inner_stream or "(empty)",
+                    "raw_patch": json.dumps(raw_patch, ensure_ascii=False, indent=2),
+                    "failure_reason": failure_reason or "(unknown)",
+                },
+            ),
+        )
         text = self.llm.chat(
             messages,
             {
@@ -528,6 +650,36 @@ class LifeRuntime:
 def _inner_stream_text(session) -> str:
     stream = getattr(session, "inner_stream", None)
     return str(getattr(stream, "text", "") or "").strip()
+
+
+def _character_profile_text(session) -> str:
+    data = getattr(session, "character_data", {}) or {}
+    parts = []
+    for label, key in (
+        ("description", "description"),
+        ("personality", "personality"),
+        ("background", "background"),
+        ("relationship", "relationship"),
+        ("scene", "scene"),
+    ):
+        value = str(data.get(key) or "").strip()
+        if value:
+            parts.append(f"{label}: {value}")
+    return "\n".join(parts).strip()
+
+
+def _cognition_context_text(session, *, event_text: str) -> str:
+    cognition = getattr(session, "cognition", None)
+    if cognition is None:
+        return ""
+    try:
+        if event_text and hasattr(cognition, "get_context_for_text"):
+            return str(cognition.get_context_for_text(event_text) or "").strip()
+        if hasattr(cognition, "get_context"):
+            return str(cognition.get_context() or "").strip()
+    except Exception as exc:
+        lifecycle_debug.log("life.runtime.cognition_context_error", error=str(exc))
+    return ""
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:

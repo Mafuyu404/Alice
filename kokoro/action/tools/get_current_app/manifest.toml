@@ -1,0 +1,6 @@
+id = "get_current_app"
+name = "get_current_app"
+actions = ["get_current_app"]
+description = "Read the foreground application and process without screen contents."
+needs_prepare_llm = false
+needs_after_llm = false

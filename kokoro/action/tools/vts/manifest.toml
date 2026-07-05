@@ -1,0 +1,6 @@
+id = "vts"
+name = "vts"
+actions = ["vts_expression", "vts_motion"]
+description = "Control Live2D expression or motion when embodied output is available."
+needs_prepare_llm = false
+needs_after_llm = false

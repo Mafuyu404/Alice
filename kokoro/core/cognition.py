@@ -115,7 +115,7 @@ class CognitionStore:
             "saved": False,
             "error": "",
         }
-        system_prompt = prompts.format_prompt("cognition.evaluate_system", name=character_name, user_name=user_name)
+        system_prompt = prompts.format_prompt("cognition.evaluate_system", name=character_name)
         user_prompt = prompts.format_prompt(
             "cognition.evaluate_user",
             existing=existing,
@@ -123,7 +123,6 @@ class CognitionStore:
             summary=summary,
             memories=memories,
             name=character_name,
-            user_name=user_name,
         )
         debug["system_prompt"] = system_prompt
         debug["user_prompt"] = user_prompt

@@ -160,6 +160,14 @@ class InnerCognitionReflection:
             self._lock.release()
 
     def _lookup_memory(self, query: str) -> str:
+        memory_system = getattr(self.session, "memory_system", None)
+        if memory_system is not None:
+            try:
+                result = str(memory_system.deep_recall(str(query or "")[:500]) or "").strip()
+                if result:
+                    return result
+            except Exception:
+                pass
         backend = getattr(self.session, "memory_backend", None)
         if backend is None or not hasattr(backend, "get_context_multi"):
             return ""
@@ -170,7 +178,6 @@ class InnerCognitionReflection:
                 str(query or "")[:500],
                 memory_mod.context_user_ids(
                     getattr(self.session, "character_id", ""),
-                    getattr(self.session, "memory_counterpart", "") or getattr(self.session, "user_name", ""),
                 ),
             ) or ""
         except Exception:

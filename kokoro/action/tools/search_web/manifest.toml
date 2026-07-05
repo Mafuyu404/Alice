@@ -1,0 +1,8 @@
+id = "search_web"
+name = "search_web"
+actions = ["search_web"]
+description = "Search public web information when the current situation needs external facts."
+needs_prepare_llm = true
+needs_after_llm = true
+prepare_prompt = "prepare.md"
+after_prompt = "after.md"

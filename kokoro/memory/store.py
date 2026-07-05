@@ -1,0 +1,261 @@
+"""SQLite store for Alice-owned memory records."""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+import sqlite3
+from contextlib import closing
+from pathlib import Path
+from typing import Any
+
+from kokoro.memory.models import MemoryRecord, MemoryRecordDraft, clamp01, new_id, now_iso
+
+
+class MemoryStore:
+    def __init__(self, *, character_id: str, root: Path) -> None:
+        self.character_id = character_id
+        self.root = Path(root)
+        self.path = self.root / "characters" / character_id / "memory" / "store.sqlite"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_schema()
+
+    def write(self, draft: MemoryRecordDraft) -> MemoryRecord:
+        record_id = new_id("mem")
+        now = now_iso()
+        keywords = _clean_list(draft.keywords) or _keywords(draft.content)
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                """
+                insert into memory_records (
+                  id, character_id, record_form, content, summary, created_at, updated_at,
+                  last_accessed_at, last_diffused_at, access_count, direct_access_count,
+                  diffused_access_count, importance, emotional_impact, keywords_json,
+                  tags_json, source_event_ids_json, evidence_json, related_memory_ids_json,
+                  metadata_json, index_status, deleted_at
+                ) values (?, ?, ?, ?, ?, ?, ?, '', '', 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '')
+                """,
+                    (
+                        record_id,
+                        draft.character_id,
+                        draft.record_form,
+                        draft.content.strip(),
+                        draft.summary.strip(),
+                        now,
+                        now,
+                        clamp01(draft.importance, 0.5),
+                        max(-1.0, min(1.0, float(draft.emotional_impact or 0.0))),
+                        json.dumps(keywords, ensure_ascii=False),
+                        json.dumps(_clean_list(draft.tags), ensure_ascii=False),
+                        json.dumps(_clean_list(draft.source_event_ids), ensure_ascii=False),
+                        json.dumps(draft.evidence or [], ensure_ascii=False, default=str),
+                        json.dumps(_clean_list(draft.related_memory_ids), ensure_ascii=False),
+                        json.dumps(draft.metadata or {}, ensure_ascii=False, default=str),
+                    ),
+                )
+        self._link_new_record(record_id)
+        return self.get(record_id)  # type: ignore[return-value]
+
+    def get(self, record_id: str) -> MemoryRecord | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("select * from memory_records where id = ? and deleted_at = ''", (record_id,)).fetchone()
+        return MemoryRecord.from_row(row) if row else None
+
+    def search(self, query: str, *, limit: int = 8) -> list[MemoryRecord]:
+        terms = _keywords(query)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "select * from memory_records where character_id = ? and deleted_at = ''",
+                (self.character_id,),
+            ).fetchall()
+        records = [MemoryRecord.from_row(row) for row in rows]
+        now_ranked: list[MemoryRecord] = []
+        for record in records:
+            record.score = self._score(record, terms)
+            if record.score > 0:
+                now_ranked.append(record)
+        now_ranked.sort(key=lambda item: item.score, reverse=True)
+        return now_ranked[: max(1, int(limit))]
+
+    def recent(self, *, limit: int = 8) -> list[MemoryRecord]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                select * from memory_records
+                where character_id = ? and deleted_at = ''
+                order by created_at desc
+                limit ?
+                """,
+                (self.character_id, max(1, int(limit))),
+            ).fetchall()
+        return [MemoryRecord.from_row(row) for row in rows]
+
+    def link(self, from_id: str, to_id: str, *, link_type: str, weight: float = 0.5) -> None:
+        if not from_id or not to_id or from_id == to_id:
+            return
+        now = now_iso()
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                """
+                insert or ignore into memory_links (
+                  id, character_id, from_memory_id, to_memory_id, link_type, weight, created_at, updated_at
+                ) values (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (new_id("lnk"), self.character_id, from_id, to_id, link_type, clamp01(weight, 0.5), now, now),
+                )
+
+    def neighbors(self, record_id: str, *, limit: int = 4) -> list[MemoryRecord]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                select r.*, l.weight as link_weight
+                from memory_links l
+                join memory_records r on r.id = l.to_memory_id
+                where l.character_id = ? and l.from_memory_id = ? and r.deleted_at = ''
+                order by l.weight desc, r.created_at desc
+                limit ?
+                """,
+                (self.character_id, record_id, max(1, int(limit))),
+            ).fetchall()
+        records = []
+        for row in rows:
+            record = MemoryRecord.from_row(row)
+            record.score = float(row["link_weight"] or 0.0)
+            records.append(record)
+        return records
+
+    def record_access(self, record_ids: list[str], *, diffuse: bool = True) -> None:
+        now = now_iso()
+        with closing(self._connect()) as conn:
+            with conn:
+                for record_id in dict.fromkeys(record_ids):
+                    conn.execute(
+                    """
+                    update memory_records
+                    set access_count = access_count + 1,
+                        direct_access_count = direct_access_count + 1,
+                        last_accessed_at = ?,
+                        updated_at = ?
+                    where id = ? and deleted_at = ''
+                    """,
+                        (now, now, record_id),
+                    )
+                    if not diffuse:
+                        continue
+                    links = conn.execute(
+                        "select to_memory_id, weight from memory_links where character_id = ? and from_memory_id = ?",
+                        (self.character_id, record_id),
+                    ).fetchall()
+                    for link in links:
+                        inc = 0.35 * float(link["weight"] or 0.0)
+                        if inc <= 0:
+                            continue
+                        conn.execute(
+                            """
+                            update memory_records
+                            set access_count = access_count + ?,
+                                diffused_access_count = diffused_access_count + ?,
+                                last_diffused_at = ?,
+                                updated_at = ?
+                            where id = ? and deleted_at = ''
+                            """,
+                            (inc, inc, now, now, link["to_memory_id"]),
+                        )
+
+    def _score(self, record: MemoryRecord, terms: list[str]) -> float:
+        text = " ".join([record.content, record.summary, " ".join(record.keywords), " ".join(record.tags)]).lower()
+        if not terms:
+            lexical = 0.1
+        else:
+            hits = sum(1 for term in terms if term.lower() in text)
+            lexical = hits / max(1, len(terms))
+        if lexical <= 0 and record.record_form != "open_thread":
+            return 0.0
+        access = min(0.25, math.log1p(record.access_count) * 0.05)
+        importance = record.importance * 0.25
+        emotional = abs(record.emotional_impact) * 0.08
+        open_thread = 0.12 if record.record_form == "open_thread" else 0.0
+        return lexical + access + importance + emotional + open_thread
+
+    def _link_new_record(self, record_id: str) -> None:
+        recent = self.recent(limit=8)
+        for other in recent:
+            if other.id == record_id:
+                continue
+            self.link(record_id, other.id, link_type="temporal_near", weight=0.35)
+            self.link(other.id, record_id, link_type="temporal_near", weight=0.25)
+
+    def _init_schema(self) -> None:
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                """
+                create table if not exists memory_records (
+                  id text primary key,
+                  character_id text not null,
+                  record_form text not null,
+                  content text not null,
+                  summary text not null default '',
+                  created_at text not null,
+                  updated_at text not null,
+                  last_accessed_at text not null default '',
+                  last_diffused_at text not null default '',
+                  access_count real not null default 0,
+                  direct_access_count real not null default 0,
+                  diffused_access_count real not null default 0,
+                  importance real not null default 0.5,
+                  emotional_impact real not null default 0,
+                  keywords_json text not null default '[]',
+                  tags_json text not null default '[]',
+                  source_event_ids_json text not null default '[]',
+                  evidence_json text not null default '[]',
+                  related_memory_ids_json text not null default '[]',
+                  metadata_json text not null default '{}',
+                  index_status text not null default 'pending',
+                  deleted_at text not null default ''
+                )
+                """
+            )
+                conn.execute(
+                """
+                create table if not exists memory_links (
+                  id text primary key,
+                  character_id text not null,
+                  from_memory_id text not null,
+                  to_memory_id text not null,
+                  link_type text not null,
+                  weight real not null default 0.5,
+                  created_at text not null,
+                  updated_at text not null,
+                  unique(character_id, from_memory_id, to_memory_id, link_type)
+                )
+                """
+            )
+                conn.execute("create index if not exists idx_memory_records_character on memory_records(character_id)")
+                conn.execute("create index if not exists idx_memory_links_from on memory_links(character_id, from_memory_id)")
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+
+def _clean_list(values: list[Any]) -> list[str]:
+    result = []
+    for value in values or []:
+        text = str(value or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result[:24]
+
+
+def _keywords(text: str) -> list[str]:
+    raw = re.findall(r"[\w\u4e00-\u9fff]{2,}", str(text or "").lower())
+    result: list[str] = []
+    for item in raw:
+        if item not in result:
+            result.append(item)
+    return result[:24]

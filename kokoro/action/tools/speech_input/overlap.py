@@ -95,7 +95,7 @@ class OverlapClassifier:
         """Call the overlap classification model."""
         system_prompt = prompts.get("overlap.system")
         user_prompt = prompts.format_prompt(
-            "overlap.user",
+            "overlap.user_template",
             user_text=text,
             ai_context=ai_context or "（无）",
         )
@@ -103,7 +103,7 @@ class OverlapClassifier:
             return self._fallback_classify(text)
 
         user_prompt = prompts.format_prompt(
-            "overlap.user",
+            "overlap.user_template",
             ai_context=ai_context or "（无）",
             user_text=text,
         )

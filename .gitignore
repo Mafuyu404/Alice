@@ -37,6 +37,8 @@ test_runs
 tests/*
 !tests/test_action_batch_runtime.py
 !tests/test_life_runtime.py
+!tests/test_memory_life_system.py
+!tests/test_prompt_management.py
 scripts/*
 !scripts/run_life_runtime_debug.py
 

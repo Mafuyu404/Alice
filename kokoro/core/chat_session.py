@@ -49,6 +49,7 @@ class ChatSession:
     _cognition_turn_counter: int = 0
     # Memory event store (structured event extraction)
     memory_events: object = field(default=None)  # MemoryEventStore
+    memory_system: object = field(default=None)  # kokoro.memory.MemorySystem
     input_registry: object = field(default=None)  # InputTypeRegistry
     event_bus: object = field(default=None)  # InputEventBus
     inner_stream_loop: object = field(default=None)  # InnerStreamLoop
@@ -78,6 +79,7 @@ class ChatSession:
         from kokoro.core.emotion import EmotionState
         from kokoro.core.inner_stream import InnerStream, InnerStreamLoop
         from kokoro.core.memory_events import MemoryEventStore
+        from kokoro.memory import create_memory_system
         if self.cognition is None:
             self.cognition = CognitionStore(self.character_id, self.character_data)
         if self.emotion is None:
@@ -95,8 +97,18 @@ class ChatSession:
                 character_id=self.character_id,
                 reset_on_start=bool(section.get("reset_on_start", True)),
             )
+        if self.memory_system is None:
+            self.memory_system = create_memory_system(
+                character_id=self.character_id,
+                root=_PROJECT_ROOT,
+                vector_backend=self.memory_backend,
+            )
         if self.memory_events is None:
-            self.memory_events = MemoryEventStore(self.memory_backend, self.character_id)
+            self.memory_events = MemoryEventStore(
+                self.memory_backend,
+                self.character_id,
+                memory_system=self.memory_system,
+            )
         if self.input_registry is None:
             self.input_registry = input_events.default_registry()
         if self.event_bus is None:
@@ -237,6 +249,29 @@ class ChatSession:
     def set_memory_counterpart(self, name: str) -> None:
         self.memory_counterpart = str(name or "").strip()
 
+    def _memory_context_for_text(self, text: str) -> str:
+        query = str(text or "").strip()
+        if not query:
+            return ""
+        memory_system = getattr(self, "memory_system", None)
+        if memory_system is not None:
+            try:
+                memory_ctx = str(memory_system.deep_recall(query) or "").strip()
+                if memory_ctx:
+                    return memory_ctx
+            except Exception as exc:
+                logger.warning("life memory recall failed: %s", exc)
+        try:
+            return str(
+                self.memory_backend.get_context_multi(
+                    query,
+                    memory_mod.context_user_ids(self.character_id),
+                )
+                or ""
+            ).strip()
+        except Exception:
+            return ""
+
     def write_chat_log_to_file(self, filepath: str | None = None) -> str:
         """Write the conversation history to a log file and return the path."""
         if not self.history:
@@ -326,10 +361,7 @@ class ChatSession:
         if extra_context:
             messages.append({"role": "system", "content": extra_context})
         if inject_memory:
-            memory_ctx = self.memory_backend.get_context_multi(
-                user_text,
-                memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
-            )
+            memory_ctx = self._memory_context_for_text(user_text)
             if memory_ctx:
                 messages.append({"role": "system", "content": memory_ctx})
         # Cognitive layer — runtime cache of relevant perceptions
@@ -397,6 +429,28 @@ class ChatSession:
                 daemon=True,
             ).start()
 
+        memory_system = getattr(self, "memory_system", None)
+        if memory_system is not None:
+            try:
+                from kokoro.memory.models import MemoryEventDraft
+
+                memory_system.append_event(
+                    MemoryEventDraft(
+                        character_id=self.character_id,
+                        source="conversation",
+                        event_type="conversation_turn",
+                        content=(
+                            f"{self.user_name}: {user_text}\n"
+                            f"{self.character_name}: {assistant_text}"
+                        ),
+                        memory_policy="experience",
+                        participants=[self.user_name, self.character_name],
+                        metadata={"path": "full_sedimentation"},
+                    )
+                )
+            except Exception as exc:
+                logger.warning("life memory event sedimentation failed: %s", exc)
+
         # Refresh cognition cache — keyword match against current turn, no LLM
         self.cognition.refresh_cache(user_text, assistant_text)
 
@@ -456,10 +510,7 @@ class ChatSession:
 
                 # Cognition full evaluation after summarization
                 try:
-                    memories = self.memory_backend.get_context_multi(
-                        conv_text[:500],
-                        memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
-                    )
+                    memories = self._memory_context_for_text(conv_text[:500])
                     self.cognition.evaluate(
                         conversation=conv_text,
                         summary=new_summary,
@@ -475,14 +526,33 @@ class ChatSession:
         finally:
             self._summarize_in_progress = False
 
+    def _remember_life_memory_async(self, content: str, recent_context: str = "") -> None:
+        memory_system = getattr(self, "memory_system", None)
+        if memory_system is None:
+            return
+        try:
+            if hasattr(self.inner_stream, "get_text"):
+                inner_stream = self.inner_stream.get_text()
+            elif hasattr(self.inner_stream, "get_context"):
+                inner_stream = self.inner_stream.get_context()
+            else:
+                inner_stream = ""
+        except Exception:
+            inner_stream = ""
+        try:
+            memory_system.remember(
+                content,
+                inner_stream=inner_stream,
+                recent_context=recent_context or self.summary or "",
+            )
+        except Exception as exc:
+            logger.warning("life memory write failed: %s", exc)
+
     def _eval_cognition_async(self, user_text: str, assistant_text: str) -> None:
         """Periodic lightweight cognition evaluation (no summary needed)."""
         try:
             conv_text = f"{self.user_name}：{user_text}\n{self.character_name}：{assistant_text}"
-            memories = self.memory_backend.get_context_multi(
-                conv_text[:500],
-                memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
-            )
+            memories = self._memory_context_for_text(conv_text[:500])
             self.cognition.evaluate(
                 conversation=conv_text,
                 summary=self.summary or "",
@@ -502,10 +572,7 @@ class ChatSession:
                 character_name=self.character_name,
             )
             try:
-                memories = self.memory_backend.get_context_multi(
-                    f"{user_text} {assistant_text}"[:500],
-                    memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
-                )
+                memories = self._memory_context_for_text(f"{user_text} {assistant_text}"[:500])
             except Exception:
                 memories = ""
             self.inner_stream.evaluate(
@@ -551,6 +618,12 @@ class ChatSession:
                 character_id=self.character_id,
                 event=event,
             )
+            memory_system = getattr(self, "memory_system", None)
+            if memory_system is not None:
+                try:
+                    memory_system.append_input_event(event)
+                except Exception as exc:
+                    logger.warning("failed to append life memory event: %s", exc)
             autonomous = getattr(self, "autonomous_step", None)
             note_external = getattr(autonomous, "note_external_event", None)
             if callable(note_external):
@@ -585,6 +658,12 @@ class ChatSession:
                 character_id=self.character_id,
                 event=event,
             )
+            memory_system = getattr(self, "memory_system", None)
+            if memory_system is not None:
+                try:
+                    memory_system.append_input_event(event)
+                except Exception as exc:
+                    logger.warning("failed to append life memory event: %s", exc)
             autonomous = getattr(self, "autonomous_step", None)
             note_external = getattr(autonomous, "note_external_event", None)
             if callable(note_external):
@@ -672,10 +751,7 @@ class ChatSession:
             if event_text:
                 query = f"{query}\n{event_text}"
             query = query[:1000]
-            memories = self.memory_backend.get_context_multi(
-                query,
-                memory_mod.context_user_ids(self.character_id, self.memory_counterpart or self.user_name),
-            ) if query else ""
+            memories = self._memory_context_for_text(query) if query else ""
         except Exception:
             memories = ""
         cognition_context = ""

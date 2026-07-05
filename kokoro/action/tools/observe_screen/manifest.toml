@@ -1,0 +1,8 @@
+id = "observe_screen"
+name = "observe_screen"
+actions = ["observe_screen", "look_at_screen"]
+description = "Observe the current screen when visual context is needed."
+needs_prepare_llm = true
+needs_after_llm = true
+prepare_prompt = "prepare.md"
+after_prompt = "after.md"

@@ -1,0 +1,8 @@
+id = "say"
+name = "say"
+actions = ["say", "say_precomputed", "wait", "stay_silent"]
+description = "Speak outward, use a precomputed utterance, or intentionally remain silent."
+needs_prepare_llm = true
+needs_after_llm = true
+prepare_prompt = "prepare.md"
+after_prompt = "after.md"

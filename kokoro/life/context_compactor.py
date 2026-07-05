@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from kokoro.core import lifecycle_debug
 from kokoro.core import input_events
-from kokoro.core import prompts
+from kokoro.core import lifecycle_debug
+from kokoro.prompt import PromptContext, PromptManager
+from kokoro.prompt.contracts import LIFE_CONTEXT_COMPACT_SCENE
 
 
 LlmCall = Callable[[list[dict], dict], str]
@@ -21,10 +22,13 @@ class ContextCompactor:
     root: Path
     llm_call: LlmCall | None = None
     max_chars: int = 8000
+    prompt_manager: PromptManager | None = None
 
     def __post_init__(self) -> None:
         self.path = self.root / "characters" / self.character_id / "context"
         self.path.mkdir(parents=True, exist_ok=True)
+        if self.prompt_manager is None:
+            self.prompt_manager = PromptManager()
 
     def append_live(self, text: str) -> None:
         text = str(text or "").strip()
@@ -83,24 +87,21 @@ class ContextCompactor:
                 tool_results=tool_results,
             )
         else:
-            messages = [
-                {
-                    "role": "system",
-                    "content": prompts.get("life_runtime.context_compact_system", ""),
-                },
-                {
-                    "role": "user",
-                    "content": prompts.format_prompt(
-                        "life_runtime.context_compact_user",
-                        time_context=time_context or "无",
-                        inner_stream=inner_stream or "空",
-                        previous_digest=previous or "无",
-                        pending_threads=pending or "无",
-                        tool_results_digest=tool_results or "无",
-                        live_events=live or "无",
-                    ),
-                },
-            ]
+            messages = self.prompt_manager.render(
+                LIFE_CONTEXT_COMPACT_SCENE,
+                PromptContext(
+                    scene=LIFE_CONTEXT_COMPACT_SCENE,
+                    character_id=self.character_id,
+                    values={
+                        "time_context": time_context or "(none)",
+                        "inner_stream": inner_stream or "(empty)",
+                        "previous_digest": previous or "(none)",
+                        "pending_threads": pending or "(none)",
+                        "tool_results_digest": tool_results or "(none)",
+                        "live_events": live or "(none)",
+                    },
+                ),
+            )
             digest = self.llm_call(messages, {"function": "life_context_compact", "max_tokens": 512}).strip()
         digest = _clean_digest(digest)[-self.max_chars :].strip()
         digest_path.write_text(digest + "\n", encoding="utf-8")
@@ -166,7 +167,7 @@ def _clean_digest(text: str) -> str:
         if not line:
             continue
         line = re.sub(r"^#{1,6}\s*", "", line)
-        line = re.sub(r"^\*\*(.*?)\*\*\s*:?", r"\1：", line)
+        line = re.sub(r"^\*\*(.*?)\*\*\s*:?", r"\1:", line)
         line = line.replace("**", "").strip()
         if line:
             lines.append(line)

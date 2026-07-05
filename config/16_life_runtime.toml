@@ -49,10 +49,10 @@ min_tick_seconds = 0.25
 max_tick_seconds = 8.0
 
 [life_runtime.local_thinking]
-# Local/high-frequency thinking is the intended default. The model defaults to
-# stt_refine_model from 05_audio_input.toml when this value is empty.
+# Local/high-frequency thinking is the intended default. Keep this explicit so
+# life runtime does not fall back to lighter audio/refine models.
 enabled = true
-model = ""
+model = "qwen2.5:7b"
 
 # auto tries Ollama first, then OpenAI-compatible on 404. Use "ollama" or
 # "openai" to force a protocol.

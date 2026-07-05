@@ -1,0 +1,6 @@
+id = "get_current_time"
+name = "get_current_time"
+actions = ["get_current_time"]
+description = "Read the current date, time, and weekday."
+needs_prepare_llm = false
+needs_after_llm = false

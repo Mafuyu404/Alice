@@ -70,7 +70,7 @@ class EmotionState:
         if not user_text and not assistant_text:
             return debug
 
-        system_prompt = prompts.format_prompt("emotion.evaluate_system", name=character_name, user_name=user_name)
+        system_prompt = prompts.format_prompt("emotion.evaluate_system", name=character_name)
 
         tone_line = f"情绪基调：{self.tone}" if self.tone else "情绪基调：（无）"
         moti_line = f"中期动机：{self.motivation}" if self.motivation else "中期动机：（无）"

@@ -1,0 +1,7 @@
+id = "retire_sticker"
+name = "retire_sticker"
+actions = ["retire_sticker"]
+description = "Retire a local sticker that should no longer be used."
+needs_prepare_llm = false
+needs_after_llm = true
+after_prompt = "after.md"

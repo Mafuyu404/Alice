@@ -168,7 +168,7 @@ class StoredEvent:
 class MemoryEventStore:
     """Extract, cache, summarize, and persist structured memory events."""
 
-    def __init__(self, memory_backend, user_id: str):
+    def __init__(self, memory_backend, user_id: str, memory_system: object | None = None):
         section = _cfg.get("memory_events", {})
         if not isinstance(section, dict):
             section = {}
@@ -177,6 +177,7 @@ class MemoryEventStore:
         self.eval_model = str(section.get("eval_model", "") or _cfg.llm_model())
 
         self._memory_backend = memory_backend
+        self._memory_system = memory_system
         self._user_id = user_id
         self._pending: list[StoredEvent] = []
         self._cache: list[StoredEvent] = []
@@ -300,11 +301,8 @@ class MemoryEventStore:
         )
 
     def _write_event(self, event: StoredEvent, counterpart_name: str = "") -> None:
-        """Store a single event to the mem0 backend with session-level dedup."""
-        if not self._memory_backend or not event.desc:
-            return
-        _mem = getattr(self._memory_backend, '_mem', None)
-        if _mem is None:
+        """Store a single event through Alice memory, then sync the vector index."""
+        if not event.desc:
             return
 
         # Session-level dedup: skip if a similar desc was already written this session
@@ -317,12 +315,26 @@ class MemoryEventStore:
                     return
             self._seen_descs.add(norm)
 
+        memory_system = getattr(self, "_memory_system", None)
+        if memory_system is not None:
+            try:
+                memory_system.remember(
+                    event.desc,
+                    recent_context="structured conversation memory event",
+                    importance="medium",
+                )
+                return
+            except Exception as exc:
+                _logger.warning("life memory event store failed: %s", exc)
+
+        store = getattr(self._memory_backend, "store", None)
+        if not callable(store):
+            return
         try:
-            _mem.add(
+            store(
                 event.desc,
-                user_id=_memory.scoped_user_id(self._user_id, counterpart_name),
-                metadata={"tags": event.tags, "counterpart": counterpart_name or ""},
-                infer=False,
+                "memory_event",
+                user_id=_memory.scoped_user_id(self._user_id),
             )
         except Exception as exc:
             _logger.warning("memory event store failed: %s", exc)

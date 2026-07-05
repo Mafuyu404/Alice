@@ -140,7 +140,6 @@ class InnerStream:
         system_prompt = prompts.format_prompt(
             "inner_stream.evaluate_system",
             name=character_name,
-            user_name=user_name,
         )
         profile = _compact_profile(self.character_data)
         user_prompt = prompts.format_prompt(
@@ -297,7 +296,6 @@ class InnerStream:
         system_prompt = prompts.format_prompt(
             "inner_stream.events_system",
             name=character_name,
-            user_name=user_name,
             inner_continuity_skill=prompts.skill("inner_continuity"),
             social_presence_skill=prompts.skill("social_presence"),
             memory_cognition_skill=prompts.skill("memory_cognition"),
@@ -306,7 +304,6 @@ class InnerStream:
         user_prompt = prompts.format_prompt(
             "inner_stream.events_user",
             name=character_name,
-            user_name=user_name,
             current=self.text.strip() or "（空）",
             profile=profile or "（无）",
             summary=summary or "（无）",

@@ -1,0 +1,8 @@
+id = "task"
+name = "task"
+actions = ["claude_code_exec", "check_task_progress", "list_active_tasks", "cancel_task"]
+description = "Start, inspect, list, or cancel background coding and computer-operation tasks."
+needs_prepare_llm = true
+needs_after_llm = true
+prepare_prompt = "prepare.md"
+after_prompt = "after.md"

@@ -1,0 +1,8 @@
+id = "send_qq_message"
+name = "send_qq_message"
+actions = ["send_qq_message"]
+description = "Send a text message through the connected QQ channel."
+needs_prepare_llm = true
+needs_after_llm = true
+prepare_prompt = "prepare.md"
+after_prompt = "after.md"
