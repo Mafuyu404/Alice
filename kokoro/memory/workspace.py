@@ -20,6 +20,7 @@ class MemoryWorkspaceState:
 
     def as_context(self, *, max_chars: int = 12000) -> str:
         parts = [
+            ("updated_at", self.updated_at),
             ("current_experience", self.current_experience),
             ("open_threads", self.open_threads),
             ("recent_raw_digest", self.recent_raw_digest),

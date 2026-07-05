@@ -64,16 +64,43 @@ class InformationPool:
 
     def format_batch(self, items: Iterable[PooledEvent], *, max_chars: int = 4000) -> str:
         lines: list[str] = []
+        now = self._now()
         for item in items:
             event = item.event
             content = event.visible_content()
             if not content:
                 continue
+            age = _fmt_seconds(now - item.monotonic)
             lines.append(
-                f"[#{item.sequence} {event.timestamp} {event.type}/{event.source}] {content}"
+                "\n".join(
+                    [
+                        (
+                            f'<input_event seq="{item.sequence}" type="{event.type}" '
+                            f'source="{event.source}" timestamp="{event.timestamp}" age="{age}">'
+                        ),
+                        content,
+                        "</input_event>",
+                    ]
+                )
             )
         text = "\n".join(lines)
         return text[-max(200, int(max_chars)) :]
+
+    def timing_lines(self, items: Iterable[PooledEvent]) -> list[str]:
+        batch = list(items)
+        if not batch:
+            return []
+        now = self._now()
+        oldest = min(batch, key=lambda item: item.monotonic)
+        newest = max(batch, key=lambda item: item.monotonic)
+        return [
+            (
+                "Current event batch: "
+                f"{len(batch)} item(s), oldest waited {_fmt_seconds(now - oldest.monotonic)}, "
+                f"newest waited {_fmt_seconds(now - newest.monotonic)}, "
+                f"sequence #{oldest.sequence}-#{newest.sequence}."
+            )
+        ]
 
     def _now(self) -> float:
         if self.clock is not None:
@@ -81,3 +108,14 @@ class InformationPool:
         import time
 
         return time.monotonic()
+
+
+def _fmt_seconds(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {sec}s"

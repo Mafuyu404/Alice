@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -78,6 +80,7 @@ class ContextCompactor:
             tool_results_digest=tool_results,
             live_events=live,
         )
+        implementation = "fallback"
         if self.llm_call is None:
             digest = _fallback_compact(
                 previous=previous,
@@ -87,6 +90,7 @@ class ContextCompactor:
                 tool_results=tool_results,
             )
         else:
+            implementation = "llm"
             messages = self.prompt_manager.render(
                 LIFE_CONTEXT_COMPACT_SCENE,
                 PromptContext(
@@ -106,6 +110,16 @@ class ContextCompactor:
         digest = _clean_digest(digest)[-self.max_chars :].strip()
         digest_path.write_text(digest + "\n", encoding="utf-8")
         live_path.write_text("", encoding="utf-8")
+        self._append_compaction_audit(
+            implementation=implementation,
+            previous=previous,
+            live=live,
+            pending=pending,
+            tool_results=tool_results,
+            time_context=time_context,
+            inner_stream=inner_stream,
+            digest=digest,
+        )
         lifecycle_debug.log(
             "life.context.compact_done",
             character_id=self.character_id,
@@ -123,11 +137,56 @@ class ContextCompactor:
     def tool_results_digest(self) -> str:
         return _read(self.path / "tool_results_digest.txt")
 
+    def _append_compaction_audit(
+        self,
+        *,
+        implementation: str,
+        previous: str,
+        live: str,
+        pending: str,
+        tool_results: str,
+        time_context: str,
+        inner_stream: str,
+        digest: str,
+    ) -> None:
+        record = {
+            "type": "context_compaction",
+            "character_id": self.character_id,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "implementation": implementation,
+            "max_chars": self.max_chars,
+            "input_chars": {
+                "previous_digest": len(previous or ""),
+                "live_events": len(live or ""),
+                "pending_threads": len(pending or ""),
+                "tool_results_digest": len(tool_results or ""),
+                "time_context": len(time_context or ""),
+                "inner_stream": len(inner_stream or ""),
+            },
+            "output_chars": {
+                "recent_digest": len(digest or ""),
+            },
+            "paths": {
+                "live_timeline": str(self.path / "live_timeline.txt"),
+                "recent_digest": str(self.path / "recent_digest.txt"),
+                "pending_threads": str(self.path / "pending_threads.txt"),
+                "tool_results_digest": str(self.path / "tool_results_digest.txt"),
+            },
+        }
+        _append_jsonl(self.path / "compaction_audit.jsonl", record)
+        lifecycle_debug.log("life.context.compact_audit", character_id=self.character_id, record=record)
+
 
 def _append(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
         file.write(text.strip() + "\n")
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _read(path: Path) -> str:

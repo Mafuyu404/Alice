@@ -11,16 +11,16 @@ from pathlib import Path
 from typing import Any
 import urllib.error
 
-from kokoro.action import runtime as action_runtime_mod
 from kokoro.action import tool_spec
 from kokoro.action import tools as action_tools
+from kokoro.action.life_runtime import create_life_action_runtime
 from kokoro.action.plan import ActionPlan, execute_action_plan
-from kokoro.action.tools import search_web as search_web_tool
 from kokoro.core import config as cfg
 from kokoro.core import input_events
 from kokoro.core import lifecycle_debug
 from kokoro.memory.models import MemoryEventDraft
 from kokoro.life.context_compactor import ContextCompactor
+from kokoro.life.context_fragments import render_fragment
 from kokoro.life.event_pool import InformationPool
 from kokoro.life.local_thinking import LocalThinking
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
@@ -76,7 +76,7 @@ class LifeRuntime:
         self.prompt_manager = PromptManager()
         self.tool_registry = tool_spec.ActionToolRegistry()
         action_tools.register_all(self.tool_registry)
-        self.tool_prompt_specs = discover_tool_prompt_specs(self.root / "kokoro" / "action" / "tools")
+        self.tool_prompt_specs = discover_tool_prompt_specs(_ROOT / "kokoro" / "action" / "tools")
         self.action_runtime = action_runtime or self._create_action_runtime()
         self._availability_cache: dict[str, tuple[float, bool]] = {}
         self._available_actions = self._resolve_available_actions()
@@ -101,25 +101,11 @@ class LifeRuntime:
         )
 
     def _create_action_runtime(self):
-        search_section = cfg.inner_stream_search_config()
-        search_client = search_web_tool.create_client(search_section)
-        merge_window = self.section.get("result_merge_window_seconds", 1.0)
-        if merge_window is None:
-            merge_window = 1.0
-        return action_runtime_mod.ActionRuntime(
+        return create_life_action_runtime(
             session=self.session,
-            handlers={},
             registry=self.tool_registry,
-            tool_context={
-                "tool_timeout": float(self.section.get("tool_timeout", 45.0) or 45.0),
-                "character_id": getattr(self.session, "character_id", "default"),
-                "memory_system": getattr(self.session, "memory_system", None),
-                "memory_backend": getattr(self.session, "memory_backend", None),
-                "web_search_client": search_client,
-                "search_max_results": int(search_section.get("max_results", 5) or 5),
-                "search_max_event_chars": int(search_section.get("max_event_chars", 6000) or 6000),
-            },
-            merge_window_seconds=float(merge_window),
+            section=self.section,
+            search_section=cfg.inner_stream_search_config(),
         )
 
     def start(self) -> None:
@@ -195,7 +181,7 @@ class LifeRuntime:
         if batch:
             self._last_processed_sequence = max(item.sequence for item in batch)
         inner_stream = _inner_stream_text(self.session)
-        time_context = self.time.render()
+        time_context = self.time.render(pending_lines=self.pool.timing_lines(batch))
         digest = self.compactor.compact_once(time_context=time_context, inner_stream=inner_stream)
         if digest:
             self._append_memory_event(
@@ -212,71 +198,7 @@ class LifeRuntime:
             digest=digest,
             event_text=event_text,
         )
-        data = _extract_json(thought)
-        self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=None)
-        lifecycle_debug.log(
-            "life.runtime.thought_raw",
-            chars=len(thought or ""),
-            text=thought,
-            json_ok=isinstance(data, dict),
-        )
-        self._append_memory_event(
-            source="life_runtime",
-            event_type="inner_thought",
-            content=thought,
-            memory_policy="experience",
-            metadata={
-                "json_ok": isinstance(data, dict),
-                "processed_events": len(batch),
-                "trace_dir": self._last_prompt_trace_dir or "",
-            },
-        )
-        if not isinstance(data, dict):
-            parse_reason = _json_parse_error(thought)
-            lifecycle_debug.log(
-                "life.runtime.thought_parse_failed",
-                reason=parse_reason,
-                text=thought,
-            )
-            self._append_memory_event(
-                source="life_runtime",
-                event_type="inner_thought_parse_failed",
-                content=f"{parse_reason}\n\n{thought}",
-                memory_policy="experience",
-                metadata={"trace_dir": self._last_prompt_trace_dir or ""},
-            )
-            repaired = self._repair_json_thought(thought, parse_reason=parse_reason)
-            if repaired:
-                repaired_data = _extract_json(repaired)
-                lifecycle_debug.log(
-                    "life.runtime.thought_repair_raw",
-                    chars=len(repaired),
-                    text=repaired,
-                    json_ok=isinstance(repaired_data, dict),
-                )
-                if isinstance(repaired_data, dict):
-                    thought = repaired
-                    data = repaired_data
-                    lifecycle_debug.log("life.runtime.thought_repair_applied")
-                    self._append_memory_event(
-                        source="life_runtime",
-                        event_type="inner_thought_repaired",
-                        content=repaired,
-                        memory_policy="experience",
-                        metadata={"trace_dir": self._last_prompt_trace_dir or ""},
-                    )
-                else:
-                    lifecycle_debug.log(
-                        "life.runtime.thought_repair_failed",
-                        reason=_json_parse_error(repaired),
-                    )
-                    self._append_memory_event(
-                        source="life_runtime",
-                        event_type="inner_thought_repair_failed",
-                        content=f"{_json_parse_error(repaired)}\n\n{repaired}",
-                        memory_policy="experience",
-                        metadata={"trace_dir": self._last_prompt_trace_dir or ""},
-                    )
+        thought, data = self._record_and_parse_thought(thought, processed_events=len(batch))
         self.time.mark_llm_thought()
         patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
         self._record_pending_threads_from_data(data)
@@ -293,8 +215,9 @@ class LifeRuntime:
         intensity = _extract_intensity_from_data(data)
         action_plan_status = ""
         action_plan_error = ""
+        action_results: dict[str, str] = {}
         if action_plan:
-            action_plan_status, action_plan_error = self._execute_action_plan(action_plan)
+            action_plan_status, action_plan_error, action_results = self._execute_action_plan(action_plan)
             self._append_memory_event(
                 source="life_runtime",
                 event_type="action_plan_finished",
@@ -302,6 +225,7 @@ class LifeRuntime:
                     {
                         "status": action_plan_status,
                         "error": action_plan_error,
+                        "results": action_results,
                         "plan": action_plan,
                     },
                     ensure_ascii=False,
@@ -311,6 +235,19 @@ class LifeRuntime:
                 memory_policy="experience",
                 metadata={"trace_dir": self._last_prompt_trace_dir or ""},
             )
+        if action_plan_status == "executed" and action_results:
+            followup = self._continue_after_action_results(
+                initial_plan=action_plan or {},
+                initial_results=action_results,
+            )
+            if followup.get("patch_applied"):
+                patch_applied = True
+            if followup.get("thinking_intensity") is not None:
+                intensity = followup["thinking_intensity"]
+            if followup.get("action_plan"):
+                action_plan = followup["action_plan"]
+                action_plan_status = str(followup.get("action_plan_status") or action_plan_status)
+                action_plan_error = str(followup.get("action_plan_error") or action_plan_error)
         self._run_memory_core_cycle()
         lifecycle_debug.log(
             "life.runtime.tick_done",
@@ -333,10 +270,202 @@ class LifeRuntime:
             action_plan_error=action_plan_error,
         )
 
-    def _execute_action_plan(self, raw_plan: dict[str, Any]) -> tuple[str, str]:
+    def _record_and_parse_thought(self, thought: str, *, processed_events: int) -> tuple[str, dict[str, Any] | None]:
+        data = _extract_json(thought)
+        self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=None)
+        lifecycle_debug.log(
+            "life.runtime.thought_raw",
+            chars=len(thought or ""),
+            text=thought,
+            json_ok=isinstance(data, dict),
+        )
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="inner_thought",
+            content=thought,
+            memory_policy="experience",
+            metadata={
+                "json_ok": isinstance(data, dict),
+                "processed_events": processed_events,
+                "trace_dir": self._last_prompt_trace_dir or "",
+            },
+        )
+        if isinstance(data, dict):
+            return thought, data
+
+        parse_reason = _json_parse_error(thought)
+        lifecycle_debug.log(
+            "life.runtime.thought_parse_failed",
+            reason=parse_reason,
+            text=thought,
+        )
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="inner_thought_parse_failed",
+            content=f"{parse_reason}\n\n{thought}",
+            memory_policy="experience",
+            metadata={"trace_dir": self._last_prompt_trace_dir or ""},
+        )
+        repaired = self._repair_json_thought(thought, parse_reason=parse_reason)
+        if not repaired:
+            return thought, data
+
+        repaired_data = _extract_json(repaired)
+        lifecycle_debug.log(
+            "life.runtime.thought_repair_raw",
+            chars=len(repaired),
+            text=repaired,
+            json_ok=isinstance(repaired_data, dict),
+        )
+        if isinstance(repaired_data, dict):
+            lifecycle_debug.log("life.runtime.thought_repair_applied")
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="inner_thought_repaired",
+                content=repaired,
+                memory_policy="experience",
+                metadata={"trace_dir": self._last_prompt_trace_dir or ""},
+            )
+            return repaired, repaired_data
+
+        lifecycle_debug.log(
+            "life.runtime.thought_repair_failed",
+            reason=_json_parse_error(repaired),
+        )
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="inner_thought_repair_failed",
+            content=f"{_json_parse_error(repaired)}\n\n{repaired}",
+            memory_policy="experience",
+            metadata={"trace_dir": self._last_prompt_trace_dir or ""},
+        )
+        return thought, data
+
+    def _continue_after_action_results(
+        self,
+        *,
+        initial_plan: dict[str, Any],
+        initial_results: dict[str, str],
+    ) -> dict[str, Any]:
+        max_rounds = max(0, int(self.section.get("tool_followup_rounds", 1) or 0))
+        if max_rounds <= 0:
+            return {}
+
+        state: dict[str, Any] = {}
+        current_plan = initial_plan
+        current_results = initial_results
+        seen_plans = {_canonical_plan_key(initial_plan)}
+        for round_index in range(max_rounds):
+            result_context = self._absorb_action_results_context(
+                plan=current_plan,
+                results=current_results,
+                round_index=round_index,
+            )
+            inner_stream = _inner_stream_text(self.session)
+            time_context = self.time.render(
+                pending_lines=[
+                    "Tool results have just returned inside the same life tick; understand them before deciding whether anything else changes."
+                ]
+            )
+            thought = self._think(
+                inner_stream=inner_stream,
+                time_context=time_context,
+                digest=self.compactor.recent_digest(),
+                event_text=result_context,
+            )
+            thought, data = self._record_and_parse_thought(thought, processed_events=0)
+            self.time.mark_llm_thought()
+            patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
+            self._record_pending_threads_from_data(data)
+            action_plan = _extract_action_plan_from_data(data)
+            self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
+            intensity = _extract_intensity_from_data(data)
+            state.update(
+                {
+                    "thought": thought,
+                    "patch_applied": bool(state.get("patch_applied")) or patch_applied,
+                    "thinking_intensity": intensity if intensity is not None else state.get("thinking_intensity"),
+                    "action_plan": action_plan or state.get("action_plan"),
+                }
+            )
+            lifecycle_debug.log(
+                "life.runtime.tool_followup.done",
+                round=round_index + 1,
+                patch_applied=patch_applied,
+                thinking_intensity=intensity,
+                has_action_plan=bool(action_plan),
+            )
+            if not action_plan:
+                break
+            plan_key = _canonical_plan_key(action_plan)
+            if plan_key in seen_plans:
+                lifecycle_debug.log("life.runtime.tool_followup.repeat_plan_stop", action_plan=action_plan)
+                state.update(
+                    {
+                        "action_plan_status": "skipped_repeat",
+                        "action_plan_error": "follow-up repeated an already executed action plan",
+                    }
+                )
+                break
+            seen_plans.add(plan_key)
+            status, error, results = self._execute_action_plan(action_plan)
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="action_plan_finished",
+                content=json.dumps(
+                    {
+                        "status": status,
+                        "error": error,
+                        "results": results,
+                        "plan": action_plan,
+                        "phase": "tool_followup",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                memory_policy="experience",
+                metadata={"trace_dir": self._last_prompt_trace_dir or ""},
+            )
+            state.update({"action_plan_status": status, "action_plan_error": error})
+            if status != "executed" or not results:
+                break
+            current_plan = action_plan
+            current_results = results
+        return state
+
+    def _absorb_action_results_context(
+        self,
+        *,
+        plan: dict[str, Any],
+        results: dict[str, str],
+        round_index: int,
+    ) -> str:
+        text = _format_action_results(plan, results)
+        if not text:
+            return ""
+        self.time.mark_event(event_type="action_result")
+        self.compactor.append_live(text)
+        self.compactor.append_tool_result(text)
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="tool_results_same_tick",
+            content=text,
+            memory_policy="experience",
+            metadata={"round": round_index + 1},
+        )
+        lifecycle_debug.log(
+            "life.runtime.tool_results.same_tick_context",
+            round=round_index + 1,
+            chars=len(text),
+            text=text,
+        )
+        return text
+
+    def _execute_action_plan(self, raw_plan: dict[str, Any]) -> tuple[str, str, dict[str, str]]:
         if self.action_runtime is None:
             lifecycle_debug.log("life.runtime.action_plan.no_runtime", action_plan=raw_plan)
-            return "rejected", "action runtime is not available"
+            return "rejected", "action runtime is not available", {}
         try:
             plan = ActionPlan.from_dict(raw_plan)
             validation_error = self._validate_action_plan(plan)
@@ -346,14 +475,14 @@ class LifeRuntime:
                     plan=plan,
                     error=validation_error,
                 )
-                return "rejected", validation_error
+                return "rejected", validation_error, {}
             lifecycle_debug.log("life.runtime.action_plan.execute", plan=plan)
             results = execute_action_plan(plan, self.action_runtime)
             lifecycle_debug.log("life.runtime.action_plan.done", plan=plan, results=results)
-            return "executed", ""
+            return "executed", "", results
         except Exception as exc:
             lifecycle_debug.log("life.runtime.action_plan.error", action_plan=raw_plan, error=str(exc))
-            return "error", str(exc)
+            return "error", str(exc), {}
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -378,6 +507,7 @@ class LifeRuntime:
         character_profile = _character_profile_text(self.session)
         cognition_context = _cognition_context_text(self.session, event_text=event_text)
         memory_context = self._memory_context(event_text=event_text, inner_stream=inner_stream, digest=digest)
+        fragment_max = int(self.section.get("context_fragment_max_chars", 4000) or 4000)
         trace_dir = None
         debug_dir = self.section.get("prompt_trace_dir")
         if debug_dir:
@@ -390,17 +520,33 @@ class LifeRuntime:
             debug_mode=bool(self.section.get("debug", False)),
             trace_dir=trace_dir,
             values={
-                "character_profile": character_profile or "(none)",
-                "cognition_context": cognition_context or "(none)",
-                "memory_context": memory_context or "(none)",
-                "inner_stream": inner_stream or "(empty)",
+                "character_profile": self._context_fragment("character_profile", character_profile, max_chars=fragment_max),
+                "cognition_context": self._context_fragment("cognition", cognition_context, max_chars=fragment_max),
+                "memory_context": self._context_fragment("memory", memory_context, max_chars=fragment_max),
+                "inner_stream": self._context_fragment("inner_stream", inner_stream or "(empty)", max_chars=fragment_max),
                 "inner_stream_version": self._inner_stream_version,
-                "time_context": time_context or "(none)",
-                "context_digest": digest or "(none)",
-                "tool_capabilities": self._tool_capabilities_text(),
-                "event_batch": event_text or "(no new external event; this can be time passing or continued thinking)",
-                "pending_threads": self.compactor.pending_threads() or "(none)",
-                "tool_results_digest": self.compactor.tool_results_digest() or "(none)",
+                "time_context": self._context_fragment("time_awareness", time_context, max_chars=2000),
+                "context_digest": self._context_fragment("recent_digest", digest, max_chars=fragment_max),
+                "tool_capabilities": self._context_fragment(
+                    "tool_capabilities",
+                    self._tool_capabilities_text(),
+                    max_chars=max(fragment_max, 6000),
+                ),
+                "event_batch": self._context_fragment(
+                    "event_batch",
+                    event_text or "(no new external event; this can be time passing or continued thinking)",
+                    max_chars=int(self.section.get("event_batch_fragment_max_chars", min(fragment_max, 2400)) or 2400),
+                ),
+                "pending_threads": self._context_fragment(
+                    "pending_threads",
+                    self.compactor.pending_threads(),
+                    max_chars=fragment_max,
+                ),
+                "tool_results_digest": self._context_fragment(
+                    "tool_results_digest",
+                    self.compactor.tool_results_digest(),
+                    max_chars=int(self.section.get("tool_results_fragment_max_chars", min(fragment_max, 1400)) or 1400),
+                ),
             },
         )
         messages = self.prompt_manager.render(LIFE_TICK_SCENE, ctx)
@@ -418,6 +564,9 @@ class LifeRuntime:
                 "timeout": int(self.section.get("tick_timeout", 90) or 90),
             },
         )
+
+    def _context_fragment(self, source: str, content: str, *, max_chars: int) -> str:
+        return render_fragment(source, content or "(none)", max_chars=max_chars)
 
     def _append_memory_event(
         self,
@@ -619,7 +768,12 @@ class LifeRuntime:
         actions = sorted(self._available_actions)
         schemas = self.tool_registry.enabled_schemas()
         lines = ["Registered action names: " + ", ".join(actions)]
-        prompt_catalog = render_tool_catalog(self.tool_prompt_specs, actions)
+        prompt_catalog = render_tool_catalog(
+            self.tool_prompt_specs,
+            actions,
+            include_stage_prompts=bool(self.section.get("include_tool_stage_prompts_in_life_prompt", False)),
+            stage_prompt_max_chars=int(self.section.get("tool_stage_prompt_max_chars", 180) or 180),
+        )
         if prompt_catalog:
             lines.append("Tool prompt catalog:")
             lines.append(prompt_catalog)
@@ -967,6 +1121,41 @@ def _extract_intensity_from_data(data: dict[str, Any] | None) -> int | None:
         return max(0, min(100, int(value)))
     except Exception:
         return None
+
+
+def _format_action_results(plan: dict[str, Any], results: dict[str, str]) -> str:
+    if not results:
+        return ""
+    actions = plan.get("actions") or plan.get("nodes") or []
+    if not isinstance(actions, list):
+        actions = []
+    tools_by_id = {
+        str(action.get("id") or action.get("action_id") or "").strip(): str(
+            action.get("tool") or action.get("action") or ""
+        ).strip()
+        for action in actions
+        if isinstance(action, dict)
+    }
+    lines = ["[same_tick_tool_results]"]
+    for action_id, result in results.items():
+        text = str(result or "").strip()
+        if not text:
+            continue
+        tool = tools_by_id.get(str(action_id), "")
+        label = f"action_id={action_id}"
+        if tool:
+            label += f" tool={tool}"
+        lines.append(f"- [{label}]\n{text}")
+    return "\n".join(lines).strip()
+
+
+def _canonical_plan_key(plan: dict[str, Any] | None) -> str:
+    if not isinstance(plan, dict):
+        return ""
+    try:
+        return json.dumps(plan, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        return str(plan)
 
 
 def _web_search_available(client: object) -> bool:

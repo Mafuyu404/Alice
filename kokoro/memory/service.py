@@ -109,7 +109,7 @@ class MemorySystem:
         workspace_context = self.workspace.as_context(max_chars=2400)
         if not workspace_context:
             return recall_context
-        return f"{recall_context}\n\n【当前经验工作区】\n{workspace_context}".strip()
+        return f"{recall_context}\n\n【经验工作区：记忆材料，不是当前现场】\n{workspace_context}".strip()
 
     def deep_recall(self, query: str, *, limit: int = 8) -> str:
         return self.recall.deep_recall(query, limit=limit)

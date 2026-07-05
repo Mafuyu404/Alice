@@ -113,26 +113,52 @@ class ChatSession:
             self.input_registry = input_events.default_registry()
         if self.event_bus is None:
             self.event_bus = input_events.InputEventBus()
+        from kokoro.core import config as _cfg
         life_primary = False
         if self.life_runtime is None:
-            from kokoro.core import config as _cfg
             life_section = _cfg.life_runtime_config()
             if bool(life_section.get("enabled", False)):
                 try:
                     from kokoro.life import LifeRuntime
                     self.life_runtime = LifeRuntime(session=self, section=life_section)
-                    life_primary = bool(life_section.get("primary", True))
-                    self.event_bus.subscribe(self.life_runtime.submit)
-                    self.life_runtime.start()
                     lifecycle_debug.log("chat_session.life_runtime.created", character_id=self.character_id)
                 except Exception as exc:
                     logger.warning("failed to initialize life runtime: %s", exc)
                     lifecycle_debug.log("chat_session.life_runtime.error", character_id=self.character_id, error=str(exc))
         if self.life_runtime is not None:
-            from kokoro.core import config as _cfg
-            life_primary = bool(_cfg.life_runtime_config().get("primary", True))
+            runtime_section = getattr(self.life_runtime, "section", None)
+            if isinstance(runtime_section, dict):
+                life_primary = bool(runtime_section.get("primary", True))
+            else:
+                life_primary = bool(_cfg.life_runtime_config().get("primary", True))
+            submit_life_event = getattr(self.life_runtime, "submit", None)
+            if callable(submit_life_event) and not getattr(self.life_runtime, "_chat_session_event_bus_attached", False):
+                self.event_bus.subscribe(submit_life_event)
+                setattr(self.life_runtime, "_chat_session_event_bus_attached", True)
+            attach_action_runtime = getattr(self.life_runtime, "attach_action_runtime", None)
+            if callable(attach_action_runtime) and getattr(self.life_runtime, "action_runtime", None) is None:
+                try:
+                    from kokoro.action.life_runtime import create_life_action_runtime
+
+                    action_runtime = create_life_action_runtime(
+                        session=self,
+                        section=runtime_section if isinstance(runtime_section, dict) else _cfg.life_runtime_config(),
+                        search_section=_cfg.inner_stream_search_config(),
+                    )
+                    attach_action_runtime(action_runtime)
+                    lifecycle_debug.log("chat_session.life_runtime.action_runtime_attached", character_id=self.character_id)
+                except Exception as exc:
+                    logger.warning("failed to attach life action runtime: %s", exc)
+                    lifecycle_debug.log(
+                        "chat_session.life_runtime.action_runtime_error",
+                        character_id=self.character_id,
+                        error=str(exc),
+                    )
+            start_life_runtime = getattr(self.life_runtime, "start", None)
+            if callable(start_life_runtime) and not getattr(self.life_runtime, "_chat_session_started", False):
+                start_life_runtime()
+                setattr(self.life_runtime, "_chat_session_started", True)
         if self.inner_stream_loop is None and not life_primary:
-            from kokoro.core import config as _cfg
             search_section = _cfg.inner_stream_search_config()
             output_handlers = []
             cognition_reflector = None
@@ -621,7 +647,9 @@ class ChatSession:
             memory_system = getattr(self, "memory_system", None)
             if memory_system is not None:
                 try:
-                    memory_system.append_input_event(event)
+                    append_input_event = getattr(memory_system, "append_input_event", None)
+                    if callable(append_input_event):
+                        append_input_event(event)
                 except Exception as exc:
                     logger.warning("failed to append life memory event: %s", exc)
             autonomous = getattr(self, "autonomous_step", None)
@@ -661,7 +689,9 @@ class ChatSession:
             memory_system = getattr(self, "memory_system", None)
             if memory_system is not None:
                 try:
-                    memory_system.append_input_event(event)
+                    append_input_event = getattr(memory_system, "append_input_event", None)
+                    if callable(append_input_event):
+                        append_input_event(event)
                 except Exception as exc:
                     logger.warning("failed to append life memory event: %s", exc)
             autonomous = getattr(self, "autonomous_step", None)

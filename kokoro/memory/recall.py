@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 
 from kokoro.memory.index import MemoryIndex
@@ -138,7 +140,7 @@ class MemoryRecall:
 
 
 def _record_line(record: MemoryRecord, *, compact: bool = False) -> str:
-    text = (record.summary or record.content).strip() if compact else record.content.strip()
+    text = _record_prompt_text(record)
     if len(text) > (180 if compact else 320):
         text = text[: 180 if compact else 320].rstrip() + "..."
     tags = " ".join(f"#{tag}" for tag in record.tags[:3])
@@ -149,8 +151,109 @@ def _record_line(record: MemoryRecord, *, compact: bool = False) -> str:
 
 
 def _short_hint(record: MemoryRecord) -> str:
-    text = (record.summary or record.content).strip()
+    text = _record_prompt_text(record)
     return text[:90].rstrip() + ("..." if len(text) > 90 else "")
+
+
+def _record_prompt_text(record: MemoryRecord) -> str:
+    summary = _clean_prompt_text(str(record.summary or "").strip())
+    content = _clean_prompt_text(record.content)
+    if summary and content and summary not in content:
+        return f"{summary}：{content}"
+    return summary or content
+
+
+def _clean_prompt_text(text: str) -> str:
+    text = _strip_fence(str(text or "").strip())
+    if not text:
+        return ""
+    data = _try_json(text)
+    if isinstance(data, dict):
+        extracted = _text_from_json_memory(data)
+        if extracted:
+            return extracted
+    text = _normalize_legacy_tool_receipt(text)
+    text = _remove_recall_boilerplate(text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def _strip_fence(text: str) -> str:
+    match = re.fullmatch(r"\s*```(?:json|txt|text|plaintext)?\s*(.*?)\s*```\s*", text, flags=re.DOTALL | re.IGNORECASE)
+    return match.group(1).strip() if match else text
+
+
+def _try_json(text: str) -> object:
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _text_from_json_memory(data: dict) -> str:
+    parts: list[str] = []
+    for key in ("summary", "content", "memory", "memory_note", "current_experience", "notes"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+        elif isinstance(value, list):
+            parts.extend(str(item).strip() for item in value if str(item).strip())
+    patch = data.get("inner_stream_patch")
+    if isinstance(patch, dict):
+        for item in patch.get("patches", []) if isinstance(patch.get("patches"), list) else []:
+            if isinstance(item, dict) and str(item.get("text") or "").strip():
+                parts.append(str(item["text"]).strip())
+        reason = str(patch.get("reason") or "").strip()
+        if reason:
+            parts.append(reason)
+    remember = data.get("remember")
+    if isinstance(remember, list):
+        for item in remember:
+            if isinstance(item, dict):
+                for key in ("summary", "content"):
+                    value = str(item.get(key) or "").strip()
+                    if value:
+                        parts.append(value)
+                        break
+    cleaned = []
+    for part in parts:
+        part = _remove_recall_boilerplate(_normalize_legacy_tool_receipt(_strip_fence(part)))
+        if part:
+            cleaned.append(part)
+    return " / ".join(dict.fromkeys(cleaned)).strip()
+
+
+def _normalize_legacy_tool_receipt(text: str) -> str:
+    text = re.sub(r"我刚刚搜索了[：:]\s*", "搜索线索：", text)
+    text = re.sub(r"搜索结果[：:]\s*", "结果片段：", text)
+    text = text.replace("[web_search_result]", "web 搜索材料")
+    text = re.sub(r"action_id\s*=\s*\S+", "", text)
+    return text.strip()
+
+
+def _remove_recall_boilerplate(text: str) -> str:
+    skip_prefixes = (
+        "刚被带出的记忆材料",
+        "连带出现的记忆材料",
+        "更远一些的记忆线索",
+        "这些只是被呈现出来的材料",
+        "是否接住、放下",
+        "【当前经验工作区】",
+        "【经验工作区",
+        "## current_experience",
+        "## open_threads",
+        "## recent_raw_digest",
+        "## workspace_notes",
+    )
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if any(stripped.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        lines.append(stripped)
+    return "\n".join(lines).strip()
 
 
 def _trim_vector_text(text: str, max_chars: int = 900) -> str:

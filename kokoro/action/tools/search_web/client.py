@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -60,21 +59,18 @@ def create_client(section: dict | None = None) -> WebSearchClient:
     )
 
 
-def format_search_result(query: str, result: dict[str, Any], *, max_chars: int = 6000) -> str:
-    """Format a daemon response as a compact external input event."""
+def format_search_result(query: str, result: dict[str, Any], *, max_chars: int = 1800) -> str:
+    """Format a daemon response as compact material for the life context."""
     items = _extract_items(result)
-    lines = [f"我刚刚搜索了：{query}"]
+    lines = ["[web_search_result]", f"query: {query}"]
     if not items:
         raw = json.dumps(result, ensure_ascii=False)[:max_chars]
-        lines.append("搜索返回了结果，但结构无法简化：")
+        lines.append("unstructured_result:")
         lines.append(raw)
         return "\n".join(lines)[:max_chars].strip()
 
-    lines.append("搜索结果：")
-    matching = _matching_items(query, items)
-    if matching:
-        titles = "；".join(str(item.get("title") or item.get("name") or "")[:80] for item in matching[:3])
-        lines.append(f"命中提示：以下结果看起来直接包含查询词或其关键词：{titles}")
+    lines.append(f"candidate_count: {len(items)}")
+    lines.append("candidates:")
     for i, item in enumerate(items, 1):
         title = str(item.get("title") or item.get("name") or "无标题").strip()
         url = str(item.get("url") or item.get("link") or item.get("href") or "").strip()
@@ -85,11 +81,11 @@ def format_search_result(query: str, result: dict[str, Any], *, max_chars: int =
             or item.get("summary")
             or ""
         ).strip()
-        line = f"{i}. {title}"
+        line = f"{i}. title: {title[:120]}"
         if url:
-            line += f"\n   {url}"
+            line += f"\n   url: {url[:180]}"
         if snippet:
-            line += f"\n   {snippet[:500]}"
+            line += f"\n   note: {snippet[:160]}"
         lines.append(line)
     return "\n".join(lines)[:max_chars].strip()
 
@@ -113,24 +109,3 @@ def _extract_items(value: Any) -> list[dict[str, Any]]:
                 return nested
     return []
 
-
-def _matching_items(query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    query_text = str(query or "").strip().lower()
-    compact_query = re.sub(r"\s+", "", query_text)
-    tokens = [token for token in re.split(r"\s+", query_text) if len(token) >= 2]
-    matched: list[dict[str, Any]] = []
-    for item in items:
-        haystack = " ".join(
-            str(item.get(key) or "")
-            for key in ("title", "name", "url", "link", "href", "source", "snippet", "content", "description", "summary")
-        ).lower()
-        compact_haystack = re.sub(r"\s+", "", haystack)
-        if compact_query and compact_query in compact_haystack:
-            matched.append(item)
-            continue
-        if tokens and any(len(token) >= 4 and token in haystack for token in tokens):
-            matched.append(item)
-            continue
-        if tokens and all(token in haystack for token in tokens[:4]):
-            matched.append(item)
-    return matched

@@ -126,6 +126,28 @@ def main() -> int:
     parser.add_argument("--llm-model", default="", help="Override LifeRuntime local thinking model for --real-llm.")
     parser.add_argument("--llm-url", default="", help="Override LifeRuntime local thinking base URL for --real-llm.")
     parser.add_argument("--api-style", default="", choices=["", "auto", "ollama", "openai"], help="Override local thinking API style.")
+    parser.add_argument(
+        "--initial-event",
+        default="LifeRuntime debug start: absorb this event, notice elapsed time, and decide whether a tool helps.",
+        help="Initial external event submitted to the life runtime.",
+    )
+    parser.add_argument(
+        "--guide-event",
+        action="append",
+        default=[],
+        help="Timed guide event as seconds:text. Can be repeated.",
+    )
+    parser.add_argument(
+        "--memory-event",
+        action="append",
+        default=[],
+        help="Timed memory-candidate input as seconds:text. Can be repeated.",
+    )
+    parser.add_argument(
+        "--real-memory",
+        action="store_true",
+        help="Use the configured memory backend instead of NoMemoryBackend and write before/after memory snapshots.",
+    )
     args = parser.parse_args()
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -140,6 +162,8 @@ def main() -> int:
     section = {
         "enabled": True,
         "primary": True,
+        "debug": True,
+        "prompt_trace_dir": str(out_dir / "prompt_trace"),
         "idle_tick_seconds": 0.2,
         "min_tick_seconds": 0.05,
         "max_tick_seconds": 0.5,
@@ -159,7 +183,9 @@ def main() -> int:
     characters = character_mod.load()
     if args.character not in characters:
         raise KeyError(args.character)
-    backend = memory_mod.NoMemoryBackend()
+    backend = memory_mod.create_backend(full_config) if args.real_memory else memory_mod.NoMemoryBackend()
+    memory_user_id = memory_mod.scoped_user_id(args.character)
+    _write_memory_snapshot(backend, memory_user_id, out_dir / "memory_before.json")
     session = chat_session.ChatSession(
         character_id=args.character,
         character_data=characters[args.character],
@@ -188,22 +214,48 @@ def main() -> int:
         out_dir=str(out_dir),
         scripted=not args.real_llm,
     )
-    runtime.submit(
-        input_events.build_text_event(
-            "LifeRuntime debug start: absorb this event, notice elapsed time, and decide whether a tool helps.",
-            source="life_runtime_debug",
-            metadata={"debug_run": True, "phase": "start"},
-            priority="high",
-            lifetime="session",
-        )
+    guide_events = _parse_guide_events(args.guide_event)
+    memory_events = _parse_timed_text_events(args.memory_event)
+    session.record_input_event(
+        args.initial_event,
+        source="life_runtime_debug",
+        metadata={"debug_run": True, "phase": "start"},
+        priority="high",
+        lifetime="session",
     )
     results = []
     error = ""
     try:
         if args.duration_seconds and args.duration_seconds > 0:
             runtime.start()
+            start = time.monotonic()
             deadline = time.monotonic() + float(args.duration_seconds)
+            pending_guides = list(guide_events)
+            pending_memory_events = list(memory_events)
             while time.monotonic() < deadline:
+                elapsed = time.monotonic() - start
+                ready = [item for item in pending_guides if item[0] <= elapsed]
+                pending_guides = [item for item in pending_guides if item[0] > elapsed]
+                ready_memory = [item for item in pending_memory_events if item[0] <= elapsed]
+                pending_memory_events = [item for item in pending_memory_events if item[0] > elapsed]
+                for seconds, text in ready:
+                    lifecycle_debug.log("life_debug.guide_event", seconds=seconds, text=text)
+                    session.record_input_event(
+                        text,
+                        source="life_runtime_debug_guide",
+                        metadata={"debug_run": True, "phase": "guide", "at_seconds": seconds},
+                        priority="high",
+                        lifetime="session",
+                    )
+                for seconds, text in ready_memory:
+                    lifecycle_debug.log("life_debug.memory_candidate_event", seconds=seconds, text=text)
+                    session.record_input_event(
+                        text,
+                        source="life_runtime_debug_memory_candidate",
+                        metadata={"debug_run": True, "phase": "memory_candidate", "at_seconds": seconds},
+                        priority="normal",
+                        lifetime="memorize_candidate",
+                    )
                 time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
         else:
             for index in range(max(1, args.ticks)):
@@ -218,6 +270,7 @@ def main() -> int:
     finally:
         runtime.stop(wait=True, timeout=5.0)
         _stop_runtime(web_search_runtime)
+        _write_memory_snapshot(backend, memory_user_id, out_dir / "memory_after.json")
         close = getattr(backend, "close", None)
         if callable(close):
             close()
@@ -237,6 +290,7 @@ def main() -> int:
         "context_digest": runtime.compactor.recent_digest(),
         "pending_threads": runtime.compactor.pending_threads(),
         "tool_results_digest": runtime.compactor.tool_results_digest(),
+        "memory_user_id": memory_user_id,
     }
     (out_dir / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     lifecycle_debug.log("life_debug.done", summary=summary)
@@ -256,6 +310,44 @@ def _tick_result_summary(index: int, result) -> dict:
     }
 
 
+def _parse_guide_events(raw_events: list[str]) -> list[tuple[float, str]]:
+    events: list[tuple[float, str]] = []
+    for raw in raw_events or []:
+        text = str(raw or "")
+        if ":" not in text:
+            continue
+        seconds_text, content = text.split(":", 1)
+        content = content.strip()
+        if not content:
+            continue
+        try:
+            seconds = max(0.0, float(seconds_text.strip()))
+        except ValueError:
+            continue
+        events.append((seconds, content))
+    events.sort(key=lambda item: item[0])
+    return events
+
+
+def _parse_timed_text_events(raw_events: list[str]) -> list[tuple[float, str]]:
+    events: list[tuple[float, str]] = []
+    for raw in raw_events or []:
+        text = str(raw or "")
+        if ":" not in text:
+            continue
+        seconds_text, content = text.split(":", 1)
+        content = content.strip()
+        if not content:
+            continue
+        try:
+            seconds = max(0.0, float(seconds_text.strip()))
+        except ValueError:
+            continue
+        events.append((seconds, content))
+    events.sort(key=lambda item: item[0])
+    return events
+
+
 def _start_web_search_runtime(config: dict, *, out_dir: Path):
     runtime = search_web_tool.start_runtime(config, root=out_dir)
     section = config.get("inner_stream_search") if isinstance(config, dict) else {}
@@ -272,6 +364,20 @@ def _stop_runtime(runtime: object) -> None:
     stop = getattr(runtime, "stop", None)
     if callable(stop):
         stop()
+
+
+def _write_memory_snapshot(backend: object, user_id: str, path: Path) -> None:
+    items = []
+    try:
+        list_memories = getattr(backend, "list_memories", None)
+        if callable(list_memories):
+            items = list_memories(user_id=user_id, limit=500)
+    except Exception as exc:
+        items = [{"error": str(exc)}]
+    try:
+        path.write_text(json.dumps(items, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    except Exception as exc:
+        lifecycle_debug.log("life_debug.memory_snapshot_error", path=str(path), error=str(exc))
 
 
 def _tick_summaries_from_trace(trace_path: Path) -> list[dict]:

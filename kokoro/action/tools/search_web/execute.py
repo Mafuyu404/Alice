@@ -22,7 +22,7 @@ def execute_search_web(
     try:
         client = _client(ctx)
         limit = int(ctx.get("search_max_results", prepared.args.get("limit") or 5) or 5)
-        max_chars = int(ctx.get("search_max_event_chars", prepared.args.get("max_chars") or 6000) or 6000)
+        max_chars = int(ctx.get("search_max_event_chars", prepared.args.get("max_chars") or 1800) or 1800)
         result = client.search(query, limit=limit)
         content = format_search_result(query, result, max_chars=max_chars)
         return tool_spec.ToolResult(

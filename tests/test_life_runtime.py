@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from unittest import mock
 from pathlib import Path
 
 from kokoro.action.plan import ActionPlan, execute_action_plan
+from kokoro.action.tools.search_web.client import format_search_result
 from kokoro.core import input_events
 from kokoro.core.chat_session import ChatSession
 from kokoro.core.inner_stream import InnerStream
@@ -62,16 +64,48 @@ class DummyMemoryBackend:
         return None
 
 
+class DummyMemorySystem:
+    def __init__(self) -> None:
+        self.events = []
+        self.context = ""
+        self.maintenance_calls = 0
+
+    def append_event(self, event) -> str:
+        self.events.append(event.as_json())
+        return event.event_id
+
+    def default_context(self, **kwargs) -> str:
+        return self.context
+
+    def maintenance_once(self, *, max_batches: int = 1):
+        self.maintenance_calls += 1
+
+        class Decision:
+            remember = []
+            archive = []
+            notes = "no new events"
+
+        return [Decision()]
+
+
 class LifeRuntimeTests(unittest.TestCase):
     def test_information_pool_batches_since_sequence(self) -> None:
-        pool = InformationPool(max_events=4, clock=lambda: 10.0)
+        now = {"value": 10.0}
+        pool = InformationPool(max_events=4, clock=lambda: now["value"])
         first = pool.add(input_events.build_text_event("one", source="debug"))
+        now["value"] = 17.0
         second = pool.add(input_events.build_text_event("two", source="debug"))
+        now["value"] = 22.0
 
         batch = pool.batch_since(first.sequence)
 
         self.assertEqual([item.sequence for item in batch], [second.sequence])
-        self.assertIn("two", pool.format_batch(batch))
+        formatted = pool.format_batch(batch)
+        self.assertIn("two", formatted)
+        self.assertIn('age="5s"', formatted)
+        self.assertIn('<input_event seq="2"', formatted)
+        self.assertIn("</input_event>", formatted)
+        self.assertIn("newest waited 5s", "\n".join(pool.timing_lines(batch)))
 
     def test_time_awareness_renders_elapsed_time_material(self) -> None:
         now = {"value": 100.0}
@@ -145,6 +179,28 @@ class LifeRuntimeTests(unittest.TestCase):
         self.assertNotIn("```", digest)
         self.assertNotIn("plaintext", digest)
 
+    def test_context_compactor_writes_explicit_compaction_audit(self) -> None:
+        from kokoro.life.context_compactor import ContextCompactor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            compactor = ContextCompactor(character_id="test_role", root=Path(tmp), llm_call=None, max_chars=500)
+            compactor.append_live("A visible event entered the life context.")
+            digest = compactor.compact_once(time_context="Runtime elapsed: 10s", inner_stream="I am thinking.")
+            audit_path = Path(tmp) / "characters" / "test_role" / "context" / "compaction_audit.jsonl"
+            records = [
+                json.loads(line)
+                for line in audit_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+
+        self.assertIn("A visible event", digest)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["type"], "context_compaction")
+        self.assertEqual(records[0]["implementation"], "fallback")
+        self.assertGreater(records[0]["input_chars"]["live_events"], 0)
+        self.assertGreater(records[0]["output_chars"]["recent_digest"], 0)
+        self.assertIn("recent_digest", records[0]["paths"])
+
     def test_inner_stream_exposes_patch_first_entrypoint(self) -> None:
         stream = object.__new__(InnerStream)
         stream.character_id = "test_role"
@@ -207,7 +263,226 @@ class LifeRuntimeTests(unittest.TestCase):
         self.assertEqual(llm.calls[-1][1]["function"], "life_tick")
         prompt_text = llm.calls[-1][0][-1]["content"]
         self.assertIn("inner_stream", prompt_text)
+        self.assertIn('<life_context source="inner_stream"', prompt_text)
+        self.assertIn('<life_context source="event_batch"', prompt_text)
+        self.assertIn('max_chars="4000"', prompt_text)
         self.assertIn("0", prompt_text)
+
+    def test_life_runtime_context_fragments_bound_dynamic_prompt_material(self) -> None:
+        response = json.dumps({"thinking_intensity": 20, "notes": "quiet"})
+        session = DummySession()
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={
+                    "enabled": True,
+                    "local_thinking": {"enabled": True},
+                    "context_fragment_max_chars": 200,
+                },
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.submit(input_events.build_text_event("old_prefix_" + ("x" * 260) + "_new_tail", source="debug"))
+            runtime.tick_once()
+
+        prompt_text = llm.calls[-1][0][-1]["content"]
+        self.assertIn('<life_context source="event_batch"', prompt_text)
+        self.assertIn('max_chars="200"', prompt_text)
+        self.assertIn("_new_tail", prompt_text)
+        self.assertNotIn("old_prefix_", prompt_text)
+
+    def test_life_runtime_loads_tool_prompt_specs_from_project_root(self) -> None:
+        session = DummySession()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={"enabled": True, "local_thinking": {"enabled": True}},
+                llm=FakeLlm("{}"),
+                root=Path(tmp),
+            )
+            runtime._available_actions.add("search_web")
+
+            text = runtime._tool_capabilities_text()
+
+        self.assertIn("Tool prompt catalog", text)
+        self.assertIn("search_web", text)
+        self.assertIn("prepare LLM", text)
+        self.assertIn("after LLM", text)
+        self.assertNotIn("你在为 search_web 工具提炼搜索请求", text)
+        self.assertNotIn("query 要保留当前注意力里的具体对象", text)
+
+    def test_life_runtime_can_opt_in_to_tool_stage_prompts_for_diagnostics(self) -> None:
+        session = DummySession()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={
+                    "enabled": True,
+                    "local_thinking": {"enabled": True},
+                    "include_tool_stage_prompts_in_life_prompt": True,
+                    "tool_stage_prompt_max_chars": 180,
+                },
+                llm=FakeLlm("{}"),
+                root=Path(tmp),
+            )
+            runtime._available_actions.add("search_web")
+
+            text = runtime._tool_capabilities_text()
+
+        self.assertIn("你在为 search_web 工具提炼搜索请求", text)
+        self.assertIn("query 要保留当前注意力里的具体对象", text)
+
+    def test_life_runtime_records_inner_activity_as_memory_events(self) -> None:
+        response = json.dumps(
+            {
+                "thinking_intensity": 60,
+                "inner_stream_patch": {
+                    "base_version": 0,
+                    "patches": [
+                        {
+                            "op": "append",
+                            "text": "I keep the research thread alive.",
+                        }
+                    ],
+                    "reason": "continued internal activity",
+                },
+                "pending_threads": ["continue researching Minecraft adventure mod structure"],
+            }
+        )
+        session = DummySession()
+        session.memory_system = DummyMemorySystem()
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={"enabled": True, "local_thinking": {"enabled": True}},
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.submit(input_events.build_text_event("new research clue", source="debug"))
+            runtime.tick_once()
+
+        event_types = [event["type"] for event in session.memory_system.events]
+        self.assertIn("runtime_input", event_types)
+        self.assertIn("context_digest", event_types)
+        self.assertIn("inner_thought", event_types)
+        self.assertIn("inner_stream_patch_applied", event_types)
+        self.assertIn("pending_threads", event_types)
+
+    def test_life_runtime_memory_is_core_not_action_tool(self) -> None:
+        response = json.dumps({"thinking_intensity": 20, "notes": "quiet"})
+        session = DummySession()
+        memory = DummyMemorySystem()
+        memory.context = "A relevant remembered research clue."
+        session.memory_system = memory
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={"enabled": True, "local_thinking": {"enabled": True}},
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.submit(input_events.build_text_event("new clue", source="debug"))
+            runtime.tick_once()
+
+        self.assertNotIn("search_memory", runtime._available_actions)
+        self.assertNotIn("save_to_memory", runtime._available_actions)
+        self.assertNotIn("write_conversation_memory", runtime._available_actions)
+        event_types = [event["type"] for event in memory.events]
+        self.assertIn("memory_context_presented", event_types)
+        self.assertIn("memory_core_cycle", event_types)
+        self.assertGreaterEqual(memory.maintenance_calls, 1)
+
+    def test_life_runtime_prompt_trace_writes_llm_parse_and_tool_plan(self) -> None:
+        response = json.dumps(
+            {
+                "thinking_intensity": 50,
+                "action_plan": {"actions": [{"id": "t", "tool": "get_current_time", "args": {}}]},
+            }
+        )
+        session = DummySession()
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_root = Path(tmp) / "prompt_trace"
+            runtime = LifeRuntime(
+                session=session,
+                section={
+                    "enabled": True,
+                    "local_thinking": {"enabled": True},
+                    "prompt_trace_dir": str(trace_root),
+                    "tool_followup_rounds": 0,
+                },
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.submit(input_events.build_text_event("new information", source="debug"))
+            runtime.tick_once()
+
+            trace_dirs = [path for path in trace_root.iterdir() if path.is_dir()]
+
+            self.assertEqual(len(trace_dirs), 1)
+            self.assertTrue((trace_dirs[0] / "llm_raw.txt").exists())
+            self.assertTrue((trace_dirs[0] / "parsed.json").exists())
+            self.assertTrue((trace_dirs[0] / "tool_plan.json").exists())
+            self.assertIn("get_current_time", (trace_dirs[0] / "tool_plan.json").read_text(encoding="utf-8"))
+
+    def test_life_runtime_feeds_tool_results_back_in_same_tick(self) -> None:
+        initial = json.dumps(
+            {
+                "thinking_intensity": 50,
+                "action_plan": {"actions": [{"id": "t", "tool": "get_current_time", "args": {}}]},
+            }
+        )
+        followup = json.dumps(
+            {
+                "thinking_intensity": 65,
+                "inner_stream_patch": {
+                    "patches": [{"op": "append", "text": "I notice the returned time and keep the same thread moving."}],
+                    "reason": "the tool result came back inside the same life tick",
+                },
+            }
+        )
+        session = DummySession()
+        llm = FakeLlm(["compressed context", initial, followup])
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={"enabled": True, "local_thinking": {"enabled": True}},
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.submit(input_events.build_text_event("check the time and keep thinking", source="debug"))
+            result = runtime.tick_once()
+
+            self.assertIn("same_tick_tool_results", runtime.compactor.tool_results_digest())
+
+        functions = [call[1]["function"] for call in llm.calls]
+        self.assertEqual(functions, ["life_context_compact", "life_tick", "life_tick"])
+        self.assertTrue(result.patch_applied)
+        self.assertEqual(result.thinking_intensity, 65)
+        self.assertIn("returned time", session.inner_stream.text)
+
+    def test_life_runtime_time_context_includes_event_batch_age(self) -> None:
+        response = json.dumps({"thinking_intensity": 40})
+        session = DummySession()
+        llm = FakeLlm(["compressed context", response])
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={"enabled": True, "local_thinking": {"enabled": True}},
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.pool.clock = lambda: 100.0
+            runtime.submit(input_events.build_text_event("an event that waited", source="debug"))
+            runtime.pool.clock = lambda: 145.0
+            runtime.tick_once()
+
+        rendered_messages = "\n".join(str(message.get("content", "")) for message in llm.calls[1][0])
+        self.assertIn("Current event batch: 1 item(s), oldest waited 45s", rendered_messages)
+        self.assertIn('age="45s"', rendered_messages)
 
     def test_life_runtime_repairs_invalid_json_tick_output(self) -> None:
         bad = '{"thinking_intensity": 61, "inner_stream_patch": {"patches": [{"op": "append", "text": "I keep the repaired thread alive."}]'
@@ -347,7 +622,7 @@ class LifeRuntimeTests(unittest.TestCase):
             )
 
         unavailable = ActionPlan.from_dict({"actions": [{"id": "s", "tool": "say_precomputed", "args": {}}]})
-        incomplete = ActionPlan.from_dict({"actions": [{"id": "w", "tool": "write_conversation_memory", "args": {}}]})
+        memory_tool = ActionPlan.from_dict({"actions": [{"id": "w", "tool": "write_conversation_memory", "args": {}}]})
         memory_misuse = ActionPlan.from_dict(
             {
                 "actions": [
@@ -361,8 +636,8 @@ class LifeRuntimeTests(unittest.TestCase):
         )
 
         self.assertIn("not available", runtime._validate_action_plan(unavailable))
-        self.assertIn("missing required args", runtime._validate_action_plan(incomplete))
-        self.assertIn("trigger_text", runtime._validate_action_plan(memory_misuse))
+        self.assertIn("not available", runtime._validate_action_plan(memory_tool))
+        self.assertIn("not available", runtime._validate_action_plan(memory_misuse))
 
     def test_life_runtime_ignores_empty_action_plan(self) -> None:
         response = json.dumps(
@@ -406,7 +681,7 @@ class LifeRuntimeTests(unittest.TestCase):
             result = runtime.tick_once()
 
         self.assertEqual(result.action_plan_status, "rejected")
-        self.assertIn("missing required args", result.action_plan_error)
+        self.assertIn("not available", result.action_plan_error)
 
     def test_local_thinking_openai_style_uses_chat_completions(self) -> None:
         thinker = LocalThinking(
@@ -454,6 +729,199 @@ class LifeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result, "fallback ok")
         self.assertEqual(calls, ["http://127.0.0.1:14515/api/chat", "http://127.0.0.1:14515/v1/chat/completions"])
+
+    def test_local_thinking_priority_queue_runs_life_tick_before_memory(self) -> None:
+        thinker = LocalThinking(
+            {
+                "enabled": True,
+                "model": "local-model",
+                "base_url": "http://127.0.0.1:14515",
+                "api_style": "openai",
+            }
+        )
+        executed = []
+        original_ensure_worker = thinker._ensure_worker
+        thinker._ensure_worker = lambda: None
+
+        def fake_chat_now(messages, options):
+            function = options["function"]
+            executed.append(function)
+            return f"done:{function}"
+
+        thinker._chat_now = fake_chat_now
+        results = {}
+        low = threading.Thread(
+            target=lambda: results.update(memory=thinker.chat([], {"function": "memory_lifecycle"})),
+            daemon=True,
+        )
+        high = threading.Thread(
+            target=lambda: results.update(life=thinker.chat([], {"function": "life_tick"})),
+            daemon=True,
+        )
+        low.start()
+        high.start()
+        deadline = time.monotonic() + 1.0
+        while thinker._queue.qsize() < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        thinker._ensure_worker = original_ensure_worker
+        thinker._ensure_worker()
+        low.join(timeout=1.0)
+        high.join(timeout=1.0)
+
+        self.assertEqual(executed[:2], ["life_tick", "memory_lifecycle"])
+        self.assertEqual(results["life"], "done:life_tick")
+        self.assertEqual(results["memory"], "done:memory_lifecycle")
+
+    def test_local_thinking_coalesces_stale_memory_calls(self) -> None:
+        thinker = LocalThinking(
+            {
+                "enabled": True,
+                "model": "local-model",
+                "base_url": "http://127.0.0.1:14515",
+                "api_style": "openai",
+            }
+        )
+        executed = []
+        original_ensure_worker = thinker._ensure_worker
+        thinker._ensure_worker = lambda: None
+
+        def fake_chat_now(messages, options):
+            function = options["function"]
+            marker = messages[0]["content"]
+            executed.append((function, marker))
+            return f"done:{marker}"
+
+        thinker._chat_now = fake_chat_now
+        results = {}
+        first = threading.Thread(
+            target=lambda: results.update(first=thinker.chat([{"role": "user", "content": "old"}], {"function": "memory_experience_workspace"})),
+            daemon=True,
+        )
+        second = threading.Thread(
+            target=lambda: results.update(second=thinker.chat([{"role": "user", "content": "new"}], {"function": "memory_experience_workspace"})),
+            daemon=True,
+        )
+        first.start()
+        deadline = time.monotonic() + 1.0
+        while thinker._queue.qsize() < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        second.start()
+        deadline = time.monotonic() + 1.0
+        while thinker._queue.qsize() < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        first.join(timeout=1.0)
+        thinker._ensure_worker = original_ensure_worker
+        thinker._ensure_worker()
+        second.join(timeout=1.0)
+
+        self.assertEqual(results["first"], "")
+        self.assertEqual(results["second"], "done:new")
+        self.assertEqual(executed, [("memory_experience_workspace", "new")])
+
+    def test_life_debug_script_uses_memory_candidate_inputs_not_forced_memory_tools(self) -> None:
+        script = (Path(__file__).resolve().parents[1] / "scripts" / "run_life_runtime_debug.py").read_text(encoding="utf-8")
+
+        self.assertIn("--memory-event", script)
+        self.assertIn("life_runtime_debug_memory_candidate", script)
+        self.assertNotIn("--force-memory-tool", script)
+        self.assertNotIn("life_debug.force_memory_tool", script)
+
+    def test_life_debug_analyzer_reports_continuity_evidence(self) -> None:
+        from scripts.analyze_life_runtime_debug import analyze_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / "run_summary.json").write_text(
+                json.dumps(
+                    {
+                        "character": "lerwa",
+                        "scripted": False,
+                        "tool_results_digest": "[same_tick_tool_results]\n- ok",
+                        "inner_stream": "I keep thinking.",
+                        "context_digest": "recent context",
+                        "pending_threads": "unfinished thread",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            records = [
+                {"event": "life_debug.start", "monotonic": 10.0},
+                {"event": "life.runtime.prompt_rendered", "monotonic": 10.1},
+                {"event": "life.local_thinking.start", "function": "life_tick", "monotonic": 10.2},
+                {
+                    "event": "life.runtime.tick_done",
+                    "monotonic": 20.0,
+                    "processed_events": 1,
+                    "patch_applied": True,
+                    "has_action_plan": True,
+                    "action_plan_status": "executed",
+                },
+                {"event": "life.runtime.tool_results.same_tick_context", "monotonic": 20.1},
+                {"event": "life.context.tool_result_append", "monotonic": 20.2},
+                {"event": "life_debug.done", "monotonic": 70.0},
+            ]
+            (run_dir / "lifecycle_trace.jsonl").write_text(
+                "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            audit_dir = run_dir / "characters" / "lerwa" / "context"
+            audit_dir.mkdir(parents=True)
+            (audit_dir / "compaction_audit.jsonl").write_text(
+                json.dumps({"type": "context_compaction"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+
+            audit = analyze_run(run_dir)
+
+        self.assertEqual(audit["tick_count"], 1)
+        self.assertEqual(audit["action_plan"]["executed"], 1)
+        self.assertTrue(audit["same_tick_tool_feedback"]["present"])
+        self.assertEqual(audit["context_continuity"]["compaction_audit_records"], 1)
+        self.assertEqual(audit["context_continuity"]["life_tick_llm_calls"], 1)
+
+    def test_web_search_result_format_is_neutral_not_first_person(self) -> None:
+        text = format_search_result(
+            "Minecraft模组开发任务结构设计",
+            {
+                "results": [
+                    {
+                        "title": "Example",
+                        "url": "https://example.test",
+                        "snippet": "A result snippet.",
+                    }
+                ]
+            },
+        )
+
+        self.assertIn("[web_search_result]", text)
+        self.assertIn("query: Minecraft模组开发任务结构设计", text)
+        self.assertIn("candidate_count:", text)
+        self.assertIn("candidates:", text)
+        self.assertIn("title: Example", text)
+        self.assertNotIn("我刚刚搜索了", text)
+        self.assertNotIn("搜索结果：", text)
+
+    def test_web_search_result_format_keeps_prompt_material_compact(self) -> None:
+        text = format_search_result(
+            "Minecraft adventure mod",
+            {
+                "results": [
+                    {
+                        "title": "A very long result title " + ("x" * 200),
+                        "url": "https://example.test/" + ("path/" * 80),
+                        "snippet": "snippet " + ("y" * 1000),
+                    }
+                ]
+            },
+            max_chars=420,
+        )
+
+        self.assertLessEqual(len(text), 420)
+        self.assertIn("title:", text)
+        self.assertIn("url:", text)
+        self.assertIn("note:", text)
+        self.assertNotIn("query_match_hint", text)
 
     def test_life_runtime_falls_back_to_full_rewrite_when_patch_misses(self) -> None:
         bad_patch = json.dumps(
@@ -572,6 +1040,7 @@ class LifeRuntimeTests(unittest.TestCase):
                 character_id="life_test",
                 character_data={"name": "Life Test"},
                 memory_backend=DummyMemoryBackend(),
+                memory_system=object(),
                 inner_stream=DummyStream("I am here."),
                 cognition=object(),
                 emotion=object(),
@@ -581,6 +1050,64 @@ class LifeRuntimeTests(unittest.TestCase):
         self.assertTrue(session.life_runtime.started)
         self.assertIsNone(session.inner_stream_loop)
         self.assertIsNone(session.autonomous_step)
+
+    def test_chat_session_primary_life_runtime_keeps_tool_runtime_without_old_loop(self) -> None:
+        with (
+            mock.patch(
+                "kokoro.core.config.life_runtime_config",
+                return_value={"enabled": True, "primary": True, "local_thinking": {"enabled": False}},
+            ),
+            mock.patch("kokoro.life.runtime.LifeRuntime.start", lambda self: None),
+        ):
+            session = ChatSession(
+                character_id="life_test",
+                character_data={"name": "Life Test"},
+                memory_backend=DummyMemoryBackend(),
+                memory_system=object(),
+                inner_stream=DummyStream("I am here."),
+                cognition=object(),
+                emotion=object(),
+            )
+
+        self.assertIsNotNone(session.life_runtime)
+        self.assertIsNotNone(session.life_runtime.action_runtime)
+        self.assertIn("get_current_time", session.life_runtime._available_actions)
+        self.assertIsNone(session.inner_stream_loop)
+        self.assertIsNone(session.autonomous_step)
+
+    def test_chat_session_injected_life_runtime_receives_event_bus_inputs(self) -> None:
+        class FakeLifeRuntime:
+            section = {"primary": True}
+
+            def __init__(self) -> None:
+                self.submitted = []
+                self.started = False
+
+            def submit(self, event):
+                self.submitted.append(event)
+
+            def start(self):
+                self.started = True
+
+        runtime = FakeLifeRuntime()
+        with mock.patch("kokoro.core.config.life_runtime_config", return_value={"enabled": False, "primary": False}):
+            session = ChatSession(
+                character_id="life_test",
+                character_data={"name": "Life Test"},
+                memory_backend=DummyMemoryBackend(),
+                memory_system=object(),
+                inner_stream=DummyStream("I am here."),
+                cognition=object(),
+                emotion=object(),
+                life_runtime=runtime,
+            )
+
+        event = session.record_input_event("direct debug input", source="debug")
+
+        self.assertTrue(runtime.started)
+        self.assertIsNone(session.inner_stream_loop)
+        self.assertIsNone(session.autonomous_step)
+        self.assertEqual(runtime.submitted[-1], event)
 
 
 if __name__ == "__main__":

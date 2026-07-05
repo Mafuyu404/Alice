@@ -99,14 +99,26 @@ def index_tool_prompt_specs(specs: list[ToolPromptSpec]) -> dict[str, ToolPrompt
     return index
 
 
-def render_tool_catalog(specs: list[ToolPromptSpec], enabled_actions: set[str] | list[str] | tuple[str, ...]) -> str:
+def render_tool_catalog(
+    specs: list[ToolPromptSpec],
+    enabled_actions: set[str] | list[str] | tuple[str, ...],
+    *,
+    include_stage_prompts: bool = False,
+    stage_prompt_max_chars: int = 900,
+) -> str:
     enabled = set(enabled_actions)
     lines: list[str] = []
     for spec in specs:
         actions = set(spec.actions or (spec.name,))
         if not actions.intersection(enabled):
             continue
-        lines.append(spec.catalog_line())
+        lines.append(_catalog_line_for_enabled_actions(spec, enabled))
+        if include_stage_prompts:
+            max_chars = max(120, int(stage_prompt_max_chars))
+            if spec.prepare_prompt:
+                lines.append(_stage_prompt_block("prepare", spec.prepare_prompt, max_chars=max_chars))
+            if spec.after_prompt:
+                lines.append(_stage_prompt_block("after", spec.after_prompt, max_chars=max_chars))
     return "\n".join(lines)
 
 
@@ -122,3 +134,23 @@ def _read_optional(base: Path, value: Any) -> str:
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8").strip()
+
+
+def _stage_prompt_block(stage: str, text: str, *, max_chars: int) -> str:
+    text = " ".join(str(text or "").split())
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "..."
+    return f"  {stage}: {text}"
+
+
+def _catalog_line_for_enabled_actions(spec: ToolPromptSpec, enabled: set[str]) -> str:
+    suffixes: list[str] = []
+    if spec.needs_prepare_llm:
+        suffixes.append("prepare LLM")
+    if spec.needs_after_llm:
+        suffixes.append("after LLM")
+    suffix = f" ({', '.join(suffixes)})" if suffixes else ""
+    actions = tuple(action for action in (spec.actions or (spec.name,)) if action in enabled)
+    action_text = ", ".join(actions) if actions else spec.name
+    description = f": {spec.description}" if spec.description else ""
+    return f"- {action_text}{description}{suffix}"
