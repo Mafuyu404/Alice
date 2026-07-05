@@ -1,7 +1,8 @@
-"""Full event sedimentation and model-driven memory lifecycle."""
+"""Model-driven memory lifecycle from experience workspace to long memory."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -23,12 +24,7 @@ class MemoryLifecycleDecision:
 
 
 class MemoryLifecycleWorker:
-    """Turns append-only experience events into retained memory or cold archive.
-
-    The worker is intentionally model-driven: hard code only handles IO,
-    parsing, cursor movement, and safety bounds. Meaning, retention, and
-    forgetting decisions come from the LLM prompt.
-    """
+    """Turns the model-maintained workspace into retained memory."""
 
     def __init__(
         self,
@@ -51,95 +47,63 @@ class MemoryLifecycleWorker:
         self.archive_path.parent.mkdir(parents=True, exist_ok=True)
 
     def run_once(self) -> MemoryLifecycleDecision:
-        events = self._next_events()
-        if not events:
-            return MemoryLifecycleDecision(notes="no new events")
-        decision = self._decide(events)
+        workspace_text = self._workspace_text()
+        workspace_hash = _hash_text(workspace_text)
+        cursor = self._read_cursor()
+        if not workspace_text.strip():
+            return MemoryLifecycleDecision(notes="empty workspace")
+        if workspace_hash and workspace_hash == cursor.get("workspace_hash"):
+            return MemoryLifecycleDecision(notes="workspace unchanged")
+        decision = self._decide(workspace_text, workspace_hash)
         for draft in decision.remember:
             write_draft = getattr(self.memory_system, "write_draft", None)
             if callable(write_draft):
                 write_draft(draft)
         self._append_archive(decision.archive)
-        self._advance_cursor(events)
+        self._advance_cursor(workspace_hash)
         return decision
 
-    def _next_events(self) -> list[dict[str, Any]]:
-        event_log = getattr(self.memory_system, "event_log", None)
-        event_path = getattr(event_log, "path", self.path / "events")
-        event_path = Path(event_path)
-        cursor = self._read_cursor()
-        result: list[dict[str, Any]] = []
-        total_chars = 0
-        for file_path in sorted(event_path.glob("*.jsonl")):
-            if file_path.name < cursor.get("file", ""):
-                continue
-            try:
-                lines = file_path.read_text(encoding="utf-8").splitlines()
-            except OSError:
-                continue
-            start_line = int(cursor.get("line", 0) or 0) if file_path.name == cursor.get("file") else 0
-            for index, line in enumerate(lines[start_line:], start=start_line + 1):
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                content = str(event.get("content") or "").strip()
-                if not content:
-                    continue
-                event["_cursor_file"] = file_path.name
-                event["_cursor_line"] = index
-                result.append(event)
-                total_chars += len(content)
-                if len(result) >= self.batch_size or total_chars >= self.max_chars:
-                    return result
-        return result
+    def _workspace_text(self) -> str:
+        workspace = getattr(self.memory_system, "workspace", None)
+        as_context = getattr(workspace, "as_context", None)
+        if callable(as_context):
+            return str(as_context(max_chars=self.max_chars) or "")
+        return ""
 
-    def _decide(self, events: list[dict[str, Any]]) -> MemoryLifecycleDecision:
+    def _decide(self, workspace_text: str, workspace_hash: str) -> MemoryLifecycleDecision:
         if self.llm_call is None:
-            return MemoryLifecycleDecision(
-                archive=[_archive_item(event, reason="no lifecycle llm configured") for event in events],
-                notes="archived without model decision",
-            )
+            return MemoryLifecycleDecision(notes="no lifecycle llm configured")
         system = load_template("memory/life/lifecycle_system.md")
         user_template = load_template("memory/life/lifecycle_user.md")
         if not system or not user_template:
-            return MemoryLifecycleDecision(
-                archive=[_archive_item(event, reason="missing lifecycle prompt") for event in events],
-                notes="archived without prompts",
-            )
-        user = user_template.replace(
-            "{{ events_json }}",
-            json.dumps([_event_for_prompt(event) for event in events], ensure_ascii=False, indent=2),
-        )
+            return MemoryLifecycleDecision(notes="missing lifecycle prompts")
+        user = user_template.replace("{{ workspace_text }}", workspace_text)
         try:
             raw = self.llm_call(
                 [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                {"function": "memory_lifecycle", "max_tokens": 1200},
+                {"function": "memory_lifecycle", "max_tokens": 300, "timeout": 45},
             )
             data = _extract_json(raw)
         except Exception:
             data = None
         if not isinstance(data, dict):
-            return MemoryLifecycleDecision(
-                archive=[_archive_item(event, reason="lifecycle decision parse failed") for event in events],
-                notes="parse failed",
-            )
-        return self._decision_from_json(data, events)
+            return MemoryLifecycleDecision(notes="parse failed")
+        return self._decision_from_json(data, workspace_hash, workspace_text)
 
     def _decision_from_json(
         self,
         data: dict[str, Any],
-        events: list[dict[str, Any]],
+        workspace_hash: str,
+        workspace_text: str,
     ) -> MemoryLifecycleDecision:
         drafts: list[MemoryRecordDraft] = []
-        event_ids = {str(event.get("event_id") or "") for event in events}
         for item in data.get("remember", []) if isinstance(data.get("remember"), list) else []:
             if not isinstance(item, dict):
                 continue
             content = str(item.get("content") or "").strip()
             if not content:
                 continue
-            source_ids = [str(x) for x in item.get("source_event_ids", []) if str(x) in event_ids]
+            source_ids = [str(x) for x in item.get("source_event_ids", []) if str(x).strip()]
             record_form = str(item.get("record_form") or "episode_note").strip()
             if record_form not in {"raw_event", "episode_note", "distilled_note", "open_thread", "association_note"}:
                 record_form = "episode_note"
@@ -155,17 +119,15 @@ class MemoryLifecycleWorker:
                     tags=_as_list(item.get("tags")),
                     source_event_ids=source_ids,
                     evidence=item.get("evidence") if isinstance(item.get("evidence"), list) else [],
-                    metadata={"lifecycle": "sedimented"},
+                    metadata={"lifecycle": "sedimented", "workspace_hash": workspace_hash},
                 )
             )
-        archive = []
-        archived_ids: set[str] = set()
+        archive: list[dict[str, Any]] = []
         for item in data.get("archive", []) if isinstance(data.get("archive"), list) else []:
             if not isinstance(item, dict):
                 continue
             event_id = str(item.get("event_id") or "").strip()
-            if event_id and event_id in event_ids:
-                archived_ids.add(event_id)
+            if event_id:
                 archive.append(
                     {
                         "event_id": event_id,
@@ -173,10 +135,8 @@ class MemoryLifecycleWorker:
                         "archived_at": now_iso(),
                     }
                 )
-        remembered_ids = {source_id for draft in drafts for source_id in draft.source_event_ids}
-        for event in events:
-            event_id = str(event.get("event_id") or "").strip()
-            if event_id and event_id not in remembered_ids and event_id not in archived_ids:
+        if not drafts and not archive:
+            for event_id in _event_ids_from_workspace(workspace_text):
                 archive.append(
                     {
                         "event_id": event_id,
@@ -201,18 +161,16 @@ class MemoryLifecycleWorker:
         try:
             data = json.loads(self.cursor_path.read_text(encoding="utf-8"))
         except Exception:
-            return {"file": "", "line": 0}
-        return data if isinstance(data, dict) else {"file": "", "line": 0}
+            return {"workspace_hash": ""}
+        return data if isinstance(data, dict) else {"workspace_hash": ""}
 
-    def _advance_cursor(self, events: list[dict[str, Any]]) -> None:
-        if not events:
+    def _advance_cursor(self, workspace_hash: str) -> None:
+        if not workspace_hash:
             return
-        last = events[-1]
         self.cursor_path.write_text(
             json.dumps(
                 {
-                    "file": str(last.get("_cursor_file") or ""),
-                    "line": int(last.get("_cursor_line") or 0),
+                    "workspace_hash": workspace_hash,
                     "updated_at": now_iso(),
                 },
                 ensure_ascii=False,
@@ -222,24 +180,19 @@ class MemoryLifecycleWorker:
         )
 
 
-def _event_for_prompt(event: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "event_id": event.get("event_id"),
-        "timestamp": event.get("timestamp"),
-        "source": event.get("source"),
-        "type": event.get("type"),
-        "tool_name": event.get("tool_name"),
-        "memory_policy": event.get("memory_policy"),
-        "content": event.get("content"),
-    }
+def _hash_text(text: str) -> str:
+    if not str(text or "").strip():
+        return ""
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
 
 
-def _archive_item(event: dict[str, Any], *, reason: str) -> dict[str, Any]:
-    return {
-        "event_id": event.get("event_id"),
-        "reason": reason,
-        "archived_at": now_iso(),
-    }
+def _event_ids_from_workspace(text: str) -> list[str]:
+    result: list[str] = []
+    for match in re.finditer(r"\bevt_[A-Za-z0-9_\-]+", str(text or "")):
+        event_id = match.group(0)
+        if event_id not in result:
+            result.append(event_id)
+    return result[:100]
 
 
 def _extract_json(text: str):

@@ -9,11 +9,13 @@ from pathlib import Path
 
 from kokoro.memory.consolidator import MemoryConsolidator
 from kokoro.memory.event_log import MemoryEventLog
+from kokoro.memory.experience import MemoryExperienceWorker
 from kokoro.memory.index import MemoryIndex
 from kokoro.memory.lifecycle import MemoryLifecycleWorker
 from kokoro.memory.models import MemoryEventDraft, MemoryRecordDraft
 from kokoro.memory.recall import MemoryRecall
 from kokoro.memory.store import MemoryStore
+from kokoro.memory.workspace import MemoryWorkspace
 from kokoro.memory.working_context import MemoryWorkingContext
 
 
@@ -35,10 +37,14 @@ class MemorySystem:
         self.vector_backend = vector_backend
         self.event_log = MemoryEventLog(character_id=character_id, root=self.root)
         self.store = MemoryStore(character_id=character_id, root=self.root)
+        self.workspace = MemoryWorkspace(character_id=character_id, root=self.root)
         self.working_context = MemoryWorkingContext(character_id=character_id, root=self.root)
         self.index = MemoryIndex(character_id=character_id, vector_backend=vector_backend)
         self.consolidator = MemoryConsolidator(character_id=character_id, llm_call=llm_call)
+        self.experience = MemoryExperienceWorker(memory_system=self, llm_call=llm_call)
         self.lifecycle = MemoryLifecycleWorker(memory_system=self, llm_call=llm_call)
+        self.auto_wake_lifecycle = True
+        self.inline_maintenance_enabled = True
         self.recall = MemoryRecall(
             character_id=character_id,
             store=self.store,
@@ -56,7 +62,8 @@ class MemorySystem:
 
     def append_event(self, event: MemoryEventDraft) -> str:
         event_id = self.event_log.append(event)
-        self.wake_lifecycle_worker()
+        if self.auto_wake_lifecycle:
+            self.wake_lifecycle_worker()
         return event_id
 
     def append_input_event(self, event: object) -> str:
@@ -98,7 +105,11 @@ class MemorySystem:
     def default_context(self, **kwargs) -> str:
         if "recent_memory_digest" not in kwargs:
             kwargs["recent_memory_digest"] = self.working_context.read_recent_memory_digest()
-        return self.recall.default_context(**kwargs)
+        recall_context = self.recall.default_context(**kwargs)
+        workspace_context = self.workspace.as_context(max_chars=2400)
+        if not workspace_context:
+            return recall_context
+        return f"{recall_context}\n\n【当前经验工作区】\n{workspace_context}".strip()
 
     def deep_recall(self, query: str, *, limit: int = 8) -> str:
         return self.recall.deep_recall(query, limit=limit)
@@ -116,12 +127,32 @@ class MemorySystem:
         return self.working_context.read_recent_memory_digest(max_chars=max_chars)
 
     def sediment_once(self):
+        self.experience.run_once()
         return self.lifecycle.run_once()
 
+    def maintenance_once(self, *, max_batches: int = 1):
+        decisions = []
+        batches = max(1, int(max_batches or 1))
+        with self._lifecycle_lock:
+            for _ in range(batches):
+                self.experience.run_once()
+                decision = self.lifecycle.run_once()
+                decisions.append(decision)
+                if not decision.remember and not decision.archive:
+                    break
+        return decisions
+
     def set_lifecycle_llm(self, llm_call) -> None:
+        self.experience.llm_call = llm_call
         self.lifecycle.llm_call = llm_call
         if getattr(self.consolidator, "llm_call", None) is None:
             self.consolidator.llm_call = llm_call
+
+    def set_lifecycle_runtime_mode(self, *, auto_wake: bool | None = None, inline: bool | None = None) -> None:
+        if auto_wake is not None:
+            self.auto_wake_lifecycle = bool(auto_wake)
+        if inline is not None:
+            self.inline_maintenance_enabled = bool(inline)
 
     def start_lifecycle_worker(
         self,
@@ -164,6 +195,7 @@ class MemorySystem:
                     break
                 with self._lifecycle_lock:
                     try:
+                        self.experience.run_once()
                         decision = self.lifecycle.run_once()
                     except Exception as exc:
                         logger.warning("memory lifecycle worker failed: %s", exc)

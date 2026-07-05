@@ -19,6 +19,7 @@ from kokoro.action.tools import search_web as search_web_tool
 from kokoro.core import config as cfg
 from kokoro.core import input_events
 from kokoro.core import lifecycle_debug
+from kokoro.memory.models import MemoryEventDraft
 from kokoro.life.context_compactor import ContextCompactor
 from kokoro.life.event_pool import InformationPool
 from kokoro.life.local_thinking import LocalThinking
@@ -69,6 +70,9 @@ class LifeRuntime:
         set_lifecycle_llm = getattr(memory_system, "set_lifecycle_llm", None)
         if callable(set_lifecycle_llm):
             set_lifecycle_llm(self.llm.chat)
+        set_lifecycle_runtime_mode = getattr(memory_system, "set_lifecycle_runtime_mode", None)
+        if callable(set_lifecycle_runtime_mode):
+            set_lifecycle_runtime_mode(auto_wake=False, inline=False)
         self.prompt_manager = PromptManager()
         self.tool_registry = tool_spec.ActionToolRegistry()
         action_tools.register_all(self.tool_registry)
@@ -136,8 +140,8 @@ class LifeRuntime:
         if callable(start_lifecycle):
             memory_section = dict(self.section.get("memory_lifecycle", {}) or {})
             start_lifecycle(
-                interval_seconds=float(memory_section.get("interval_seconds", 20.0) or 20.0),
-                max_batches_per_wake=int(memory_section.get("max_batches_per_wake", 3) or 3),
+                interval_seconds=float(memory_section.get("interval_seconds", 300.0) or 300.0),
+                max_batches_per_wake=int(memory_section.get("max_batches_per_wake", 1) or 1),
             )
         lifecycle_debug.log("life.runtime.start", interval=self._loop_interval)
 
@@ -163,6 +167,17 @@ class LifeRuntime:
         self.time.mark_event(event_type=event.type)
         pooled = self.pool.add(event)
         self.compactor.append_event(event, self.pool.format_batch([pooled], max_chars=1200))
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="runtime_input",
+            content=self.pool.format_batch([pooled], max_chars=1200),
+            memory_policy="experience",
+            metadata={
+                "input_type": event.type,
+                "origin": event.source,
+                "sequence": pooled.sequence,
+            },
+        )
         self._wake.set()
 
     def attach_action_runtime(self, action_runtime) -> None:
@@ -182,6 +197,14 @@ class LifeRuntime:
         inner_stream = _inner_stream_text(self.session)
         time_context = self.time.render()
         digest = self.compactor.compact_once(time_context=time_context, inner_stream=inner_stream)
+        if digest:
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="context_digest",
+                content=digest,
+                memory_policy="experience",
+                metadata={"phase": "before_think"},
+            )
         event_text = self.pool.format_batch(batch, max_chars=int(self.section.get("batch_max_chars", 4000) or 4000))
         thought = self._think(
             inner_stream=inner_stream,
@@ -197,12 +220,30 @@ class LifeRuntime:
             text=thought,
             json_ok=isinstance(data, dict),
         )
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="inner_thought",
+            content=thought,
+            memory_policy="experience",
+            metadata={
+                "json_ok": isinstance(data, dict),
+                "processed_events": len(batch),
+                "trace_dir": self._last_prompt_trace_dir or "",
+            },
+        )
         if not isinstance(data, dict):
             parse_reason = _json_parse_error(thought)
             lifecycle_debug.log(
                 "life.runtime.thought_parse_failed",
                 reason=parse_reason,
                 text=thought,
+            )
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="inner_thought_parse_failed",
+                content=f"{parse_reason}\n\n{thought}",
+                memory_policy="experience",
+                metadata={"trace_dir": self._last_prompt_trace_dir or ""},
             )
             repaired = self._repair_json_thought(thought, parse_reason=parse_reason)
             if repaired:
@@ -217,21 +258,60 @@ class LifeRuntime:
                     thought = repaired
                     data = repaired_data
                     lifecycle_debug.log("life.runtime.thought_repair_applied")
+                    self._append_memory_event(
+                        source="life_runtime",
+                        event_type="inner_thought_repaired",
+                        content=repaired,
+                        memory_policy="experience",
+                        metadata={"trace_dir": self._last_prompt_trace_dir or ""},
+                    )
                 else:
                     lifecycle_debug.log(
                         "life.runtime.thought_repair_failed",
                         reason=_json_parse_error(repaired),
+                    )
+                    self._append_memory_event(
+                        source="life_runtime",
+                        event_type="inner_thought_repair_failed",
+                        content=f"{_json_parse_error(repaired)}\n\n{repaired}",
+                        memory_policy="experience",
+                        metadata={"trace_dir": self._last_prompt_trace_dir or ""},
                     )
         self.time.mark_llm_thought()
         patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
         self._record_pending_threads_from_data(data)
         action_plan = _extract_action_plan_from_data(data)
         self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
+        if action_plan:
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="action_plan_selected",
+                content=json.dumps(action_plan, ensure_ascii=False, indent=2, default=str),
+                memory_policy="experience",
+                metadata={"trace_dir": self._last_prompt_trace_dir or ""},
+            )
         intensity = _extract_intensity_from_data(data)
         action_plan_status = ""
         action_plan_error = ""
         if action_plan:
             action_plan_status, action_plan_error = self._execute_action_plan(action_plan)
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="action_plan_finished",
+                content=json.dumps(
+                    {
+                        "status": action_plan_status,
+                        "error": action_plan_error,
+                        "plan": action_plan,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                memory_policy="experience",
+                metadata={"trace_dir": self._last_prompt_trace_dir or ""},
+            )
+        self._run_memory_core_cycle()
         lifecycle_debug.log(
             "life.runtime.tick_done",
             processed_events=len(batch),
@@ -335,14 +415,98 @@ class LifeRuntime:
             {
                 "function": "life_tick",
                 "max_tokens": int(self.section.get("tick_max_tokens", 640) or 640),
+                "timeout": int(self.section.get("tick_timeout", 90) or 90),
             },
         )
+
+    def _append_memory_event(
+        self,
+        *,
+        source: str,
+        event_type: str,
+        content: str,
+        memory_policy: str = "experience",
+        metadata: dict[str, Any] | None = None,
+        tool_name: str = "",
+    ) -> None:
+        text = str(content or "").strip()
+        if not text:
+            return
+        memory_system = getattr(self.session, "memory_system", None)
+        append_event = getattr(memory_system, "append_event", None)
+        if not callable(append_event):
+            return
+        try:
+            append_event(
+                MemoryEventDraft(
+                    character_id=str(getattr(self.session, "character_id", "default") or "default"),
+                    source=source,
+                    event_type=event_type,
+                    content=text,
+                    memory_policy=memory_policy,  # type: ignore[arg-type]
+                    tool_name=tool_name,
+                    metadata=dict(metadata or {}),
+                )
+            )
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.memory_event_append_error", event_type=event_type, error=str(exc))
+
+    def _run_memory_core_cycle(self) -> None:
+        memory_system = getattr(self.session, "memory_system", None)
+        if memory_system is not None and not bool(getattr(memory_system, "inline_maintenance_enabled", True)):
+            wake = getattr(memory_system, "wake_lifecycle_worker", None)
+            now = time.monotonic()
+            last = float(getattr(self, "_last_memory_worker_wake", 0.0) or 0.0)
+            wake_seconds = float(self.section.get("memory_core_wake_seconds", 300.0) or 300.0)
+            if callable(wake) and now - last >= max(1.0, wake_seconds):
+                self._last_memory_worker_wake = now
+                wake()
+                lifecycle_debug.log("life.runtime.memory_core_deferred", wake=True)
+            else:
+                lifecycle_debug.log("life.runtime.memory_core_deferred", wake=False)
+            return
+        maintenance = getattr(memory_system, "maintenance_once", None)
+        if not callable(maintenance):
+            return
+        try:
+            decisions = maintenance(max_batches=int(self.section.get("memory_core_batches_per_tick", 1) or 1))
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.memory_core_error", error=str(exc))
+            return
+        remembered = sum(len(getattr(decision, "remember", []) or []) for decision in decisions or [])
+        archived = sum(len(getattr(decision, "archive", []) or []) for decision in decisions or [])
+        notes = [str(getattr(decision, "notes", "") or "").strip() for decision in decisions or []]
+        notes = [note for note in notes if note]
+        lifecycle_debug.log(
+            "life.runtime.memory_core_cycle",
+            decisions=len(decisions or []),
+            remembered=remembered,
+            archived=archived,
+            notes=notes,
+        )
+        if remembered or archived or notes:
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="memory_core_cycle",
+                content=json.dumps(
+                    {
+                        "decisions": len(decisions or []),
+                        "remembered": remembered,
+                        "archived": archived,
+                        "notes": notes,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                memory_policy="debug",
+                metadata={"remembered": remembered, "archived": archived},
+            )
 
     def _memory_context(self, *, event_text: str, inner_stream: str, digest: str) -> str:
         memory_system = getattr(self.session, "memory_system", None)
         if memory_system is not None:
             try:
-                return str(
+                context = str(
                     memory_system.default_context(
                         event_text=event_text,
                         inner_stream=inner_stream,
@@ -351,6 +515,19 @@ class LifeRuntime:
                     )
                     or ""
                 ).strip()
+                if context:
+                    self._append_memory_event(
+                        source="life_runtime",
+                        event_type="memory_context_presented",
+                        content=context,
+                        memory_policy="experience",
+                        metadata={
+                            "event_chars": len(event_text or ""),
+                            "inner_stream_chars": len(inner_stream or ""),
+                            "digest_chars": len(digest or ""),
+                        },
+                    )
+                return context
             except Exception as exc:
                 lifecycle_debug.log("life.runtime.memory_system_context_error", error=str(exc))
 
@@ -474,10 +651,7 @@ class LifeRuntime:
             unavailable.add("vts_motion")
         if context.get("retire_sticker_store") is None:
             unavailable.add("retire_sticker")
-        memory_system = context.get("memory_system")
-        memory_backend = context.get("memory_backend")
-        if memory_system is None and (memory_backend is None or not getattr(memory_backend, "ready", False)):
-            unavailable.update({"search_memory", "save_to_memory"})
+        unavailable.update({"search_memory", "save_to_memory", "write_conversation_memory"})
         if not self._cached_availability("search_web", lambda: _web_search_available(context.get("web_search_client"))):
             unavailable.add("search_web")
         if context.get("task_manager") is None:
@@ -545,6 +719,17 @@ class LifeRuntime:
         result = apply_inner_stream_patch(inner_stream, patch, max_chars=max_chars)
         if not result.applied:
             lifecycle_debug.log("life.runtime.patch_not_applied", reason=result.reason, patch=patch)
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="inner_stream_patch_failed",
+                content=json.dumps(
+                    {"reason": result.reason, "patch": raw_patch},
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+                memory_policy="experience",
+            )
             return self._rewrite_inner_stream_fallback(
                 inner_stream=inner_stream,
                 raw_patch=raw_patch,
@@ -573,6 +758,23 @@ class LifeRuntime:
             before=before,
             after=getattr(stream, "text", result.text),
             reason=patch.reason,
+        )
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="inner_stream_patch_applied",
+            content=json.dumps(
+                {
+                    "version": self._inner_stream_version,
+                    "reason": patch.reason,
+                    "patch": raw_patch,
+                    "before": before,
+                    "after": getattr(stream, "text", result.text),
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            memory_policy="experience",
         )
         return True
 
@@ -630,6 +832,22 @@ class LifeRuntime:
             failure_reason=failure_reason,
             debug=debug,
         )
+        self._append_memory_event(
+            source="life_runtime",
+            event_type="inner_stream_patch_fallback",
+            content=json.dumps(
+                {
+                    "applied": applied,
+                    "failure_reason": failure_reason,
+                    "fallback_text": text,
+                    "debug": debug,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
+            memory_policy="experience",
+        )
         return applied
 
     def _record_pending_threads_from_thought(self, thought: str) -> None:
@@ -645,6 +863,12 @@ class LifeRuntime:
             text = str(value or "").strip()
         if text:
             self.compactor.record_pending_threads(text)
+            self._append_memory_event(
+                source="life_runtime",
+                event_type="pending_threads",
+                content=text,
+                memory_policy="experience",
+            )
 
 
 def _inner_stream_text(session) -> str:
