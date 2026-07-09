@@ -113,13 +113,15 @@ class PromptManagementTests(unittest.TestCase):
         tick = load_template("life/inner_stream_tick.md")
         combined = base + "\n" + tick
 
-        self.assertIn('"id":"a1","tool":"search_web"', combined)
-        self.assertIn('"id":"a1 tool=search_web"', combined)
-        self.assertIn("不要把工具名、等号、空格或参数塞进 id", combined)
+        self.assertIn('"id":"a1","tool":"能力名"', combined)
+        self.assertIn('"id":"a1 tool=能力名"', combined)
+        self.assertIn("不要把能力名、等号、空格或参数塞进 id", combined)
         self.assertIn("pending_threads 是留给未来自己的自然牵挂", combined)
         self.assertIn("不要只在 notes 里说", combined)
         self.assertIn("写 inner_stream 时用“问题如何变了”", combined)
-        self.assertIn("正确写法", combined)
+        self.assertNotIn('"tool":"search_web"', combined)
+        self.assertNotIn("read_article", combined)
+        self.assertNotIn("download_source_code", combined)
 
     def test_memory_templates_are_filesystem_backed_strict_templates(self) -> None:
         cognition = load_template("memory/cognition_evaluate_user.md")

@@ -16,7 +16,6 @@ enabled = true
 #        "save_to_memory", "send_qq_message", "retire_sticker", "vts_expression", "vts_motion", "claude_code_exec",
 #        "check_task_progress", "list_active_tasks", "cancel_task"
 tools = [
-  "look_at_screen",
   "search_memory",
   "get_current_time",
   "get_current_app",

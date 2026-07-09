@@ -1,150 +1,112 @@
-# Action Tool Module Contract
+# 行动工具模块规范
 
-`kokoro.action.tools` is the capability layer.  CLI code is an entry/runtime
-assembly surface: it may call public tool facades to load sessions, create
-runtime bundles, and start loops.  Executable behavior, local routing rules,
-clients, long-lived resources, and tool-specific refinement belong in a tool
-module.
+`kokoro.action.tools` 是能力层。CLI 代码只是入口和运行时组装面：它可以调用公开工具门面来加载会话、创建运行时资源包、启动循环。可执行行为、本地路由规则、客户端、长生命周期资源，以及工具专属提炼逻辑，都属于对应工具模块。
 
-## Directory Shape
+## 目录形状
 
-Each action tool owns one directory:
+每个行动工具拥有一个独立目录：
 
 ```text
 tools/<tool_name>/
-  __init__.py    # public facade: register(registry) and stable helpers only
-  spec.py        # schema constants and ToolSpec registration
-  prepare.py     # optional: turn an Action into executable PreparedAction
-  execute.py     # execute the prepared action
-  after.py       # optional: follow-up behavior after execution
-  runtime.py     # optional: long-lived resources or local runtime helpers
-  config.py      # optional: tool-owned defaults and config loading
+  __init__.py    # 公开门面：只放 register(registry) 和稳定 helper
+  spec.py        # schema 常量和 ToolSpec 注册
+  prepare.py     # 可选：把 Action 转成可执行的 PreparedAction
+  execute.py     # 执行 prepared action
+  after.py       # 可选：执行后的后续行为
+  runtime.py     # 可选：长生命周期资源或本地运行时 helper
+  config.py      # 可选：工具自有默认值和配置加载
 ```
 
-Registered action tools must keep `spec.py` and `execute.py` in the tool
-directory.  Pure query tools may omit `prepare.py`; tools with no follow-up
-behavior may omit `after.py`.  New behavior should not be added to `cli.py`,
-`tool_schemas.py`, or `tool_handlers.py`.
+已注册行动工具必须把 `spec.py` 和 `execute.py` 放在工具目录里。纯查询工具可以省略 `prepare.py`；没有后续行为的工具可以省略 `after.py`。新行为不应该继续加到 `cli.py`、`tool_schemas.py` 或 `tool_handlers.py`。
 
-Runtime-only capability modules also live under `tools/`, but they are not
-registered as `Action` tools.  Examples are input sources, bridges, live
-runtimes, and text-CLI helpers.  These directories must be listed in
-`RUNTIME_MODULE_NAMES` so the package boundary stays explicit.  Runtime-only
-modules must have `__init__.py`, must not expose `register(registry)`, and must
-not contain `spec.py`, `prepare.py`, `execute.py`, or `after.py`.
+仅运行时能力模块也放在 `tools/` 下，但它们不是注册的 `Action` 工具。例如输入源、桥接、直播运行时、文本 CLI helper。这些目录必须列在 `RUNTIME_MODULE_NAMES` 里，让包边界保持显式。仅运行时模块必须有 `__init__.py`，不能暴露 `register(registry)`，也不能包含 `spec.py`、`prepare.py`、`execute.py` 或 `after.py`。
 
-## Lifecycle
+## 生命周期
 
-Tools are registered through:
+工具通过下面的入口注册：
 
 ```python
 def register(registry: ActionToolRegistry) -> None:
     registry.register(ToolSpec(...))
 ```
 
-`ToolSpec` declares:
+`ToolSpec` 声明：
 
-- `name`: public tool capability name.
-- `actions`: all `Action.action` values handled by this tool.
-- `schema`: optional function-call schema, defined in the local `spec.py`.
-- `prepare`: optional preparation stage.
-- `execute`: required execution stage.
-- `after`: optional post-execution hook.
-- `default_visibility` and `default_result_policy`: event feedback behavior.
+- `name`：公开工具能力名。
+- `actions`：这个工具处理的所有 `Action.action` 值。
+- `schema`：可选的 function-call schema，定义在本地 `spec.py`。
+- `prepare`：可选准备阶段。
+- `execute`：必需执行阶段。
+- `after`：可选执行后 hook。
+- `default_visibility` 和 `default_result_policy`：事件反馈行为。
 
-Registered hooks are part of the module contract:
+已注册 hook 是模块契约的一部分：
 
-- `execute` must be implemented by the tool's own `execute.py`.
-- `prepare`, when present, must be implemented by the tool's own `prepare.py`.
-- `after`, when present, must be implemented by the tool's own `after.py`.
-- A registered action tool cannot also be listed in `RUNTIME_MODULE_NAMES`.
-- Each `Action.action` value is owned by exactly one registered `ToolSpec`.
+- `execute` 必须由工具自己的 `execute.py` 实现。
+- `prepare` 如果存在，必须由工具自己的 `prepare.py` 实现。
+- `after` 如果存在，必须由工具自己的 `after.py` 实现。
+- 已注册行动工具不能同时列在 `RUNTIME_MODULE_NAMES`。
+- 每个 `Action.action` 值只归一个已注册 `ToolSpec` 所有。
 
-## Prepare Rules
+## Prepare 规则
 
-`prepare` belongs to the tool, not the generic action selector.  Use it when a
-tool needs focused work before execution:
+`prepare` 属于工具，不属于通用行动选择器。当工具在执行前需要聚焦处理时使用它：
 
-- `say`: turn an intention into final speech context or text.
-- `search_web`: extract a precise query from the action reason and context.
-- `memory`: consolidate event details into memory content.
-- `observe_screen`: normalize the visual focus.
-- `qq` and stickers: select a target or candidate set.
+- `say`：把意图转成最终说话上下文或文本。
+- `search_web`：从行动理由和上下文中提取精确 query。
+- `memory`：把事件细节整合成记忆内容。
+- `observe_screen`：规范化视觉关注点。
+- `qq` 和表情包：选择目标或候选集。
 
-Extra LLM calls needed for a specific tool should happen in that tool's
-preparation stage or a tool-owned helper called by `prepare`.
+某个工具需要额外 LLM 调用时，应发生在这个工具的准备阶段，或由 `prepare` 调用的工具自有 helper 中。
 
-The action selector decides whether a capability should be used.  Tool-specific
-argument refinement, search query extraction, memory consolidation, and final
-speech shaping stay inside the selected tool's `prepare` stage so the selector
-does not grow tool-specific reasoning branches.
+行动选择器只决定是否使用某个能力。工具专属参数提炼、搜索 query 提取、记忆整合、最终说话塑形，都留在已选工具的 `prepare` 阶段，避免选择器膨胀出工具专属推理分支。
 
-## Import Boundaries
+## 导入边界
 
-Core action modules may import tool package facades:
+核心行动模块可以导入工具包门面：
 
 ```python
 from kokoro.action.tools import search_web
 ```
 
-They should not import tool internals such as
-`kokoro.action.tools.search_web.client`.  CLI runtime modules may assemble
-resources through public facades.  Top-level legacy modules under
-`kokoro.action` should be thin compatibility facades while old imports are being
-retired.
+它们不应该导入工具内部模块，例如 `kokoro.action.tools.search_web.client`。CLI 运行时模块可以通过公开门面组装资源。`kokoro.action` 下的顶层旧模块应该只是很薄的兼容门面，等待旧导入逐步退场。
 
-Tool modules may import their own internal files.  Cross-tool access must go
-through the other tool's package facade:
+工具模块可以导入自己的内部文件。跨工具访问必须通过对方工具的包门面：
 
 ```python
 from kokoro.action.tools import say as say_tool
 ```
 
-Do not import another tool's internal modules from either implementation files
-or package facades.  A tool facade is the public boundary for that tool; it
-should not re-export another tool's private implementation details.
+不要从实现文件或包门面导入另一个工具的内部模块。工具门面是这个工具的公开边界；它不应该重新导出另一个工具的私有实现细节。
 
-## Capability Ownership
+## 能力归属
 
-Place attached behavior with the capability it serves:
+附属行为放到它服务的能力下面：
 
-- `say`: proactive/local speech, final speech shaping, TTS, subtitles,
-  portrait output, echo filtering, and AEC.
-- `speech_input`: microphone, STT, speech turn buffering, overlap handling, and
-  speech-derived text events.
-- `search_web`: query extraction, web clients, daemon/runtime search helpers,
-  and search-result feedback.
-- `memory`: memory search, memory writes, and memory-content consolidation.
-- `observe_screen`: screen vision, foreground app, screen interest, visual user
-  commands, and page/screen caches.
-- `qq`: QQ bridge/input/media/sticker support that is runtime or channel-level;
-  public message/sticker actions register through action tools.
-- `vts`: expressions, motions, VTS controller/runtime, and body driver helpers.
-- `live`: live platform input/runtime integration.
-- `debug_input`: persistent high-priority text debug input and log-driven debug
-  automation.
-- `task`: long-running task creation, progress, listing, and cancellation.
+- `say`：主动/本地说话、最终说话塑形、TTS、字幕、画像输出、回声过滤和 AEC。
+- `speech_input`：麦克风、STT、语音轮次缓冲、重叠处理和语音派生文本事件。
+- `search_web`：query 提取、网页客户端、daemon/运行时搜索 helper 和搜索结果反馈。
+- `memory`：记忆搜索、记忆写入和记忆内容整合。
+- `observe_screen`：屏幕视觉、前台应用、屏幕兴趣、视觉用户命令，以及页面/屏幕缓存。
+- `qq`：QQ 桥接、输入、媒体、表情包支持；公开消息/表情动作通过行动工具注册。
+- `vts`：表情、动作、VTS 控制器/运行时和身体驱动 helper。
+- `live`：直播平台输入和运行时集成。
+- `debug_input`：持久高优先级纯文本调试输入，以及日志驱动调试自动化。
+- `task`：长任务创建、进度、列表和取消。
 
-## Registry Boundaries
+## 注册边界
 
-`tools.__init__` owns the registry manifest:
+`tools.__init__` 拥有注册清单：
 
-- `TOOL_MODULES`: action tool packages that must expose `spec.py` and
-  `register(registry)`.
-- `TOOL_ACTIONS`: all registered action names, including non-function-call
-  actions such as `say` and `wait`.
-- `DEFAULT_ENABLED_TOOL_ACTIONS`: default function-call tools for the legacy
-  OpenAI-compatible tool loop.
-- `RUNTIME_MODULE_NAMES`: tool-package directories that provide runtime or
-  input capabilities but are not registered as action tools.
-- `register_all(registry)`: imports tool modules and registers their specs.
+- `TOOL_MODULES`：必须暴露 `spec.py` 和 `register(registry)` 的行动工具包。
+- `TOOL_ACTIONS`：所有已注册 action name，包括 `say` 和 `wait` 这类非 function-call action。
+- `DEFAULT_ENABLED_TOOL_ACTIONS`：旧 OpenAI 兼容工具循环默认启用的 function-call 工具。
+- `RUNTIME_MODULE_NAMES`：提供运行时或输入能力、但不注册为行动工具的工具包目录。
+- `register_all(registry)`：导入工具模块并注册它们的 spec。
 
-`kokoro.action.tool_schemas` is compatibility-only.  New schemas must be placed
-in the corresponding tool module.
+`kokoro.action.tool_schemas` 只做兼容。新 schema 必须放到对应工具模块里。
 
-## Feedback
+## 反馈
 
-Every tool result must return a `ToolResult` or string.  `ActionRuntime` writes
-started/result events with `cycle_id`, `action_id`, and `causality_id`; tools
-should put tool-specific details in `ToolResult.metadata` rather than publishing
-parallel ad-hoc result channels.
+每个工具结果必须返回 `ToolResult` 或字符串。`ActionRuntime` 会写入带有 `cycle_id`、`action_id` 和 `causality_id` 的 started/result 事件；工具应该把专属细节放进 `ToolResult.metadata`，而不是发布并行的临时结果通道。

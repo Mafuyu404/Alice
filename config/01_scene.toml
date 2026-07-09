@@ -5,9 +5,9 @@
 # 场景由多个独立开关组合，不再用 single_live/multi_live 这类混合枚举。
 # multi_enabled 控制是否按多人场景理解说话人。
 # live_enabled 控制是否按直播场景理解弹幕/观众输入。
-# random_mc_enabled 控制是否按“随机 MC 百科页面”理解当前网页。
-# 多个开关可以组合；例如多人 + 随机 MC 表示多个角色一起讨论当前随机页面。
+# page_scene_enabled 控制是否把当前网页缓存当作持续页面讲解/研究场景。
+# 多个开关可以组合；例如多人 + 页面场景表示多个角色一起讨论当前页面。
 [scene]
 multi_enabled = false
 live_enabled = false
-random_mc_enabled = true
+page_scene_enabled = false

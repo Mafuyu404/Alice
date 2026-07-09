@@ -244,10 +244,7 @@ def _refined_query(query: str) -> str:
     value = str(query or "").strip()
     if not value:
         return ""
-    additions: list[str] = []
-    if not re.search(r"Minecraft|我的世界|模组|mod", value, flags=re.I):
-        additions.extend(["我的世界", "模组"])
-    return " ".join([value, *additions]).strip()
+    return value
 
 
 def _extract_search_items(value: Any) -> list[dict[str, Any]]:

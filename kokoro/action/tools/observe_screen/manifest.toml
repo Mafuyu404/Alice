@@ -1,7 +1,7 @@
 id = "observe_screen"
 name = "observe_screen"
 actions = ["observe_screen", "look_at_screen"]
-description = "Observe the current screen when visual context is needed."
+description = "Observe only the currently visible local computer screen when the present visual environment matters. This is a perception tool for the life carrier, not a way to open webpages, inspect documentation, browse remote sources, or replace a domain-specific information tool."
 needs_prepare_llm = true
 needs_after_llm = true
 prepare_prompt = "prepare.md"

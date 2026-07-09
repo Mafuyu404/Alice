@@ -10,7 +10,7 @@ LOOK_AT_SCREEN_SCHEMA = {
     "type": "function",
     "function": {
         "name": "look_at_screen",
-        "description": "Capture and analyze the current screen when visual context is needed.",
+        "description": "Capture and analyze only the currently visible computer screen when immediate visual environment context is needed. It does not open webpages, inspect remote sources, or read a requested site.",
         "parameters": {
             "type": "object",
             "properties": {

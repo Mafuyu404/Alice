@@ -38,7 +38,7 @@ vision_max_pixels = 921600
 
 [edge_page_cache]
 # 是否开启 Edge 网页正文缓存。
-enabled = true
+enabled = false
 
 # 抓取间隔（秒）。
 interval_seconds = 1.0
@@ -65,6 +65,10 @@ request_timeout = 3.0
 
 [screen_watch]
 # 是否开启持续屏幕截图分析。
+enabled = false
+
+[observe_screen]
+# 是否允许生命流/工具调用主动截屏观察当前电脑屏幕。
 enabled = false
 
 # 截图分析的最小间隔（秒）。

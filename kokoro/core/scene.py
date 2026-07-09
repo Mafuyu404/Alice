@@ -63,28 +63,25 @@ def live_enabled(config: dict | None = None) -> bool:
     return is_live(resolve(config))
 
 
-def random_mc_enabled(config: dict | None = None) -> bool:
+def page_scene_enabled(config: dict | None = None) -> bool:
     if config is None:
         config = _cfg.load()
     section = config.get("scene", {})
     if not isinstance(section, dict):
         return False
-    return bool(section.get("random_mc_enabled", False))
+    return bool(section.get("page_scene_enabled", False))
 
 
-def random_mc_guidance() -> str:
+def page_scene_guidance() -> str:
     return (
-        "【随机 MC 百科场景】\n"
-        "浏览器里会周期性打开 Minecraft 百科的随机页面，可能是模组、整合包、物品、机制或相关条目。"
-        "当前网页缓存是这个场景的核心材料。发言应围绕页面中明确出现的标题、简介、正文、版本、玩法、作者、依赖、特性或争议展开，"
+        "【页面讲解/研究场景】\n"
+        "浏览器里的当前页面会作为持续变化的外部材料进入对话。"
+        "当前网页缓存是这个场景的核心材料。发言应围绕页面中明确出现的标题、简介、正文、版本、作者、来源、机制、结构、特性或争议展开，"
         "可以介绍、评价、吐槽、比较或提出观察，但不能编造页面没有出现的具体内容。"
-        "默认把自己当成熟悉 MC 模组社区和整合包社区的人：知道常见的模组定位、作者习惯、整合包配方思路、玩家口碑、版本兼容焦虑，"
-        "也知道百科条目里哪些信息最值得先看。"
-        "同时保留一点初级模组开发者视角：会自然注意命名、配方门槛、依赖关系、兼容成本、版本选择、资源闭环、任务线引导、"
-        "配置暴露程度、是否便于维护，以及设计到底是在服务玩家体验还是服务作者自己。"
-        "评论时优先像圈内人一样说人话：既能聊社区印象和玩法价值，也能聊实现和维护层面的取舍。"
-        "不要装成全知的资深作者；不确定就明确说不确定，可以用“像是”“大概是在”“这看起来更像”这类谨慎判断。"
-        "如果页面切换到新随机条目，要自然转向新页面；如果缓存为空或看不清，就直接说明信息不够。"
+        "默认把自己当成正在认真理解这个页面的人：先抓住页面事实，再根据角色自己的经验、兴趣和关系自然评价。"
+        "可以注意命名、结构、来源、版本、依赖、维护成本、使用门槛、体验路径和设计取舍，但这些角度必须服务当前页面本身。"
+        "不要装成全知；不确定就明确说不确定，可以用“像是”“大概是在”“这看起来更像”这类谨慎判断。"
+        "如果页面切换到新条目，要自然转向新页面；如果缓存为空或看不清，就直接说明信息不够。"
     )
 
 
@@ -99,8 +96,8 @@ def guidance_text(
     parts = []
     if raw:
         parts.append(raw.format(user_name=user_name, name=character_name))
-    if random_mc_enabled(config):
-        parts.append(random_mc_guidance())
+    if page_scene_enabled(config):
+        parts.append(page_scene_guidance())
     return "\n\n".join(parts)
 
 

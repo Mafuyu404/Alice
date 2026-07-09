@@ -59,7 +59,7 @@ agent_loop.agent_chat() → 流式回复
 
 后台定时调用 `auto_turn()`：
 1. 检查是否有到期计划要执行
-2. 检查随机 MC 页面是否切换
+2. 检查页面场景是否切换
 3. 如果都无，调用 `decide(event=idle_tick)`
 4. 返回 (character_id, name, reply)
 
@@ -75,10 +75,10 @@ agent_loop.agent_chat() → 流式回复
 - `live_enabled = true` → `scene_guidance` 注入直播理解方式
 - 弹幕内容通过 `extra_context` 送入 planner
 
-### 随机 MC 页面讲解
+### 页面讲解/研究场景
 
-- `random_mc_enabled = true`
-- 页面切换时 `random_mc_page_changed` 事件强制角色转向新页面
+- `page_scene_enabled = true`
+- 页面切换时 `page_scene_changed` 事件强制角色转向新页面
 - Idle tick 时维持讲解活跃度，不轻易 silence
 - 每个角色从自己的角度评价同一页面
 
@@ -89,7 +89,7 @@ planner 失败（网络/JSON 解析问题）时：
 ```text
 user_utterance fallback → 由发言最少的角色接话
 character_utterance fallback → 由另一个角色接上一句
-idle_tick + 随机 MC + 页面变化 → 强制转向当前页
+idle_tick + 页面场景 + 页面变化 → 强制转向当前页
 ```
 
 ## 预取（Prefetch）

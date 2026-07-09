@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -37,6 +38,8 @@ class MemoryExperienceWorker:
         llm_call: LlmCall | None = None,
         batch_size: int = 8,
         max_chars: int = 2500,
+        catch_up_max_age_seconds: float = 3600.0,
+        catch_up_tail_events: int = 64,
     ) -> None:
         self.memory_system = memory_system
         self.character_id = str(getattr(memory_system, "character_id", "") or "")
@@ -44,6 +47,8 @@ class MemoryExperienceWorker:
         self.llm_call = llm_call
         self.batch_size = max(1, int(batch_size))
         self.max_chars = max(1000, int(max_chars))
+        self.catch_up_max_age_seconds = max(0.0, float(catch_up_max_age_seconds))
+        self.catch_up_tail_events = max(1, int(catch_up_tail_events))
         self.path = self.root / "characters" / self.character_id / "memory"
         self.path.mkdir(parents=True, exist_ok=True)
         self.cursor_path = self.path / "workspace" / "experience_cursor.json"
@@ -61,6 +66,9 @@ class MemoryExperienceWorker:
         event_log = getattr(self.memory_system, "event_log", None)
         event_path = Path(getattr(event_log, "path", self.path / "events"))
         cursor = self._read_cursor()
+        catch_up = self._recent_tail_if_backlog_is_stale(event_path, cursor)
+        if catch_up:
+            return catch_up
         result: list[dict[str, Any]] = []
         total_chars = 0
         for file_path in sorted(event_path.glob("*.jsonl")):
@@ -76,6 +84,8 @@ class MemoryExperienceWorker:
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if str(event.get("memory_policy") or "experience") != "experience":
+                    continue
                 content = str(event.get("content") or "").strip()
                 if not content:
                     continue
@@ -85,6 +95,73 @@ class MemoryExperienceWorker:
                 total_chars += len(content)
                 if len(result) >= self.batch_size or total_chars >= self.max_chars:
                     return result
+        return result
+
+    def _recent_tail_if_backlog_is_stale(self, event_path: Path, cursor: dict[str, Any]) -> list[dict[str, Any]]:
+        if self.catch_up_max_age_seconds <= 0:
+            return []
+        files = sorted(event_path.glob("*.jsonl"))
+        if not files:
+            return []
+        first_pending = self._first_pending_event(files, cursor)
+        if not first_pending:
+            return []
+        first_time = _parse_time(first_pending.get("timestamp"))
+        if first_time is None:
+            return []
+        age = (datetime.now(first_time.tzinfo) - first_time).total_seconds()
+        if age <= self.catch_up_max_age_seconds:
+            return []
+        return self._tail_events(files[-1])
+
+    def _first_pending_event(self, files: list[Path], cursor: dict[str, Any]) -> dict[str, Any] | None:
+        for file_path in files:
+            if file_path.name < cursor.get("file", ""):
+                continue
+            try:
+                lines = file_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            start_line = int(cursor.get("line", 0) or 0) if file_path.name == cursor.get("file") else 0
+            for index, line in enumerate(lines[start_line:], start=start_line + 1):
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if str(event.get("memory_policy") or "experience") != "experience":
+                    continue
+                content = str(event.get("content") or "").strip()
+                if not content:
+                    continue
+                event["_cursor_file"] = file_path.name
+                event["_cursor_line"] = index
+                return event
+        return None
+
+    def _tail_events(self, file_path: Path) -> list[dict[str, Any]]:
+        try:
+            lines = file_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        result: list[dict[str, Any]] = []
+        total_chars = 0
+        start = max(0, len(lines) - max(self.catch_up_tail_events, self.batch_size))
+        for index, line in enumerate(lines[start:], start=start + 1):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(event.get("memory_policy") or "experience") != "experience":
+                continue
+            content = str(event.get("content") or "").strip()
+            if not content:
+                continue
+            event["_cursor_file"] = file_path.name
+            event["_cursor_line"] = index
+            result.append(event)
+            total_chars += len(content)
+            if len(result) >= self.batch_size or total_chars >= self.max_chars:
+                break
         return result
 
     def _update_workspace(self, events: list[dict[str, Any]]) -> bool:
@@ -187,6 +264,16 @@ def _extract_json(text: str):
         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if not match:
             return None
+
+
+def _parse_time(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
         try:
             return json.loads(match.group(0))
         except Exception:

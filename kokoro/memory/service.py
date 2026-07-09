@@ -55,6 +55,7 @@ class MemorySystem:
         self._lifecycle_wake = threading.Event()
         self._lifecycle_thread: threading.Thread | None = None
         self._lifecycle_lock = threading.Lock()
+        self.last_experience_result: dict[str, object] = {}
 
     @property
     def ready(self) -> bool:
@@ -135,7 +136,12 @@ class MemorySystem:
         batches = max(1, int(max_batches or 1))
         with self._lifecycle_lock:
             for _ in range(batches):
-                self.experience.run_once()
+                experience_result = self.experience.run_once()
+                self.last_experience_result = {
+                    "updated": bool(getattr(experience_result, "updated", False)),
+                    "event_count": int(getattr(experience_result, "event_count", 0) or 0),
+                    "notes": str(getattr(experience_result, "notes", "") or ""),
+                }
                 decision = self.lifecycle.run_once()
                 decisions.append(decision)
                 if not decision.remember and not decision.archive:
@@ -195,7 +201,12 @@ class MemorySystem:
                     break
                 with self._lifecycle_lock:
                     try:
-                        self.experience.run_once()
+                        experience_result = self.experience.run_once()
+                        self.last_experience_result = {
+                            "updated": bool(getattr(experience_result, "updated", False)),
+                            "event_count": int(getattr(experience_result, "event_count", 0) or 0),
+                            "notes": str(getattr(experience_result, "notes", "") or ""),
+                        }
                         decision = self.lifecycle.run_once()
                     except Exception as exc:
                         logger.warning("memory lifecycle worker failed: %s", exc)

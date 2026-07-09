@@ -87,6 +87,7 @@ def format_search_result(query: str, result: dict[str, Any], *, max_chars: int =
         if snippet:
             line += f"\n   note: {snippet[:160]}"
         lines.append(line)
+    lines.append("boundary: material for this query only; unrelated titles are not new topics.")
     return "\n".join(lines)[:max_chars].strip()
 
 

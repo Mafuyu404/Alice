@@ -48,7 +48,7 @@ class AutonomousDecision:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AutonomousDecision":
         action = str(data.get("action") or "wait").strip().lower()
-        if action not in {"wait", "observe", "observe_screen", "say_qq", "send_sticker", "search_web", "remember", "update_cognition"}:
+        if not re.fullmatch(r"[a-z0-9_:-]{1,80}", action):
             action = "wait"
         tags = data.get("tags")
         if not isinstance(tags, list):
@@ -72,6 +72,28 @@ _ACTION_ALIASES = {
     "remember": "write_memory",
     "say_qq": "say_qq",
 }
+
+
+def _capability_list(value: Any, *, fallback: list[str] | set[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(value, str):
+        raw_items: list[Any] = re.split(r"[\s,，]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = list(fallback)
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        name = str(item or "").strip().lower()
+        if not name or not re.fullmatch(r"[a-z0-9_:-]{1,80}", name):
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        result.append(name)
+    if "wait" not in seen:
+        result.append("wait")
+    return result
 
 
 class AutonomousStep:
@@ -127,6 +149,19 @@ class AutonomousStep:
             },
             merge_window_seconds=float(section.get("result_merge_window_seconds", 1.0) or 1.0),
         )
+        self._handler_actions = {"wait", "observe", "write_memory", "remember", "update_cognition"}
+        self._default_capabilities = _capability_list(
+            section.get("default_capabilities"),
+            fallback=sorted(self._tool_registry.registered_actions() | self._handler_actions),
+        )
+        self._default_batch_capabilities = _capability_list(
+            section.get("batch_capabilities"),
+            fallback=self._default_capabilities,
+        )
+        self._inner_stream_capabilities = _capability_list(
+            section.get("inner_stream_capabilities"),
+            fallback=self._default_batch_capabilities,
+        )
         lifecycle_debug.log(
             "autonomous_step.init",
             character_id=getattr(session, "character_id", ""),
@@ -134,6 +169,9 @@ class AutonomousStep:
             model=self.model,
             min_interval_seconds=self.min_interval_seconds,
             registered_actions=sorted(self._tool_registry.registered_actions()),
+            default_capabilities=self._default_capabilities,
+            batch_capabilities=self._default_batch_capabilities,
+            inner_stream_capabilities=self._inner_stream_capabilities,
         )
 
     def attach_reflectors(self, *, memory_reflector=None, cognition_reflector=None) -> None:
@@ -202,7 +240,7 @@ class AutonomousStep:
         if not self.enabled:
             lifecycle_debug.log("autonomous_step.decide.disabled")
             return AutonomousDecision(reason="autonomous step disabled")
-        capabilities = capabilities or ["say_qq", "send_sticker", "search_web", "remember", "update_cognition", "observe", "wait"]
+        capabilities = _capability_list(capabilities, fallback=self._default_capabilities)
         scope = str(cooldown_scope or ("qq" if "say_qq" in capabilities else "background")).strip() or "default"
         now = time.monotonic()
         last_decide_at = self._last_decide_at_by_scope.get(scope, 0.0)
@@ -302,7 +340,7 @@ class AutonomousStep:
         if not self.enabled:
             lifecycle_debug.log("autonomous_step.batch.disabled")
             return action_model.ActionBatch(actions=[], reason="autonomous step disabled")
-        capabilities = capabilities or ["observe_screen", "search_web", "write_memory", "update_cognition", "wait"]
+        capabilities = _capability_list(capabilities, fallback=self._default_batch_capabilities)
         scope = str(cooldown_scope or ("qq" if "say_qq" in capabilities else "background")).strip() or "default"
         now = time.monotonic()
         last_decide_at = self._last_decide_at_by_scope.get(scope, 0.0)
@@ -550,7 +588,7 @@ class AutonomousStep:
                 events=events,
                 context=enriched,
                 trigger_reason=trigger_reason,
-                capabilities=["search_web", "write_memory", "update_cognition", "wait", "observe_screen"],
+                capabilities=self._inner_stream_capabilities,
                 cooldown_scope="inner_stream",
             )
             self.execute_batch(batch, events=events, context=enriched, trigger_reason=trigger_reason)

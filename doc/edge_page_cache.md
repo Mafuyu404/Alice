@@ -49,12 +49,12 @@ edge_cache.format_for_prompt()
 
 调度器在空闲检查时读取缓存，判断当前网页内容是否值得角色评论。
 
-### 多人随机 MC 页面讲解
+### 多人页面讲解/研究场景
 
-启用 `random_mc_enabled = true` 时：
-- 页面切换时触发 `random_mc_page_changed` 事件
+启用 `page_scene_enabled = true` 时：
+- 页面切换时触发 `page_scene_changed` 事件
 - 调度器强制转向新页面讨论
-- idle tick 不轻易沉默——维持 MC 页面讲解活跃度
+- idle tick 不轻易沉默——维持页面讲解活跃度
 
 ### 事实锚定规则
 

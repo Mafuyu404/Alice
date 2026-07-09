@@ -72,7 +72,26 @@ class LifeRuntime:
             set_lifecycle_llm(self.llm.chat)
         set_lifecycle_runtime_mode = getattr(memory_system, "set_lifecycle_runtime_mode", None)
         if callable(set_lifecycle_runtime_mode):
-            set_lifecycle_runtime_mode(auto_wake=False, inline=False)
+            set_lifecycle_runtime_mode(
+                auto_wake=False,
+                inline=bool(self.section.get("memory_core_inline", True)),
+            )
+        experience = getattr(memory_system, "experience", None)
+        if experience is not None:
+            if "memory_experience_batch_size" in self.section:
+                experience.batch_size = max(1, int(self.section.get("memory_experience_batch_size") or 1))
+            if "memory_experience_max_chars" in self.section:
+                experience.max_chars = max(1000, int(self.section.get("memory_experience_max_chars") or 1000))
+            if "memory_experience_catch_up_max_age_seconds" in self.section:
+                experience.catch_up_max_age_seconds = max(
+                    0.0,
+                    float(self.section.get("memory_experience_catch_up_max_age_seconds") or 0.0),
+                )
+            if "memory_experience_catch_up_tail_events" in self.section:
+                experience.catch_up_tail_events = max(
+                    1,
+                    int(self.section.get("memory_experience_catch_up_tail_events") or 1),
+                )
         self.prompt_manager = PromptManager()
         self.tool_registry = tool_spec.ActionToolRegistry()
         action_tools.register_all(self.tool_registry)
@@ -94,6 +113,7 @@ class LifeRuntime:
         self._thread: threading.Thread | None = None
         self._loop_interval = float(self.section.get("idle_tick_seconds", 2.0) or 2.0)
         self._last_prompt_trace_dir: str | None = None
+        self._last_memory_core_at = 0.0
         lifecycle_debug.log(
             "life.runtime.init",
             character_id=getattr(session, "character_id", ""),
@@ -123,7 +143,7 @@ class LifeRuntime:
         self._thread.start()
         memory_system = getattr(self.session, "memory_system", None)
         start_lifecycle = getattr(memory_system, "start_lifecycle_worker", None)
-        if callable(start_lifecycle):
+        if callable(start_lifecycle) and not bool(getattr(memory_system, "inline_maintenance_enabled", True)):
             memory_section = dict(self.section.get("memory_lifecycle", {}) or {})
             start_lifecycle(
                 interval_seconds=float(memory_section.get("interval_seconds", 300.0) or 300.0),
@@ -188,7 +208,7 @@ class LifeRuntime:
                 source="life_runtime",
                 event_type="context_digest",
                 content=digest,
-                memory_policy="experience",
+                memory_policy="debug",
                 metadata={"phase": "before_think"},
             )
         event_text = self.pool.format_batch(batch, max_chars=int(self.section.get("batch_max_chars", 4000) or 4000))
@@ -203,6 +223,14 @@ class LifeRuntime:
         patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
         self._record_pending_threads_from_data(data)
         action_plan = _extract_action_plan_from_data(data)
+        action_plan = _preserve_search_query_anchors(
+            action_plan,
+            "\n".join(
+                part
+                for part in (event_text, inner_stream, digest, self.compactor.pending_threads())
+                if str(part or "").strip()
+            ),
+        )
         self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
         if action_plan:
             self._append_memory_event(
@@ -232,7 +260,7 @@ class LifeRuntime:
                     indent=2,
                     default=str,
                 ),
-                memory_policy="experience",
+                memory_policy="debug",
                 metadata={"trace_dir": self._last_prompt_trace_dir or ""},
             )
         if action_plan_status == "executed" and action_results:
@@ -378,6 +406,14 @@ class LifeRuntime:
             patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
             self._record_pending_threads_from_data(data)
             action_plan = _extract_action_plan_from_data(data)
+            action_plan = _preserve_search_query_anchors(
+                action_plan,
+                "\n".join(
+                    part
+                    for part in (result_context, inner_stream, self.compactor.recent_digest(), self.compactor.pending_threads())
+                    if str(part or "").strip()
+                ),
+            )
             self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
             intensity = _extract_intensity_from_data(data)
             state.update(
@@ -617,6 +653,12 @@ class LifeRuntime:
         maintenance = getattr(memory_system, "maintenance_once", None)
         if not callable(maintenance):
             return
+        now = time.monotonic()
+        interval = float(self.section.get("memory_core_interval_seconds", 20.0) or 20.0)
+        if now - self._last_memory_core_at < max(1.0, interval):
+            lifecycle_debug.log("life.runtime.memory_core_deferred", inline=True, interval_seconds=interval)
+            return
+        self._last_memory_core_at = now
         try:
             decisions = maintenance(max_batches=int(self.section.get("memory_core_batches_per_tick", 1) or 1))
         except Exception as exc:
@@ -632,6 +674,7 @@ class LifeRuntime:
             remembered=remembered,
             archived=archived,
             notes=notes,
+            experience=getattr(memory_system, "last_experience_result", None),
         )
         if remembered or archived or notes:
             self._append_memory_event(
@@ -669,7 +712,7 @@ class LifeRuntime:
                         source="life_runtime",
                         event_type="memory_context_presented",
                         content=context,
-                        memory_policy="experience",
+                        memory_policy="debug",
                         metadata={
                             "event_chars": len(event_text or ""),
                             "inner_stream_chars": len(inner_stream or ""),
@@ -806,6 +849,9 @@ class LifeRuntime:
         if context.get("retire_sticker_store") is None:
             unavailable.add("retire_sticker")
         unavailable.update({"search_memory", "save_to_memory", "write_conversation_memory"})
+        observe_section = cfg.get("observe_screen", {})
+        if isinstance(observe_section, dict) and observe_section.get("enabled") is False:
+            unavailable.update({"observe_screen", "look_at_screen"})
         if not self._cached_availability("search_web", lambda: _web_search_available(context.get("web_search_client"))):
             unavailable.add("search_web")
         if context.get("task_manager") is None:
@@ -1107,6 +1153,51 @@ def _extract_action_plan_from_data(data: dict[str, Any] | None) -> dict[str, Any
     if not actions:
         return None
     return plan
+
+
+def _preserve_search_query_anchors(action_plan: dict[str, Any] | None, context: str) -> dict[str, Any] | None:
+    if not isinstance(action_plan, dict):
+        return action_plan
+    anchor = _first_latin_anchor(context)
+    if not anchor:
+        return action_plan
+    actions = action_plan.get("actions")
+    if not isinstance(actions, list):
+        return action_plan
+    for item in actions:
+        if not isinstance(item, dict) or item.get("tool") != "search_web":
+            continue
+        args = item.get("args")
+        if not isinstance(args, dict):
+            continue
+        query = str(args.get("query") or "").strip()
+        if query and not _latin_anchor_re().search(query):
+            args["query"] = f"{anchor} {query}"
+    return action_plan
+
+
+def _first_latin_anchor(text: str) -> str:
+    for match in _latin_anchor_re().finditer(str(text or "")):
+        term = match.group(0).strip("._:-")
+        if term and term.lower() not in {
+            "json",
+            "http",
+            "https",
+            "inner_stream",
+            "action_plan",
+            "search_web",
+            "look_at_screen",
+            "observe_screen",
+            "pending_threads",
+            "source",
+            "metadata",
+        }:
+            return term
+    return ""
+
+
+def _latin_anchor_re():
+    return re.compile(r"\b[A-Za-z][A-Za-z0-9_.:-]{2,}\b")
 
 
 def _extract_intensity(text: str) -> int | None:

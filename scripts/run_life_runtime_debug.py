@@ -173,6 +173,13 @@ def main() -> int:
         "tick_max_tokens": 640,
         "fallback_max_tokens": 640,
         "result_merge_window_seconds": 0.0,
+        "memory_core_inline": True,
+        "memory_core_interval_seconds": 15.0,
+        "memory_core_batches_per_tick": 2,
+        "memory_experience_batch_size": 32,
+        "memory_experience_max_chars": 12000,
+        "memory_experience_catch_up_max_age_seconds": 1800.0,
+        "memory_experience_catch_up_tail_events": 96,
         "local_thinking": {
             "enabled": True,
             **({"model": args.llm_model} if args.llm_model else {}),

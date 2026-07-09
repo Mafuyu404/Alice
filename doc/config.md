@@ -30,8 +30,8 @@ user_name = "真冬"
 multi_enabled = false
 # 是否按直播场景理解弹幕/观众输入
 live_enabled = false
-# 是否按"随机 MC 百科页面讲解"理解当前网页缓存
-random_mc_enabled = true
+# 是否按"页面讲解/研究场景"理解当前网页缓存
+page_scene_enabled = true
 ```
 
 三个开关各自独立，可以组合。例如 `multi = true, live = true` = 多人直播。

@@ -166,8 +166,8 @@ class DialogueOrchestrator:
         self.idle_context_interval_seconds = max(5.0, float(section.get("idle_context_interval_seconds", 30.0)))
         self.context_idle_min_score = max(0.0, float(section.get("context_idle_min_score", 70.0)))
         self.edge_cache_config = observe_screen.edge_cache_config_from_dict(config)
-        self.random_mc_enabled = scene_mod.random_mc_enabled(config)
-        self._last_random_mc_signature = ""
+        self.page_scene_enabled = scene_mod.page_scene_enabled(config)
+        self._last_page_scene_signature = ""
         self.session = session
         self.model = model
         self.memory_backend = memory_backend
@@ -383,11 +383,11 @@ class DialogueOrchestrator:
     def build_context_event(self, *, reason: str = "idle_context") -> DialogueEvent:
         metadata = {}
         extra_context = self._cache_overview_for_planner()
-        if self.random_mc_enabled:
+        if self.page_scene_enabled:
             signature = self._page_signature()
-            if signature and signature != self._last_random_mc_signature:
-                self._last_random_mc_signature = signature
-                metadata["random_mc_page_changed"] = True
+            if signature and signature != self._last_page_scene_signature:
+                self._last_page_scene_signature = signature
+                metadata["page_scene_changed"] = True
         return DialogueEvent(
             type="context_cache",
             source=reason,
@@ -408,24 +408,24 @@ class DialogueOrchestrator:
         return "\n\n".join(parts)
 
     def _apply_scene_guardrails(self, event: DialogueEvent, decision: DialogueDecision) -> DialogueDecision:
-        if not self.random_mc_enabled:
+        if not self.page_scene_enabled:
             return decision
         page = self._page_context_for_generator()
         if not page:
             return decision
         text = event.text or ""
         page_related = (
-            event.metadata.get("random_mc_page_changed")
-            or any(token in text for token in ("页面", "网页", "当前页", "这页", "浏览器", "MC", "Minecraft", "mc", "模组", "整合包"))
+            event.metadata.get("page_scene_changed")
+            or any(token in text for token in ("页面", "网页", "当前页", "这页", "浏览器", "page", "webpage"))
         )
         if page_related:
             decision.context_use = "page" if decision.context_use != "screen" else "both"
             if event.type == "context_cache" and decision.action in ("silence", "observe"):
                 decision.action = "speak"
                 decision.utterance_mode = "normal"
-                decision.intent = decision.intent or "讨论随机 MC 百科新页面"
-                decision.topic = decision.topic or "随机 MC 页面"
-            decision.notes = (decision.notes + "；" if decision.notes else "") + "随机 MC 场景强制围绕当前网页"
+                decision.intent = decision.intent or "讨论刚切换的当前页面"
+                decision.topic = decision.topic or "当前页面"
+            decision.notes = (decision.notes + "；" if decision.notes else "") + "页面场景围绕当前网页"
         return decision
 
     def _page_signature(self) -> str:

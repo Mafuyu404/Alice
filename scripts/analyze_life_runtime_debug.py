@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +46,9 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     same_tick_context = int(counts.get("life.runtime.tool_results.same_tick_context", 0))
     tool_result_append = int(counts.get("life.context.tool_result_append", 0))
     prompt_count = len(prompt_records)
+    thought_records = [item for item in trace if item.get("event") == "life.runtime.thought_raw"]
+    thought_metrics = _thought_progress_metrics(thought_records)
+    tool_metrics = _tool_query_metrics(trace)
     life_tick_llm_calls = sum(
         1
         for item in trace
@@ -93,6 +97,8 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
             "done": int(counts.get("life.local_thinking.done", 0)),
             "coalesced": int(counts.get("life.local_thinking.coalesced", 0)),
         },
+        "thinking_progress": thought_metrics,
+        "tool_query_progress": tool_metrics,
         "errors": {
             "count": len(error_records),
             "events": [str(item.get("event") or "") for item in error_records[:20]],
@@ -154,6 +160,81 @@ def _count_prompt_trace_dirs(run_dir: Path) -> int:
     if not path.exists():
         return 0
     return sum(1 for item in path.iterdir() if item.is_dir())
+
+
+def _thought_progress_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    notes: list[str] = []
+    with_patch = 0
+    with_action_plan = 0
+    with_pending_threads = 0
+    for record in records:
+        data = _extract_json_object(str(record.get("text") or ""))
+        if not isinstance(data, dict):
+            continue
+        if data.get("inner_stream_patch"):
+            with_patch += 1
+        if data.get("action_plan"):
+            with_action_plan += 1
+        if data.get("pending_threads"):
+            with_pending_threads += 1
+        note = _normalize_note(data.get("notes"))
+        if note:
+            notes.append(note)
+    note_counts = Counter(notes)
+    adjacent_repeats = sum(1 for prev, cur in zip(notes, notes[1:]) if prev == cur)
+    repeated_notes = sum(count - 1 for count in note_counts.values() if count > 1)
+    return {
+        "thought_raw": len(records),
+        "json_notes": len(notes),
+        "unique_notes": len(note_counts),
+        "repeated_note_extra": repeated_notes,
+        "adjacent_repeated_notes": adjacent_repeats,
+        "with_inner_stream_patch": with_patch,
+        "with_action_plan": with_action_plan,
+        "with_pending_threads": with_pending_threads,
+    }
+
+
+def _tool_query_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
+    queries: list[str] = []
+    for record in records:
+        if record.get("event") not in {"life.runtime.action_plan.execute", "tool_registry.prepare.done"}:
+            continue
+        text = json.dumps(record, ensure_ascii=False, default=str)
+        for match in re.finditer(r'"query"\s*:\s*"([^"]+)"', text):
+            query = match.group(1).strip()
+            if query:
+                queries.append(query)
+    adjacent_repeats = sum(1 for prev, cur in zip(queries, queries[1:]) if prev == cur)
+    return {
+        "query_mentions": len(queries),
+        "unique_queries": len(set(queries)),
+        "adjacent_repeated_queries": adjacent_repeats,
+        "queries": list(dict.fromkeys(queries))[:20],
+    }
+
+
+def _normalize_note(value: Any) -> str:
+    if isinstance(value, list):
+        text = " ".join(str(item or "").strip() for item in value if str(item or "").strip())
+    else:
+        text = str(value or "").strip()
+    return " ".join(text.split())
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    raw = re.sub(r"```(?:json)?\s*\n?(.*?)```", r"\1", str(text or ""), flags=re.DOTALL).strip()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0))
+        except Exception:
+            return None
+    return data if isinstance(data, dict) else None
 
 
 if __name__ == "__main__":

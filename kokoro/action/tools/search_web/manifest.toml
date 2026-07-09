@@ -1,7 +1,7 @@
 id = "search_web"
 name = "search_web"
 actions = ["search_web"]
-description = "Search public web information when the current situation needs external facts."
+description = "Reach outward to public web material when you have a concrete external question. Search results are candidate material for the current intention, not a new scene or a new topic by themselves. Useful for continuing research by changing query, source, or angle."
 needs_prepare_llm = true
 needs_after_llm = true
 prepare_prompt = "prepare.md"

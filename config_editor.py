@@ -274,8 +274,8 @@ def toml_scene(cfg: dict) -> str:
         f"multi_enabled = {_toml_val(c.get('multi_enabled', False))}\n",
         _comment("直播场景。开启后按直播间/弹幕/观众输入理解上下文。"),
         f"live_enabled = {_toml_val(c.get('live_enabled', False))}\n",
-        _comment("随机 MC 百科场景。开启后当前网页缓存是核心讨论材料，页面切换时会顺应新页面。"),
-        f"random_mc_enabled = {_toml_val(c.get('random_mc_enabled', False))}\n",
+        _comment("页面讲解/研究场景。开启后当前网页缓存是核心讨论材料，页面切换时会顺应新页面。"),
+        f"page_scene_enabled = {_toml_val(c.get('page_scene_enabled', False))}\n",
     ]
     return "".join(lines)
 
@@ -1010,7 +1010,7 @@ def build_scene_page(cfg: dict) -> tuple[QWidget, list[FieldRow]]:
     fields = [
         BoolField("multi_enabled", QCheckBox("多人场景"), "scene"),
         BoolField("live_enabled", QCheckBox("直播场景"), "scene"),
-        BoolField("random_mc_enabled", QCheckBox("随机 MC 百科"), "scene"),
+        BoolField("page_scene_enabled", QCheckBox("页面讲解/研究"), "scene"),
     ]
     for f in fields:
         f.set_value(section.get(f.key))

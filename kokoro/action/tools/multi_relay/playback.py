@@ -122,7 +122,7 @@ def run_auto_turns(
             time.sleep(0.1)
             continue
         wait_for_engines(tts_map)
-        page_changed = bool(getattr(orchestrator, "consume_random_mc_page_change", lambda: False)())
+        page_changed = bool(getattr(orchestrator, "consume_page_scene_change", lambda: False)())
         if page_changed:
             prediction.clear()
             cid, cname, reply = orchestrator.auto_turn()

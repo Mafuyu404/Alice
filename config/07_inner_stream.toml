@@ -113,6 +113,18 @@ max_tokens = 512
 # 类型: float
 min_interval_seconds = 3.0
 
+# 单步决策默认可用能力。通用决策器只读取这里的 action 名，不在 prompt 里解释工具含义。
+# 类型: list[string]
+default_capabilities = ["say_qq", "send_sticker", "search_web", "remember", "update_cognition", "observe", "wait"]
+
+# 批量决策默认可用能力。具体能力的语义由工具模块和调用现场提供。
+# 类型: list[string]
+batch_capabilities = ["search_web", "write_memory", "update_cognition", "wait"]
+
+# 内在叙事流回调后的默认可用能力。
+# 类型: list[string]
+inner_stream_capabilities = ["search_web", "write_memory", "update_cognition", "wait"]
+
 # ===========================================================================
 # 内在叙事流记忆反思
 # ===========================================================================
