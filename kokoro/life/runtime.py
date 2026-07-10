@@ -26,7 +26,12 @@ from kokoro.life.local_thinking import LocalThinking
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
 from kokoro.life.time_awareness import TimeAwareness
 from kokoro.prompt import PromptContext, PromptManager
-from kokoro.prompt.contracts import LIFE_JSON_REPAIR_SCENE, LIFE_PATCH_FALLBACK_SCENE, LIFE_TICK_SCENE
+from kokoro.prompt.contracts import (
+    LIFE_JSON_REPAIR_SCENE,
+    LIFE_PATCH_FALLBACK_SCENE,
+    LIFE_TICK_SCENE,
+    LIFE_TOOL_SELECT_SCENE,
+)
 from kokoro.prompt.tools import discover_tool_prompt_specs, render_tool_catalog
 
 
@@ -173,11 +178,12 @@ class LifeRuntime:
         self.time.mark_event(event_type=event.type)
         pooled = self.pool.add(event)
         self.compactor.append_event(event, self.pool.format_batch([pooled], max_chars=1200))
+        memory_policy = "debug" if event.type == "action_result" else "experience"
         self._append_memory_event(
             source="life_runtime",
             event_type="runtime_input",
             content=self.pool.format_batch([pooled], max_chars=1200),
-            memory_policy="experience",
+            memory_policy=memory_policy,
             metadata={
                 "input_type": event.type,
                 "origin": event.source,
@@ -222,14 +228,11 @@ class LifeRuntime:
         self.time.mark_llm_thought()
         patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
         self._record_pending_threads_from_data(data)
-        action_plan = _extract_action_plan_from_data(data)
-        action_plan = _preserve_search_query_anchors(
-            action_plan,
-            "\n".join(
-                part
-                for part in (event_text, inner_stream, digest, self.compactor.pending_threads())
-                if str(part or "").strip()
-            ),
+        action_plan = self._select_action_plan_from_data(
+            data,
+            inner_stream=inner_stream,
+            time_context=time_context,
+            digest=digest,
         )
         self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
         if action_plan:
@@ -237,7 +240,7 @@ class LifeRuntime:
                 source="life_runtime",
                 event_type="action_plan_selected",
                 content=json.dumps(action_plan, ensure_ascii=False, indent=2, default=str),
-                memory_policy="experience",
+                memory_policy="debug",
                 metadata={"trace_dir": self._last_prompt_trace_dir or ""},
             )
         intensity = _extract_intensity_from_data(data)
@@ -311,7 +314,7 @@ class LifeRuntime:
             source="life_runtime",
             event_type="inner_thought",
             content=thought,
-            memory_policy="experience",
+            memory_policy="debug",
             metadata={
                 "json_ok": isinstance(data, dict),
                 "processed_events": processed_events,
@@ -331,7 +334,7 @@ class LifeRuntime:
             source="life_runtime",
             event_type="inner_thought_parse_failed",
             content=f"{parse_reason}\n\n{thought}",
-            memory_policy="experience",
+            memory_policy="debug",
             metadata={"trace_dir": self._last_prompt_trace_dir or ""},
         )
         repaired = self._repair_json_thought(thought, parse_reason=parse_reason)
@@ -351,7 +354,7 @@ class LifeRuntime:
                 source="life_runtime",
                 event_type="inner_thought_repaired",
                 content=repaired,
-                memory_policy="experience",
+                memory_policy="debug",
                 metadata={"trace_dir": self._last_prompt_trace_dir or ""},
             )
             return repaired, repaired_data
@@ -364,7 +367,7 @@ class LifeRuntime:
             source="life_runtime",
             event_type="inner_thought_repair_failed",
             content=f"{_json_parse_error(repaired)}\n\n{repaired}",
-            memory_policy="experience",
+            memory_policy="debug",
             metadata={"trace_dir": self._last_prompt_trace_dir or ""},
         )
         return thought, data
@@ -405,14 +408,11 @@ class LifeRuntime:
             self.time.mark_llm_thought()
             patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
             self._record_pending_threads_from_data(data)
-            action_plan = _extract_action_plan_from_data(data)
-            action_plan = _preserve_search_query_anchors(
-                action_plan,
-                "\n".join(
-                    part
-                    for part in (result_context, inner_stream, self.compactor.recent_digest(), self.compactor.pending_threads())
-                    if str(part or "").strip()
-                ),
+            action_plan = self._select_action_plan_from_data(
+                data,
+                inner_stream=inner_stream,
+                time_context=time_context,
+                digest=self.compactor.recent_digest(),
             )
             self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
             intensity = _extract_intensity_from_data(data)
@@ -460,7 +460,7 @@ class LifeRuntime:
                     indent=2,
                     default=str,
                 ),
-                memory_policy="experience",
+                memory_policy="debug",
                 metadata={"trace_dir": self._last_prompt_trace_dir or ""},
             )
             state.update({"action_plan_status": status, "action_plan_error": error})
@@ -487,7 +487,7 @@ class LifeRuntime:
             source="life_runtime",
             event_type="tool_results_same_tick",
             content=text,
-            memory_policy="experience",
+            memory_policy="debug",
             metadata={"round": round_index + 1},
         )
         lifecycle_debug.log(
@@ -563,11 +563,6 @@ class LifeRuntime:
                 "inner_stream_version": self._inner_stream_version,
                 "time_context": self._context_fragment("time_awareness", time_context, max_chars=2000),
                 "context_digest": self._context_fragment("recent_digest", digest, max_chars=fragment_max),
-                "tool_capabilities": self._context_fragment(
-                    "tool_capabilities",
-                    self._tool_capabilities_text(),
-                    max_chars=max(fragment_max, 6000),
-                ),
                 "event_batch": self._context_fragment(
                     "event_batch",
                     event_text or "(no new external event; this can be time passing or continued thinking)",
@@ -577,11 +572,6 @@ class LifeRuntime:
                     "pending_threads",
                     self.compactor.pending_threads(),
                     max_chars=fragment_max,
-                ),
-                "tool_results_digest": self._context_fragment(
-                    "tool_results_digest",
-                    self.compactor.tool_results_digest(),
-                    max_chars=int(self.section.get("tool_results_fragment_max_chars", min(fragment_max, 1400)) or 1400),
                 ),
             },
         )
@@ -601,8 +591,142 @@ class LifeRuntime:
             },
         )
 
-    def _context_fragment(self, source: str, content: str, *, max_chars: int) -> str:
-        return render_fragment(source, content or "(none)", max_chars=max_chars)
+    def _select_action_plan_from_data(
+        self,
+        data: dict[str, Any] | None,
+        *,
+        inner_stream: str,
+        time_context: str,
+        digest: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(data, dict):
+            return None
+        direct_plan = _extract_action_plan_from_data(data)
+        if direct_plan:
+            lifecycle_debug.log("life.runtime.direct_action_plan_ignored", action_plan=direct_plan)
+        intent = _extract_action_intent_from_data(data)
+        if not intent:
+            return None
+        return self._select_action_plan(
+            action_intent=intent,
+            inner_stream=inner_stream,
+            time_context=time_context,
+            digest=digest,
+        )
+
+    def _select_action_plan(
+        self,
+        *,
+        action_intent: str,
+        inner_stream: str,
+        time_context: str,
+        digest: str,
+    ) -> dict[str, Any] | None:
+        self._available_actions = self._resolve_available_actions()
+        if not self._available_actions:
+            lifecycle_debug.log("life.runtime.tool_select.no_available_actions", action_intent=action_intent)
+            return None
+        fragment_max = int(self.section.get("context_fragment_max_chars", 4000) or 4000)
+        trace_dir = str(Path(self._last_prompt_trace_dir) / "tool_select") if self._last_prompt_trace_dir else None
+        ctx = PromptContext(
+            scene=LIFE_TOOL_SELECT_SCENE,
+            character_id=str(getattr(self.session, "character_id", "") or ""),
+            character_name=str(getattr(self.session, "character_name", "") or getattr(self.session, "character_id", "AI")),
+            debug_mode=bool(self.section.get("debug", False)),
+            trace_dir=trace_dir,
+            values={
+                "action_intent": self._context_fragment(
+                    "action_intent",
+                    action_intent,
+                    max_chars=1200,
+                    kind="intent",
+                    audience="tool_select",
+                    role="subject",
+                ),
+                "inner_stream": self._context_fragment(
+                    "inner_stream",
+                    inner_stream or "(empty)",
+                    max_chars=fragment_max,
+                    kind="subject_state",
+                    audience="tool_select",
+                    role="subject",
+                ),
+                "time_context": self._context_fragment(
+                    "time_awareness",
+                    time_context,
+                    max_chars=1600,
+                    kind="time",
+                    audience="tool_select",
+                    role="environment",
+                ),
+                "context_digest": self._context_fragment(
+                    "recent_digest",
+                    digest,
+                    max_chars=fragment_max,
+                    kind="digest",
+                    audience="tool_select",
+                    role="environment",
+                ),
+                "tool_capabilities": self._context_fragment(
+                    "tool_capabilities",
+                    self._tool_capabilities_text(),
+                    max_chars=max(fragment_max, 6000),
+                    kind="tool_catalog",
+                    audience="tool_select",
+                    role="system",
+                ),
+            },
+        )
+        messages = self.prompt_manager.render(LIFE_TOOL_SELECT_SCENE, ctx)
+        lifecycle_debug.log(
+            "life.runtime.tool_select.prompt_rendered",
+            scene=LIFE_TOOL_SELECT_SCENE,
+            messages=len(messages),
+            trace_dir=trace_dir or "",
+        )
+        try:
+            raw = self.llm.chat(
+                messages,
+                {
+                    "function": "life_tool_select",
+                    "max_tokens": int(self.section.get("tool_select_max_tokens", 700) or 700),
+                    "timeout": int(self.section.get("tool_select_timeout", 60) or 60),
+                },
+            )
+        except Exception as exc:
+            lifecycle_debug.log("life.runtime.tool_select.error", error=str(exc))
+            return None
+        parsed = _extract_json(raw)
+        plan = _extract_action_plan_from_data(parsed)
+        lifecycle_debug.log(
+            "life.runtime.tool_select.raw",
+            text=raw,
+            json_ok=isinstance(parsed, dict),
+            has_action_plan=bool(plan),
+        )
+        return _preserve_search_query_anchors(
+            plan,
+            "\n".join(part for part in (action_intent, inner_stream, digest, self.compactor.pending_threads()) if str(part or "").strip()),
+        )
+
+    def _context_fragment(
+        self,
+        source: str,
+        content: str,
+        *,
+        max_chars: int,
+        kind: str = "material",
+        audience: str = "life_tick",
+        role: str = "environment",
+    ) -> str:
+        return render_fragment(
+            source,
+            content or "(none)",
+            max_chars=max_chars,
+            kind=kind,
+            audience=audience,
+            role=role,
+        )
 
     def _append_memory_event(
         self,
@@ -870,6 +994,9 @@ class LifeRuntime:
         return available
 
     def _missing_required_args(self, action_name: str, args: dict[str, Any]) -> list[str]:
+        spec = self.tool_registry.resolve(action_name)
+        if spec is not None and spec.prepare is not None:
+            return []
         missing: list[str] = []
         for schema in self.tool_registry.enabled_schemas():
             fn = schema.get("function", {}) if isinstance(schema, dict) else {}
@@ -918,6 +1045,9 @@ class LifeRuntime:
         max_chars = int(cfg.inner_stream_config().get("max_chars", 1200) or 1200)
         result = apply_inner_stream_patch(inner_stream, patch, max_chars=max_chars)
         if not result.applied:
+            if result.reason == "no change":
+                lifecycle_debug.log("life.runtime.patch_no_change", reason=result.reason, patch=patch)
+                return False
             lifecycle_debug.log("life.runtime.patch_not_applied", reason=result.reason, patch=patch)
             self._append_memory_event(
                 source="life_runtime",
@@ -928,7 +1058,7 @@ class LifeRuntime:
                     indent=2,
                     default=str,
                 ),
-                memory_policy="experience",
+                memory_policy="debug",
             )
             return self._rewrite_inner_stream_fallback(
                 inner_stream=inner_stream,
@@ -1046,7 +1176,7 @@ class LifeRuntime:
                 indent=2,
                 default=str,
             ),
-            memory_policy="experience",
+            memory_policy="debug",
         )
         return applied
 
@@ -1155,6 +1285,20 @@ def _extract_action_plan_from_data(data: dict[str, Any] | None) -> dict[str, Any
     return plan
 
 
+def _extract_action_intent_from_data(data: dict[str, Any] | None) -> str:
+    if not isinstance(data, dict):
+        return ""
+    for key in ("action_intent", "external_action_intent", "intent_to_act"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            text = value.get("intent") or value.get("reason") or value.get("question")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return ""
+
+
 def _preserve_search_query_anchors(action_plan: dict[str, Any] | None, context: str) -> dict[str, Any] | None:
     if not isinstance(action_plan, dict):
         return action_plan
@@ -1217,27 +1361,19 @@ def _extract_intensity_from_data(data: dict[str, Any] | None) -> int | None:
 def _format_action_results(plan: dict[str, Any], results: dict[str, str]) -> str:
     if not results:
         return ""
-    actions = plan.get("actions") or plan.get("nodes") or []
-    if not isinstance(actions, list):
-        actions = []
-    tools_by_id = {
-        str(action.get("id") or action.get("action_id") or "").strip(): str(
-            action.get("tool") or action.get("action") or ""
-        ).strip()
-        for action in actions
-        if isinstance(action, dict)
-    }
-    lines = ["[same_tick_tool_results]"]
-    for action_id, result in results.items():
+    lines = ["外部行动返回的材料："]
+    index = 1
+    for result in results.values():
         text = str(result or "").strip()
         if not text:
             continue
-        tool = tools_by_id.get(str(action_id), "")
-        label = f"action_id={action_id}"
-        if tool:
-            label += f" tool={tool}"
-        lines.append(f"- [{label}]\n{text}")
-    return "\n".join(lines).strip()
+        if "The raw result is reserved for tool-side digestion and debug logs." in text:
+            continue
+        if text == "web search skipped: empty query":
+            continue
+        lines.append(f"{index}. {text}")
+        index += 1
+    return "\n".join(lines).strip() if index > 1 else ""
 
 
 def _canonical_plan_key(plan: dict[str, Any] | None) -> str:

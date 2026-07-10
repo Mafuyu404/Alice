@@ -17,6 +17,11 @@ class InnerStreamPatch:
 
     @classmethod
     def from_raw(cls, raw: str | dict[str, Any]) -> "InnerStreamPatch":
+        if isinstance(raw, str) and raw.strip() and not raw.strip().startswith("{"):
+            return cls(
+                patches=[{"op": "append", "text": raw.strip()}],
+                reason="string patch normalized to append",
+            )
         data = raw if isinstance(raw, dict) else _extract_json_object(str(raw or ""))
         if not isinstance(data, dict):
             raise ValueError("patch response is not a JSON object")
@@ -55,6 +60,8 @@ def apply_inner_stream_patch(current: str, patch: InnerStreamPatch, *, max_chars
         if op in {"append", "add"}:
             addition = str(item.get("text") or "").strip()
             if addition:
+                if _already_present(text, addition):
+                    continue
                 text = (text + "\n" + addition).strip() if text else addition
                 changed = True
             continue
@@ -89,6 +96,45 @@ def apply_inner_stream_patch(current: str, patch: InnerStreamPatch, *, max_chars
     if changed and _looks_like_meta_placeholder(cleaned):
         return PatchResult(text=str(current or "").strip(), applied=False, reason="patch text is meta placeholder")
     return PatchResult(text=cleaned, applied=changed, reason="applied" if changed else "no change")
+
+
+def _already_present(text: str, addition: str) -> bool:
+    normalized_addition = _normalize_for_dedupe(addition)
+    if not normalized_addition:
+        return True
+    normalized_text = _normalize_for_dedupe(text)
+    if normalized_addition in normalized_text:
+        return True
+    existing_lines = [_normalize_for_dedupe(line) for line in str(text or "").splitlines() if line.strip()]
+    return any(_similar_enough(line, normalized_addition) for line in existing_lines)
+
+
+def _normalize_for_dedupe(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").strip())
+
+
+def _similar_enough(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    shorter = min(len(left), len(right))
+    if shorter < 32:
+        return False
+    overlap = _longest_common_substring_len(left, right)
+    return overlap / max(1, shorter) >= 0.92
+
+
+def _longest_common_substring_len(left: str, right: str) -> int:
+    previous = [0] * (len(right) + 1)
+    best = 0
+    for i, lch in enumerate(left, 1):
+        current = [0] * (len(right) + 1)
+        for j, rch in enumerate(right, 1):
+            if lch == rch:
+                current[j] = previous[j - 1] + 1
+                if current[j] > best:
+                    best = current[j]
+        previous = current
+    return best
 
 
 def _extract_json_object(raw: str) -> dict[str, Any]:

@@ -18,6 +18,7 @@ from kokoro.core import config as cfg
 from kokoro.core import input_events
 from kokoro.core import lifecycle_debug
 from kokoro.core import memory as memory_mod
+from kokoro.memory import create_memory_system
 from kokoro.action.tools import search_web as search_web_tool
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
 
@@ -66,6 +67,24 @@ class ScriptedLifeLlm:
             return "A compact debug timeline: the life runtime is receiving events, sensing time, and keeping unfinished threads visible."
         if function == "life_inner_stream_patch_fallback":
             return "I notice the debug run continuing, keep the time thread in view, and stay ready to use tools when they help."
+        if function == "life_tool_select":
+            return json.dumps(
+                {
+                    "action_plan": {
+                        "reason": "Translate the debug action intent into an available benign action.",
+                        "actions": [
+                            {
+                                "id": "time_check",
+                                "tool": "get_current_time",
+                                "args": {},
+                                "parallel": True,
+                                "result_policy": "feed_back",
+                            }
+                        ],
+                    }
+                },
+                ensure_ascii=False,
+            )
         self.life_tick_count += 1
         if self.life_tick_count == 1:
             return json.dumps(
@@ -81,18 +100,7 @@ class ScriptedLifeLlm:
                         ],
                         "reason": "The first life tick absorbed the debug event and time context.",
                     },
-                    "action_plan": {
-                        "reason": "Check time as a benign tool action while keeping the stream active.",
-                        "actions": [
-                            {
-                                "id": "time_check",
-                                "tool": "get_current_time",
-                                "args": {},
-                                "parallel": True,
-                                "result_policy": "feed_back",
-                            }
-                        ],
-                    },
+                    "action_intent": "Check the current time as a benign external action while keeping the stream active.",
                     "notes": "first deterministic life tick",
                 },
                 ensure_ascii=False,
@@ -168,8 +176,10 @@ def main() -> int:
         "min_tick_seconds": 0.05,
         "max_tick_seconds": 0.5,
         "batch_max_events": 16,
-        "batch_max_chars": 4000,
-        "context_max_chars": 4000,
+        "batch_max_chars": 12000,
+        "context_max_chars": 60000,
+        "memory_fragment_max_chars": 12000,
+        "tool_results_fragment_max_chars": 8000,
         "tick_max_tokens": 640,
         "fallback_max_tokens": 640,
         "result_merge_window_seconds": 0.0,
@@ -193,10 +203,16 @@ def main() -> int:
     backend = memory_mod.create_backend(full_config) if args.real_memory else memory_mod.NoMemoryBackend()
     memory_user_id = memory_mod.scoped_user_id(args.character)
     _write_memory_snapshot(backend, memory_user_id, out_dir / "memory_before.json")
+    memory_system = create_memory_system(
+        character_id=args.character,
+        root=out_dir,
+        vector_backend=backend,
+    )
     session = chat_session.ChatSession(
         character_id=args.character,
         character_data=characters[args.character],
         memory_backend=backend,
+        memory_system=memory_system,
         user_name=cfg.user_name(),
         inner_stream=DebugInnerStream(out_dir / "characters" / args.character / "inner_stream.txt"),
         inner_stream_loop=object(),

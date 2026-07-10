@@ -71,12 +71,16 @@ class InformationPool:
             if not content:
                 continue
             age = _fmt_seconds(now - item.monotonic)
+            event_type = str(event.type or "")
+            source = str(event.source or "")
+            if event_type == "action_result":
+                source = "external_action"
             lines.append(
                 "\n".join(
                     [
                         (
-                            f'<input_event seq="{item.sequence}" type="{event.type}" '
-                            f'source="{event.source}" timestamp="{event.timestamp}" age="{age}">'
+                            f'<input_event seq="{item.sequence}" type="{event_type}" '
+                            f'source="{source}" timestamp="{event.timestamp}" age="{age}">'
                         ),
                         content,
                         "</input_event>",

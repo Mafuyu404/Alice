@@ -34,6 +34,7 @@ class ActionPlanNode:
         args = data.get("args")
         if not isinstance(args, dict):
             args = {}
+        args = _normalize_node_args(data, args)
         after = data.get("after")
         if isinstance(after, str):
             after = [after]
@@ -148,3 +149,27 @@ def _levels(nodes: list[ActionPlanNode]) -> list[list[ActionPlanNode]]:
             completed.add(node.id)
             remaining.pop(node.id, None)
     return levels
+
+
+def _normalize_node_args(data: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """Accept protocol-equivalent LLM output without changing the chosen tool."""
+
+    normalized = dict(args)
+    protocol_fields = {
+        "id",
+        "action_id",
+        "tool",
+        "action",
+        "after",
+        "parallel",
+        "reason",
+        "mode",
+        "visibility",
+        "result_policy",
+    }
+    for key, value in data.items():
+        if key in protocol_fields or key == "args":
+            continue
+        if key not in normalized and value not in (None, "", [], {}):
+            normalized[key] = value
+    return normalized

@@ -36,13 +36,8 @@ portrait_overlay_state*.json
 subtitle*_state.json
 vts_token.txt
 
-# Character runtime state. Character profile/config files can still be tracked
-# unless a whole local character directory is explicitly ignored below.
-characters/*/context/
-characters/*/memory/
-characters/*/inner_stream.txt
-characters/life_test/
-characters/xuezhi/
+# Local character profiles, portraits, memories, and runtime state
+characters/
 
 # Local/manual evaluation scratch files. Real unit tests stay tracked.
 tests/run_*.py
@@ -54,7 +49,4 @@ Thumbs.db
 .DS_Store
 
 bilive-danmaku
-
-characters/lerwa
-
-debug_runs
+debug_runs/

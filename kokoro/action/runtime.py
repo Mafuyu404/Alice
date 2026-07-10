@@ -181,6 +181,9 @@ class ActionRuntime:
             priority=priority,
             metadata=metadata,
         )
+        if metadata.get("suppress_feedback"):
+            lifecycle_debug.log("action_runtime.result.suppressed", metadata=metadata)
+            return
         event = input_events.build_action_result_event(
             content,
             source=action.action,

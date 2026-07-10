@@ -15,7 +15,7 @@ def execute_search_web(
         return tool_spec.ToolResult(
             content="web search skipped: empty query",
             status="skipped",
-            metadata={"query": query},
+            metadata={"query": query, "suppress_feedback": True},
         )
 
     expected_use = str(prepared.args.get("expected_use") or "action_tool").strip()
@@ -24,10 +24,19 @@ def execute_search_web(
         limit = int(ctx.get("search_max_results", prepared.args.get("limit") or 5) or 5)
         max_chars = int(ctx.get("search_max_event_chars", prepared.args.get("max_chars") or 1800) or 1800)
         result = client.search(query, limit=limit)
-        content = format_search_result(query, result, max_chars=max_chars)
+        raw_content = format_search_result(query, result, max_chars=max_chars)
+        content = (
+            f"web search completed for query: {query}\n"
+            "The raw result is reserved for tool-side digestion and debug logs."
+        )
         return tool_spec.ToolResult(
             content=content,
-            metadata={"query": query, "expected_use": expected_use},
+            metadata={
+                "query": query,
+                "expected_use": expected_use,
+                "raw_content": raw_content,
+                "suppress_feedback": True,
+            },
         )
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"

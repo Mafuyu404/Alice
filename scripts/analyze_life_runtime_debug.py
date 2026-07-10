@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -49,6 +50,8 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
     thought_records = [item for item in trace if item.get("event") == "life.runtime.thought_raw"]
     thought_metrics = _thought_progress_metrics(thought_records)
     tool_metrics = _tool_query_metrics(trace)
+    memory_store = _memory_store_metrics(run_dir)
+    context_pollution = _context_pollution_metrics(run_dir, trace)
     life_tick_llm_calls = sum(
         1
         for item in trace
@@ -90,6 +93,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
             "memory_core_cycles": int(counts.get("life.runtime.memory_core_cycle", 0)),
             "memory_core_deferred": int(counts.get("life.runtime.memory_core_deferred", 0)),
             "memory_candidate_inputs": int(counts.get("life_debug.memory_candidate_event", 0)),
+            **memory_store,
         },
         "local_thinking_queue": {
             "queued": int(counts.get("life.local_thinking.queued", 0)),
@@ -99,6 +103,7 @@ def analyze_run(run_dir: Path) -> dict[str, Any]:
         },
         "thinking_progress": thought_metrics,
         "tool_query_progress": tool_metrics,
+        "context_pollution": context_pollution,
         "errors": {
             "count": len(error_records),
             "events": [str(item.get("event") or "") for item in error_records[:20]],
@@ -211,6 +216,71 @@ def _tool_query_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         "unique_queries": len(set(queries)),
         "adjacent_repeated_queries": adjacent_repeats,
         "queries": list(dict.fromkeys(queries))[:20],
+    }
+
+
+def _memory_store_metrics(run_dir: Path) -> dict[str, Any]:
+    stores = list((run_dir / "characters").glob("*/memory/store.sqlite"))
+    if not stores:
+        return {
+            "memory_records": 0,
+            "memory_links": 0,
+            "recent_memory_summaries": [],
+        }
+    records = 0
+    links = 0
+    summaries: list[str] = []
+    for path in stores:
+        con = None
+        try:
+            con = sqlite3.connect(path)
+            con.row_factory = sqlite3.Row
+            records += int(con.execute("select count(*) from memory_records where deleted_at = ''").fetchone()[0])
+            links += int(con.execute("select count(*) from memory_links").fetchone()[0])
+            rows = con.execute(
+                "select created_at, summary from memory_records where deleted_at = '' order by created_at desc limit 8"
+            ).fetchall()
+            for row in rows:
+                summary = str(row["summary"] or "").strip()
+                if summary:
+                    summaries.append(f"{row['created_at']} {summary}")
+        except Exception:
+            continue
+        finally:
+            if con is not None:
+                con.close()
+    return {
+        "memory_records": records,
+        "memory_links": links,
+        "recent_memory_summaries": summaries[:12],
+    }
+
+
+def _context_pollution_metrics(run_dir: Path, trace: list[dict[str, Any]]) -> dict[str, Any]:
+    live_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in (run_dir / "characters").glob("*/context/live_timeline.txt")
+        if path.exists()
+    )
+    tool_text = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in (run_dir / "characters").glob("*/context/tool_results_digest.txt")
+        if path.exists()
+    )
+    action_result_inputs = 0
+    suppressed_results = 0
+    for item in trace:
+        if item.get("event") == "chat_session.record_input_event" and "action_result" in json.dumps(item, ensure_ascii=False, default=str):
+            action_result_inputs += 1
+        if item.get("event") == "action_runtime.result.suppressed":
+            suppressed_results += 1
+    return {
+        "action_result_record_input_events": action_result_inputs,
+        "suppressed_action_results": suppressed_results,
+        "live_timeline_action_result_mentions": live_text.count('type="action_result"'),
+        "tool_results_digest_chars": len(tool_text),
+        "tool_results_digest_search_status_mentions": tool_text.count("web search completed")
+        + tool_text.count("web search skipped"),
     }
 
 

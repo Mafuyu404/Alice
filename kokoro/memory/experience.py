@@ -199,13 +199,12 @@ class MemoryExperienceWorker:
         if not isinstance(data, dict):
             return False
         if not any(key in data for key in ("current_experience", "open_threads", "recent_raw_digest")):
-            digest = "\n".join(_event_line(event) for event in events)[-5000:]
             workspace.write(
                 {
                     "current_experience": previous.current_experience,
                     "open_threads": previous.open_threads,
-                    "recent_raw_digest": digest,
-                    "notes": "experience workspace used raw digest because model returned non-workspace JSON",
+                    "recent_raw_digest": _fallback_event_digest(events),
+                    "notes": "experience workspace kept continuity; model returned non-workspace JSON",
                 }
             )
             return True
@@ -264,6 +263,32 @@ def _extract_json(text: str):
         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if not match:
             return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
+
+def _fallback_event_digest(events: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for event in events[-4:]:
+        source = str(event.get("source") or "").strip()
+        event_type = str(event.get("type") or "").strip()
+        content = _strip_transport_noise(str(event.get("content") or ""))
+        if not content:
+            continue
+        parts.append(f"{source}/{event_type}: {content}")
+    return "\n".join(parts)[-1200:]
+
+
+def _strip_transport_noise(text: str) -> str:
+    cleaned = str(text or "")
+    cleaned = re.sub(r"<input_event\b.*?</input_event>", "", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"\[web_search_result\].*", "外部材料返回了搜索结果，需要先消化其对注意力的影响。", cleaned, flags=re.DOTALL)
+    cleaned = re.sub(r"https?://\S+", "", cleaned)
+    cleaned = re.sub(r"\b(?:action_id|source|metadata|schema|boundary|candidate_count|query):.*", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:260]
 
 
 def _parse_time(value: object) -> datetime | None:
@@ -274,7 +299,3 @@ def _parse_time(value: object) -> datetime | None:
         return datetime.fromisoformat(text)
     except ValueError:
         return None
-        try:
-            return json.loads(match.group(0))
-        except Exception:
-            return None

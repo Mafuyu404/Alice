@@ -40,6 +40,9 @@ class ContextCompactor:
         lifecycle_debug.log("life.context.live_append", character_id=self.character_id, chars=len(text))
 
     def append_event(self, event: input_events.InputEvent, text: str) -> None:
+        if event.metadata.get("suppress_feedback"):
+            lifecycle_debug.log("life.context.event_suppressed", character_id=self.character_id, event=event)
+            return
         self.append_live(text)
         if event.type == "action_result":
             self.append_tool_result(text)

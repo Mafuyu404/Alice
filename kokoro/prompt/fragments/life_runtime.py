@@ -11,6 +11,7 @@ from kokoro.prompt.contracts import (
     LIFE_JSON_REPAIR_SCENE,
     LIFE_PATCH_FALLBACK_SCENE,
     LIFE_TICK_SCENE,
+    LIFE_TOOL_SELECT_SCENE,
 )
 from kokoro.prompt.fragment import PromptFragment
 from kokoro.prompt.registry import PromptRegistry
@@ -29,6 +30,19 @@ def register(registry: PromptRegistry) -> None:
             values=lambda ctx: {"name": ctx.character_name or ctx.character_id or "AI"},
             marker=("<life_contract>", "</life_contract>"),
         ),
+    )
+    _register_pair(
+        registry,
+        scene=LIFE_TOOL_SELECT_SCENE,
+        prefix="life_runtime.tool_select",
+        user_values=lambda ctx: {
+            "name": ctx.character_name or ctx.character_id or "AI",
+            "action_intent": ctx.get("action_intent", "(none)") or "(none)",
+            "inner_stream": ctx.get("inner_stream", "(empty)") or "(empty)",
+            "time_context": ctx.get("time_context", "(none)") or "(none)",
+            "context_digest": ctx.get("context_digest", "(none)") or "(none)",
+            "tool_capabilities": ctx.get("tool_capabilities", "(none)") or "(none)",
+        },
     )
     registry.register(
         LIFE_TICK_SCENE,
@@ -134,12 +148,10 @@ def _life_tick_values(ctx: PromptContext) -> dict[str, Any]:
         "inner_stream_version": ctx.get("inner_stream_version", 0),
         "time_context": ctx.get("time_context", "(none)") or "(none)",
         "context_digest": ctx.get("context_digest", "(none)") or "(none)",
-        "tool_capabilities": ctx.get("tool_capabilities", "(none)") or "(none)",
         "event_batch": ctx.get(
             "event_batch",
             "(no new external event; this can be time passing or continued thinking)",
         )
         or "(no new external event; this can be time passing or continued thinking)",
         "pending_threads": ctx.get("pending_threads", "(none)") or "(none)",
-        "tool_results_digest": ctx.get("tool_results_digest", "(none)") or "(none)",
     }
