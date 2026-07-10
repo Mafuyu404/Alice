@@ -49,3 +49,33 @@ def create_life_action_runtime(
         },
         merge_window_seconds=float(merge_window),
     )
+
+
+def attach_runtime_resources(
+    *,
+    life_runtime: Any,
+    say_resources: Any | None = None,
+) -> None:
+    """Expose already-created transport/output resources to LifeRuntime tools."""
+
+    runtime = getattr(life_runtime, "action_runtime", None)
+    if runtime is None or not hasattr(runtime, "tool_context"):
+        return
+    if say_resources is None:
+        return
+    runtime.tool_context.update(
+        {
+            "say_resources": say_resources,
+            "memory_backend": getattr(say_resources, "memory_backend", runtime.tool_context.get("memory_backend", None)),
+            "character_id": getattr(getattr(say_resources, "session", None), "character_id", runtime.tool_context.get("character_id", "default")),
+            "vts_controller": getattr(say_resources, "vts_controller", None),
+            "vts_arbiter": getattr(say_resources, "vts_arbiter", None),
+            "vts_body_driver": getattr(say_resources, "vts_body_driver", None),
+            "event_loop": getattr(say_resources, "event_loop", None),
+            "task_manager": getattr(say_resources, "task_manager", None),
+            "qq_send_message": getattr(say_resources, "qq_send_message", None),
+        }
+    )
+    attach = getattr(life_runtime, "attach_action_runtime", None)
+    if callable(attach):
+        attach(runtime)

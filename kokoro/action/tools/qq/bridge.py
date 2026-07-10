@@ -92,7 +92,7 @@ class QQBridge:
                 print(f"\n[qq] tool say {target_id}: {message[:80]}")
                 return f"QQ message sent to {target_id}: {message}"
 
-            def _poll_and_maybe_send(ws) -> None:
+            def _poll_and_publish() -> None:
                 if not poll_lock.acquire(blocking=False):
                     return
                 try:
@@ -101,33 +101,8 @@ class QQBridge:
                     except Exception as exc:
                         print(f"\n[qq] poll failed: {type(exc).__name__}: {exc}")
                         return
-                    if decision.action != "say":
-                        if decision.reason:
-                            print(f"\n[qq] silent: {decision.reason}")
-                        return
-                    params = {"message": decision.payload}
-                    if decision.conversation_id.startswith("group:"):
-                        params["message_type"] = "group"
-                        params["group_id"] = decision.conversation_id.split(":", 1)[1]
-                    elif decision.conversation_id.startswith("private:"):
-                        params["message_type"] = "private"
-                        params["user_id"] = decision.conversation_id.split(":", 1)[1]
-                    else:
-                        print(f"\n[qq] unknown conversation id: {decision.conversation_id}")
-                        return
-
-                    self.runtime.record_sent(decision, self_id=self.runtime.self_id, nickname=self.character_name)
-                    future = asyncio.run_coroutine_threadsafe(_send_action(ws, "send_msg", params), loop)
-
-                    def _log_send_result(done) -> None:
-                        try:
-                            done.result()
-                        except Exception as exc:
-                            print(f"\n[qq] send action failed: {type(exc).__name__}: {exc}")
-                            return
-                        print(f"\n[qq] say {decision.conversation_id}: {decision.message[:80]}")
-
-                    future.add_done_callback(_log_send_result)
+                    if decision.reason:
+                        print(f"\n[qq] {decision.reason}")
                 finally:
                     poll_lock.release()
 
@@ -143,7 +118,7 @@ class QQBridge:
                         await asyncio.sleep(interval)
                         if stop_client.is_set() or self.stop_event.is_set():
                             break
-                        threading.Thread(target=_poll_and_maybe_send, args=(ws,), daemon=True).start()
+                        threading.Thread(target=_poll_and_publish, daemon=True).start()
 
                 poll_task = asyncio.create_task(periodic_poll())
                 try:
@@ -158,7 +133,7 @@ class QQBridge:
                         message = self.runtime.ingest_onebot_event(event)
                         if message is not None:
                             print(f"\n[qq] {message.conversation_id} {message.nickname}: {message.content[:80]}")
-                        threading.Thread(target=_poll_and_maybe_send, args=(ws,), daemon=True).start()
+                        threading.Thread(target=_poll_and_publish, daemon=True).start()
                 finally:
                     stop_client.set()
                     poll_task.cancel()

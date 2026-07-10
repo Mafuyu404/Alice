@@ -1,7 +1,6 @@
 """QQ input, transport, and media tool module."""
 
 __all__ = [
-    "QQAutonomousParticipant",
     "QQBridge",
     "QQContextPacket",
     "QQEnvironment",
@@ -35,7 +34,6 @@ def __getattr__(name: str):
 
         return getattr(bridge, name)
     if name in {
-        "QQAutonomousParticipant",
         "QQContextPacket",
         "QQEnvironment",
         "QQInputRuntime",

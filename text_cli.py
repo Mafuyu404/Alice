@@ -41,7 +41,7 @@ class _NullLayer:
         return
 
 
-def get_args() -> argparse.Namespace:
+def get_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Alice text-only test CLI")
     parser.add_argument("--character", "-c", default="alice", help="Character id (default: alice)")
     parser.add_argument("--model", default=None, help="Chat model")
@@ -55,11 +55,12 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no-cognition", action="store_true", help="Disable cognition evaluation for this run")
     parser.add_argument("--input-file", default=None, help="Read UTF-8 user turns from a file")
     parser.add_argument("--transcript-file", default=None, help="Write a UTF-8 transcript to a file")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = get_args()
+def main(args: argparse.Namespace | None = None) -> None:
+    if args is None:
+        args = get_args()
 
     # Multi-character mode
     if args.multi:
@@ -130,7 +131,7 @@ def main() -> None:
         ]
     transcript_path = Path(args.transcript_file) if args.transcript_file else _default_transcript_path()
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
-    transcript = transcript_path.open("w", encoding="utf-8", buffering=1)
+    transcript = transcript_path.open("w", encoding="utf-8", errors="replace", buffering=1)
     print(f"  Log file: {transcript_path}")
 
     stdin_is_pipe = input_turns is not None or not sys.stdin.isatty()
@@ -159,6 +160,7 @@ def main() -> None:
                     user_text = input("\nYou> ").strip()
                 except EOFError:
                     break
+            user_text = _clean_cli_text(user_text)
             if not user_text:
                 continue
             if stdin_is_pipe:
@@ -325,7 +327,7 @@ def _run_multi(args: argparse.Namespace) -> None:
         ]
     transcript_path = Path(args.transcript_file) if args.transcript_file else _default_transcript_path()
     transcript_path.parent.mkdir(parents=True, exist_ok=True)
-    transcript = transcript_path.open("w", encoding="utf-8", buffering=1)
+    transcript = transcript_path.open("w", encoding="utf-8", errors="replace", buffering=1)
     transcript.write("# Multi-Character Dialogue Log\n\n")
     transcript.write(f"- Characters: {', '.join(names.values())}\n")
     transcript.write(f"- Planner: {orch.planning_model}\n")
@@ -351,6 +353,7 @@ def _run_multi(args: argparse.Namespace) -> None:
                     print("\n[stopped]")
                     break
 
+            raw = _clean_cli_text(raw)
             if stdin_is_pipe and raw:
                 print(raw)
 
@@ -479,5 +482,12 @@ def _default_transcript_path() -> Path:
     return Path("logs") / f"text-cli-{stamp}.log"
 
 
+def _clean_cli_text(text: str) -> str:
+    cleaned = str(text or "").replace("\ufeff", "")
+    return "".join(ch for ch in cleaned if not 0xD800 <= ord(ch) <= 0xDFFF).strip()
+
+
 if __name__ == "__main__":
-    main()
+    import subprocess
+
+    raise SystemExit(subprocess.call([sys.executable, "cli.py", "--output-mode", "text", *sys.argv[1:]]))

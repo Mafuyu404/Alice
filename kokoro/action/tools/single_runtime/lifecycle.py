@@ -76,6 +76,7 @@ def create_cli_runtime(
     session = session_runtime.session
     if session is None:
         return None
+    life_runtime_primary = _life_runtime_primary(session)
 
     output_resources = say_tool.create_single_output_resources(
         tts_enabled=not args.no_tts,
@@ -108,7 +109,7 @@ def create_cli_runtime(
         model=session_runtime.dialogue_model,
         memory_backend=session_runtime.memory_backend,
     )
-    set_proactive_state(machine, enabled=session_runtime.proactive_enabled)
+    set_proactive_state(machine, enabled=session_runtime.proactive_enabled and not life_runtime_primary)
     say_action_bundle = say_tool.create_single_action_bundle(
         session=session,
         dialogue=dialogue,
@@ -120,6 +121,14 @@ def create_cli_runtime(
         transports=transports,
         cancel_slot=cancel_slot,
     )
+    life_runtime = getattr(session, "life_runtime", None)
+    if life_runtime is not None:
+        from kokoro.action.life_runtime import attach_runtime_resources
+
+        attach_runtime_resources(
+            life_runtime=life_runtime,
+            say_resources=say_action_bundle.resources,
+        )
     speech_input_runtime = speech_input_tool.create_single_speech_runtime_from_outputs(
         output_resources=output_resources,
         machine=machine,
@@ -134,16 +143,18 @@ def create_cli_runtime(
         display_user=display_user,
         printer=printer,
     )
-    dialogue_executor_stop = say_tool.start_dialogue_plan_executor_from_outputs(
-        dialogue=dialogue,
-        machine=machine,
-        action_runtime=say_action_bundle.action_runtime,
-        memory_backend=session_runtime.memory_backend,
-        session=session,
-        cancel_slot=cancel_slot,
-        output_resources=output_resources,
-        use_proactive=session_runtime.proactive_enabled,
-    )
+    dialogue_executor_stop = None
+    if not life_runtime_primary:
+        dialogue_executor_stop = say_tool.start_dialogue_plan_executor_from_outputs(
+            dialogue=dialogue,
+            machine=machine,
+            action_runtime=say_action_bundle.action_runtime,
+            memory_backend=session_runtime.memory_backend,
+            session=session,
+            cancel_slot=cancel_slot,
+            output_resources=output_resources,
+            use_proactive=session_runtime.proactive_enabled,
+        )
     transports.start_qq()
     background_runtime = transports.start_background(
         machine=machine,
@@ -153,7 +164,7 @@ def create_cli_runtime(
         session=session,
         output_resources=output_resources,
         dialogue=dialogue,
-        use_proactive=lambda: session_runtime.proactive_enabled,
+        use_proactive=lambda: session_runtime.proactive_enabled and not life_runtime_primary,
     )
     speech_input_startup = speech_input_tool.prepare_default_input(
         enabled=session_runtime.stt_enabled,
@@ -204,7 +215,7 @@ def start_cli_runtime(
         device=bundle.speech_input_startup.device,
         output_resources=bundle.output_resources,
         vts_runtime=bundle.transports.vts_runtime,
-        use_proactive=bundle.session_runtime.proactive_enabled,
+        use_proactive=bundle.session_runtime.proactive_enabled and not _life_runtime_primary(bundle.session),
         tool_enabled=bundle.tooling_runtime.enabled,
         background_runtime=bundle.background_runtime,
         live_runtime=bundle.transports.live_runtime,
@@ -284,3 +295,13 @@ def shutdown_cli_runtime(
         vts_runtime=vts_runtime or transports.vts_runtime,
     )
     say_tool.flush_session_outputs(session, printer=printer)
+
+
+def _life_runtime_primary(session) -> bool:
+    life_runtime = getattr(session, "life_runtime", None)
+    if life_runtime is None or not bool(getattr(life_runtime, "enabled", False)):
+        return False
+    section = getattr(life_runtime, "section", {})
+    if isinstance(section, dict):
+        return bool(section.get("primary", True))
+    return True

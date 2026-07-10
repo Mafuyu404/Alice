@@ -91,6 +91,21 @@ class SingleSpeechRuntime:
         )
 
     def handle_stt_pool_turn(self, pool_text: str) -> None:
+        if self._life_runtime_primary():
+            from kokoro.action import input_sources
+
+            text = str(pool_text or "").strip()
+            if text:
+                self.display_user(text)
+                self.dialogue.cancel_plans()
+                input_sources.publish_speech_text(
+                    self.session,
+                    text,
+                    speaker=self.session.user_name,
+                    reason="stt_pool",
+                )
+            self._release_input_turn_to_life_runtime()
+            return
         handle_stt_pool_turn(
             pool_text=pool_text,
             pool_lock=self.pool_lock,
@@ -106,6 +121,10 @@ class SingleSpeechRuntime:
         )
 
     def handle_conversation(self, text: str) -> None:
+        if self._life_runtime_primary():
+            self.printer(f"\n  [trace] life_runtime_input_published text={len(str(text or '').strip())}ch")
+            self._release_input_turn_to_life_runtime()
+            return
         handle_single_direct_speech_turn(
             text=text,
             cancel_slot=self.cancel_slot,
@@ -133,6 +152,26 @@ class SingleSpeechRuntime:
             ),
         )
         return self.conversation
+
+    def _life_runtime_primary(self) -> bool:
+        life_runtime = getattr(self.session, "life_runtime", None)
+        if life_runtime is None or not bool(getattr(life_runtime, "enabled", False)):
+            return False
+        section = getattr(life_runtime, "section", {})
+        if isinstance(section, dict):
+            return bool(section.get("primary", True))
+        return True
+
+    def _release_input_turn_to_life_runtime(self) -> None:
+        from kokoro.core import state_machine as sm
+
+        self.cancel_slot[0] = None
+        if getattr(self.machine, "state", None) == sm.SystemState.THINKING:
+            self.machine.emit(sm.SystemEvent.LLM_DONE)
+            self.machine.set_tts_state(sm.TTSState.IDLE)
+            self.machine.emit(sm.SystemEvent.TTS_DONE)
+        self.machine.reset_error_count()
+        self.machine.set_stt_state(sm.STTState.LISTENING)
 
     def start_worker(self, *, device: int | None) -> threading.Thread:
         return start_default_worker(

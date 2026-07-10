@@ -124,7 +124,7 @@ class ScriptedLifeLlm:
         )
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a LifeRuntime debug trace for one character.")
     parser.add_argument("--character", default="lerwa")
     parser.add_argument("--ticks", type=int, default=3)
@@ -156,7 +156,12 @@ def main() -> int:
         action="store_true",
         help="Use the configured memory backend instead of NoMemoryBackend and write before/after memory snapshots.",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main(args: argparse.Namespace | None = None) -> int:
+    if args is None:
+        args = build_parser().parse_args()
 
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     mode = "real" if args.real_llm else "scripted"
@@ -447,4 +452,16 @@ def _trace_counts(trace_path: Path) -> dict[str, int]:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import subprocess
+
+    raise SystemExit(
+        subprocess.call(
+            [
+                sys.executable,
+                str(ROOT / "cli.py"),
+                "--output-mode",
+                "life-debug",
+                *sys.argv[1:],
+            ]
+        )
+    )

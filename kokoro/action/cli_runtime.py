@@ -17,6 +17,15 @@ def main() -> None:
     if args.list_devices:
         stt_mod.list_devices()
         return
+    if args.output_mode == "text":
+        import text_cli
+
+        text_cli.main(args)
+        return
+    if args.output_mode == "life-debug":
+        from scripts import run_life_runtime_debug
+
+        raise SystemExit(run_life_runtime_debug.main(args))
     if args.multi:
         multi_cli_runtime.run(args)
         return

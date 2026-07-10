@@ -970,8 +970,6 @@ class LifeRuntime:
             unavailable.add("vts_expression")
         if context.get("vts_body_driver") is None and context.get("vts_arbiter") is None:
             unavailable.add("vts_motion")
-        if context.get("retire_sticker_store") is None:
-            unavailable.add("retire_sticker")
         unavailable.update({"search_memory", "save_to_memory", "write_conversation_memory"})
         observe_section = cfg.get("observe_screen", {})
         if isinstance(observe_section, dict) and observe_section.get("enabled") is False:

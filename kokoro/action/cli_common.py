@@ -51,7 +51,7 @@ def _install_cli_log() -> object:
     os.makedirs(log_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     path = os.path.join(log_dir, f"cli-{stamp}.log")
-    logfile = open(path, "a", encoding="utf-8", buffering=1)
+    logfile = open(path, "a", encoding="utf-8", errors="replace", buffering=1)
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     sys.stdout = _TeeStream(original_stdout, logfile)
@@ -62,6 +62,14 @@ def _install_cli_log() -> object:
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="KokoroMemo voice CLI")
+    parser.add_argument(
+        "--output-mode",
+        choices=["full", "text", "life-debug"],
+        default="full",
+        help="Runtime/output mode: full lifecycle, text-only, or LifeRuntime debug trace",
+    )
+    parser.add_argument("--text", action="store_true", help="Shortcut for --output-mode text")
+    parser.add_argument("--life-debug", action="store_true", help="Shortcut for --output-mode life-debug")
     parser.add_argument("--character", "-c", default="alice", help="Character id (default: alice)")
     parser.add_argument("--device", type=int, default=None, help="Microphone device id")
     parser.add_argument("--list-devices", action="store_true", help="List audio devices")
@@ -84,7 +92,37 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--idle-seconds", type=float, default=0.6, help="Seconds between unattended --multi turns")
     parser.add_argument("--max-turns", type=int, default=0, help="Maximum unattended --multi turns; 0 means unlimited")
     parser.add_argument("--topic", default=None, help="Opening topic for --multi watch/auto mode")
-    return parser.parse_args()
+    # Text output mode.
+    parser.add_argument("--no-memory", action="store_true", help="Text mode: disable memory backend for this run")
+    parser.add_argument("--tools", action="store_true", help="Text mode: enable agent file tools")
+    parser.add_argument("--read-only-tools", action="store_true", help="Text mode: enable file tools without write access")
+    parser.add_argument("--max-history", type=int, default=40, help="Text mode: conversation history messages to keep")
+    parser.add_argument("--no-store", action="store_true", help="Text mode: do not store turns into memory")
+    parser.add_argument("--no-cognition", action="store_true", help="Text mode: disable cognition evaluation for this run")
+    parser.add_argument("--input-file", default=None, help="Text mode: read UTF-8 user turns from a file")
+    parser.add_argument("--transcript-file", default=None, help="Text mode: write a UTF-8 transcript to a file")
+    # LifeRuntime debug output mode.
+    parser.add_argument("--ticks", type=int, default=3, help="Life debug mode: number of manual ticks")
+    parser.add_argument("--duration-seconds", type=float, default=0.0, help="Life debug mode: run background loop for this many seconds")
+    parser.add_argument("--out-dir", default="", help="Life debug mode: output directory")
+    parser.add_argument("--real-llm", action="store_true", help="Life debug mode: use configured LLM instead of scripted responses")
+    parser.add_argument("--llm-model", default="", help="Life debug mode: local thinking model override")
+    parser.add_argument("--llm-url", default="", help="Life debug mode: local thinking base URL override")
+    parser.add_argument("--api-style", default="", choices=["", "auto", "ollama", "openai"], help="Life debug mode: local thinking API style")
+    parser.add_argument(
+        "--initial-event",
+        default="LifeRuntime debug start: absorb this event, notice elapsed time, and decide whether a tool helps.",
+        help="Life debug mode: initial event",
+    )
+    parser.add_argument("--guide-event", action="append", default=[], help="Life debug mode: timed guide event as seconds:text")
+    parser.add_argument("--memory-event", action="append", default=[], help="Life debug mode: timed memory candidate as seconds:text")
+    parser.add_argument("--real-memory", action="store_true", help="Life debug mode: use configured memory backend")
+    args = parser.parse_args()
+    if args.text:
+        args.output_mode = "text"
+    if args.life_debug:
+        args.output_mode = "life-debug"
+    return args
 
 
 def display_user(text: str) -> None:

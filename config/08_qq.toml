@@ -52,9 +52,10 @@ batch_min_unread = 1
 # 类型: float
 idle_participation_seconds = 25.0
 
-# 是否启用 QQ 自主参与判断。关闭后 QQ 只进入内在叙事，不主动发消息。
+# 是否启用旧的 QQ 直连自主参与判断。统一架构下保持关闭；
+# QQ 输入只进入内在叙事流，发送由 send_qq_message 工具完成。
 # 类型: bool
-autonomous_participation_enabled = true
+autonomous_participation_enabled = false
 
 # QQ 自主参与判断前是否同步等待内在叙事流吸收本轮 QQ 环境。
 # false 时 QQ 先快速决策，内在叙事流异步吸收，回复会更快。

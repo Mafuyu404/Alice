@@ -9,9 +9,9 @@
 # decide rhythm, attention, thinking intensity, and tool plans.
 
 [life_runtime]
-# Disabled by default while the old InnerStreamLoop remains the active runtime.
-# Enable after wiring the new runtime into the selected CLI/lifecycle entry.
-enabled = false
+# LifeRuntime is the primary inner-stream/action runtime. Inputs publish events;
+# the inner stream decides when to call tools.
+enabled = true
 
 # When true, LifeRuntime owns autonomous inner-stream/action cycling and the
 # old InnerStreamLoop/AutonomousStep is not started for the session.

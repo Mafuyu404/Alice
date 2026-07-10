@@ -14,10 +14,9 @@ from kokoro.action.tools.qq.helpers import (
 )
 from kokoro.action.tools.qq.input_runtime import QQInputRuntime
 from kokoro.action.tools.qq.models import QQContextPacket, QQRawMessage
-from kokoro.action.tools.qq.participant import QQAutonomousParticipant, QQParticipationDecision
+from kokoro.action.tools.qq.participant import QQParticipationDecision
 
 __all__ = [
-    "QQAutonomousParticipant",
     "QQContextPacket",
     "QQConversationState",
     "QQEnvironment",
