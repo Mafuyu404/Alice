@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 import urllib.error
@@ -208,7 +209,19 @@ class LifeRuntime:
             self._last_processed_sequence = max(item.sequence for item in batch)
         inner_stream = _inner_stream_text(self.session)
         time_context = self.time.render(pending_lines=self.pool.timing_lines(batch))
+        event_text = self.pool.format_batch(batch, max_chars=int(self.section.get("batch_max_chars", 4000) or 4000))
+        qq_private_observations = _qq_private_observations(batch)
+        for observation in qq_private_observations:
+            lifecycle_debug.log("life.runtime.qq_private_observed", **observation)
+        if qq_private_observations:
+            self._update_recent_qq_context(qq_private_observations[-1], event_text=event_text)
         digest = self.compactor.compact_once(time_context=time_context, inner_stream=inner_stream)
+        if qq_private_observations and _digest_may_have_lost_qq_private(digest, qq_private_observations):
+            lifecycle_debug.log(
+                "life.context.compact.qq_private_possible_drop",
+                observations=qq_private_observations,
+                digest=digest,
+            )
         if digest:
             self._append_memory_event(
                 source="life_runtime",
@@ -217,7 +230,6 @@ class LifeRuntime:
                 memory_policy="debug",
                 metadata={"phase": "before_think"},
             )
-        event_text = self.pool.format_batch(batch, max_chars=int(self.section.get("batch_max_chars", 4000) or 4000))
         thought = self._think(
             inner_stream=inner_stream,
             time_context=time_context,
@@ -228,12 +240,25 @@ class LifeRuntime:
         self.time.mark_llm_thought()
         patch_applied = self._apply_patch_from_data(data, inner_stream=inner_stream)
         self._record_pending_threads_from_data(data)
+        if qq_private_observations and not _extract_action_intent_from_data(data):
+            lifecycle_debug.log(
+                "life.runtime.qq_private.no_action_intent",
+                observations=qq_private_observations,
+                thought_snippet=str(thought or "")[:800],
+            )
         action_plan = self._select_action_plan_from_data(
             data,
             inner_stream=inner_stream,
             time_context=time_context,
             digest=digest,
+            event_text=event_text,
         )
+        if qq_private_observations and _extract_action_intent_from_data(data) and not action_plan:
+            lifecycle_debug.log(
+                "life.runtime.qq_private.tool_select_no_plan",
+                observations=qq_private_observations,
+                action_intent=_extract_action_intent_from_data(data),
+            )
         self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
         if action_plan:
             self._append_memory_event(
@@ -266,7 +291,7 @@ class LifeRuntime:
                 memory_policy="debug",
                 metadata={"trace_dir": self._last_prompt_trace_dir or ""},
             )
-        if action_plan_status == "executed" and action_results:
+        if action_plan_status == "executed" and action_results and _plan_opens_followup(action_plan or {}):
             followup = self._continue_after_action_results(
                 initial_plan=action_plan or {},
                 initial_results=action_results,
@@ -279,6 +304,12 @@ class LifeRuntime:
                 action_plan = followup["action_plan"]
                 action_plan_status = str(followup.get("action_plan_status") or action_plan_status)
                 action_plan_error = str(followup.get("action_plan_error") or action_plan_error)
+        elif action_plan_status == "executed" and action_results and _plan_has_self_expression(action_plan or {}):
+            self._close_self_expression_loop(
+                reason="self_expression_completed",
+                plan=action_plan or {},
+                results=action_results,
+            )
         self._run_memory_core_cycle()
         lifecycle_debug.log(
             "life.runtime.tick_done",
@@ -413,6 +444,7 @@ class LifeRuntime:
                 inner_stream=inner_stream,
                 time_context=time_context,
                 digest=self.compactor.recent_digest(),
+                event_text=result_context,
             )
             self._write_prompt_trace_result(llm_raw=thought, parsed=data, tool_plan=action_plan)
             intensity = _extract_intensity_from_data(data)
@@ -541,8 +573,9 @@ class LifeRuntime:
     def _think(self, *, inner_stream: str, time_context: str, digest: str, event_text: str) -> str:
         character_name = str(getattr(self.session, "character_name", "") or getattr(self.session, "character_id", "AI"))
         character_profile = _character_profile_text(self.session)
-        cognition_context = _cognition_context_text(self.session, event_text=event_text)
-        memory_context = self._memory_context(event_text=event_text, inner_stream=inner_stream, digest=digest)
+        active_event_text = event_text or self._recent_qq_context_text()
+        cognition_context = _cognition_context_text(self.session, event_text=active_event_text)
+        memory_context = self._memory_context(event_text=active_event_text, inner_stream=inner_stream, digest=digest)
         fragment_max = int(self.section.get("context_fragment_max_chars", 4000) or 4000)
         trace_dir = None
         debug_dir = self.section.get("prompt_trace_dir")
@@ -565,7 +598,7 @@ class LifeRuntime:
                 "context_digest": self._context_fragment("recent_digest", digest, max_chars=fragment_max),
                 "event_batch": self._context_fragment(
                     "event_batch",
-                    event_text or "(no new external event; this can be time passing or continued thinking)",
+                    active_event_text or "(no new external event; this can be time passing or continued thinking)",
                     max_chars=int(self.section.get("event_batch_fragment_max_chars", min(fragment_max, 2400)) or 2400),
                 ),
                 "pending_threads": self._context_fragment(
@@ -598,6 +631,7 @@ class LifeRuntime:
         inner_stream: str,
         time_context: str,
         digest: str,
+        event_text: str = "",
     ) -> dict[str, Any] | None:
         if not isinstance(data, dict):
             return None
@@ -612,6 +646,7 @@ class LifeRuntime:
             inner_stream=inner_stream,
             time_context=time_context,
             digest=digest,
+            event_text=event_text,
         )
 
     def _select_action_plan(
@@ -621,12 +656,14 @@ class LifeRuntime:
         inner_stream: str,
         time_context: str,
         digest: str,
+        event_text: str = "",
     ) -> dict[str, Any] | None:
         self._available_actions = self._resolve_available_actions()
         if not self._available_actions:
             lifecycle_debug.log("life.runtime.tool_select.no_available_actions", action_intent=action_intent)
             return None
         fragment_max = int(self.section.get("context_fragment_max_chars", 4000) or 4000)
+        active_event_text = event_text or self._recent_qq_context_text()
         trace_dir = str(Path(self._last_prompt_trace_dir) / "tool_select") if self._last_prompt_trace_dir else None
         ctx = PromptContext(
             scene=LIFE_TOOL_SELECT_SCENE,
@@ -656,6 +693,14 @@ class LifeRuntime:
                     time_context,
                     max_chars=1600,
                     kind="time",
+                    audience="tool_select",
+                    role="environment",
+                ),
+                "event_batch": self._context_fragment(
+                    "event_batch",
+                    active_event_text or "(none)",
+                    max_chars=int(self.section.get("tool_select_event_max_chars", 2400) or 2400),
+                    kind="event_batch",
                     audience="tool_select",
                     role="environment",
                 ),
@@ -706,7 +751,11 @@ class LifeRuntime:
         )
         return _preserve_search_query_anchors(
             plan,
-            "\n".join(part for part in (action_intent, inner_stream, digest, self.compactor.pending_threads()) if str(part or "").strip()),
+            "\n".join(
+                part
+                for part in (action_intent, event_text, inner_stream, digest, self.compactor.pending_threads())
+                if str(part or "").strip()
+            ),
         )
 
     def _context_fragment(
@@ -727,6 +776,90 @@ class LifeRuntime:
             audience=audience,
             role=role,
         )
+
+    def _update_recent_qq_context(self, observation: dict[str, Any], *, event_text: str) -> None:
+        if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
+            return
+        conversation_id = str(observation.get("conversation_id") or "").strip()
+        if not conversation_id:
+            return
+        self.action_runtime.tool_context["recent_qq_conversation_id"] = conversation_id
+        self.action_runtime.tool_context["recent_qq_event_batch"] = event_text
+        self.action_runtime.tool_context["recent_qq_context_updated_at"] = time.monotonic()
+        lifecycle_debug.log(
+            "life.runtime.qq_context_for_tools",
+            conversation_id=conversation_id,
+            event_chars=len(event_text or ""),
+        )
+
+    def _recent_qq_context_text(self) -> str:
+        if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
+            return ""
+        ctx = self.action_runtime.tool_context
+        event_text = str(ctx.get("recent_qq_event_batch") or "").strip()
+        if not event_text:
+            return ""
+        updated_at = ctx.get("recent_qq_context_updated_at")
+        try:
+            age = time.monotonic() - float(updated_at)
+        except Exception:
+            age = 0.0
+        max_age = float(self.section.get("recent_qq_context_seconds", 240) or 240)
+        if age > max_age:
+            return ""
+        return f"仍有余温的QQ对话现场（约 {int(max(0, age))} 秒前）：\n{event_text}"
+
+    def _close_recent_qq_context(self, *, reason: str, plan: dict[str, Any]) -> None:
+        if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
+            return
+        ctx = self.action_runtime.tool_context
+        if not ctx.get("recent_qq_event_batch"):
+            return
+        ctx["recent_qq_event_batch"] = ""
+        ctx["recent_qq_context_closed_at"] = time.monotonic()
+        lifecycle_debug.log(
+            "life.runtime.qq_context_closed",
+            reason=reason,
+            plan=plan,
+        )
+
+    def _close_self_expression_loop(
+        self,
+        *,
+        reason: str,
+        plan: dict[str, Any],
+        results: dict[str, str],
+    ) -> None:
+        self._record_recent_self_expression(plan)
+        self._close_recent_qq_context(reason=reason, plan=plan)
+        self.compactor.clear_pending_threads()
+        self.compactor.clear_tool_results()
+        closure = _self_expression_closure_text(plan, results)
+        if closure:
+            stream = getattr(self.session, "inner_stream", None)
+            current = _inner_stream_text(self.session)
+            patch = InnerStreamPatch(
+                patches=[{"op": "append", "text": closure}],
+                reason="self expression closed",
+            )
+            max_chars = int(cfg.inner_stream_config().get("max_chars", 1200) or 1200)
+            result = apply_inner_stream_patch(current, patch, max_chars=max_chars)
+            if result.applied and stream is not None:
+                apply_patch = getattr(stream, "apply_patch", None)
+                raw_patch = {
+                    "patches": [{"op": "append", "text": closure}],
+                    "reason": "self expression closed",
+                }
+                if callable(apply_patch):
+                    apply_patch(raw_patch)
+                elif hasattr(stream, "text"):
+                    stream.text = result.text
+                self._inner_stream_version += 1
+                lifecycle_debug.log(
+                    "life.runtime.self_expression_closed_inner_stream",
+                    chars=len(closure),
+                    text=closure,
+                )
 
     def _append_memory_event(
         self,
@@ -1016,9 +1149,93 @@ class LifeRuntime:
             missing = self._missing_required_args(node.tool, node.args)
             if node.tool == "write_conversation_memory" and not str(node.args.get("trigger_text") or "").strip():
                 missing.append("trigger_text")
+            if node.tool == "send_qq_message" and not str(
+                node.args.get("message") or node.args.get("content") or node.args.get("text") or ""
+            ).strip():
+                missing.append("message")
             if missing:
                 return f"action {node.tool} missing required args: {', '.join(dict.fromkeys(missing))}"
+            if node.tool == "send_qq_message":
+                duplicate = self._recent_self_expression_duplicate(node.args)
+                if duplicate:
+                    lifecycle_debug.log(
+                        "life.runtime.self_expression_duplicate_rejected",
+                        tool=node.tool,
+                        reason=duplicate,
+                        args=node.args,
+                    )
+                    return duplicate
         return ""
+
+    def _record_recent_self_expression(self, plan: dict[str, Any]) -> None:
+        if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
+            return
+        message = _first_self_expression_message(plan)
+        if not message:
+            return
+        conversation_id = _first_self_expression_conversation_id(plan)
+        if not conversation_id:
+            conversation_id = str(
+                self.action_runtime.tool_context.get("recent_qq_conversation_id") or ""
+            ).strip()
+        record = {
+            "at": time.monotonic(),
+            "conversation_id": conversation_id,
+            "message": message,
+        }
+        recent = self.action_runtime.tool_context.setdefault("recent_self_expressions", [])
+        if not isinstance(recent, list):
+            recent = []
+            self.action_runtime.tool_context["recent_self_expressions"] = recent
+        recent.append(record)
+        max_records = int(self.section.get("recent_self_expression_records", 24) or 24)
+        del recent[:-max_records]
+        lifecycle_debug.log(
+            "life.runtime.self_expression_recorded",
+            conversation_id=conversation_id,
+            message=message,
+        )
+
+    def _recent_self_expression_duplicate(self, args: dict[str, Any]) -> str:
+        if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
+            return ""
+        message = str(args.get("message") or args.get("content") or args.get("text") or "").strip()
+        if not message:
+            return ""
+        conversation_id = str(args.get("conversation_id") or "").strip()
+        if not conversation_id:
+            conversation_id = str(
+                self.action_runtime.tool_context.get("recent_qq_conversation_id") or ""
+            ).strip()
+        now = time.monotonic()
+        max_age = float(self.section.get("recent_self_expression_duplicate_seconds", 300.0) or 300.0)
+        recent = self.action_runtime.tool_context.get("recent_self_expressions", [])
+        if not isinstance(recent, list):
+            return ""
+        kept: list[dict[str, Any]] = []
+        duplicate: dict[str, Any] | None = None
+        for item in recent:
+            if not isinstance(item, dict):
+                continue
+            try:
+                age = now - float(item.get("at") or 0.0)
+            except Exception:
+                continue
+            if age > max_age:
+                continue
+            kept.append(item)
+            previous_conversation = str(item.get("conversation_id") or "").strip()
+            if conversation_id and previous_conversation and conversation_id != previous_conversation:
+                continue
+            previous = str(item.get("message") or "").strip()
+            similarity = _expression_similarity(message, previous)
+            if similarity >= _expression_duplicate_threshold(message, previous):
+                duplicate = item
+                break
+        self.action_runtime.tool_context["recent_self_expressions"] = kept
+        if duplicate is None:
+            return ""
+        return "self expression already completed for this conversation; wait for new input or new information before sending again"
 
     def _apply_patch_from_thought(self, thought: str, *, inner_stream: str) -> bool:
         return self._apply_patch_from_data(_extract_json(thought), inner_stream=inner_stream)
@@ -1204,6 +1421,84 @@ def _inner_stream_text(session) -> str:
     return str(getattr(stream, "text", "") or "").strip()
 
 
+def _qq_private_observations(batch: list[Any]) -> list[dict[str, Any]]:
+    observations: list[dict[str, Any]] = []
+    for item in batch or []:
+        event = getattr(item, "event", None)
+        metadata = dict(getattr(event, "metadata", {}) or {})
+        if str(getattr(event, "type", "") or "") != "chat_environment":
+            continue
+        if str(getattr(event, "source", "") or "") != "qq":
+            continue
+        if str(metadata.get("message_type") or "") != "private":
+            continue
+        content = str(getattr(event, "content", "") or "")
+        observations.append(
+            {
+                "sequence": getattr(item, "sequence", 0),
+                "conversation_id": str(metadata.get("conversation_id") or ""),
+                "label": str(metadata.get("label") or ""),
+                "content_snippet": _compact_snippet(content, limit=500),
+                "message_lines": _recent_message_lines(content, limit=3),
+            }
+        )
+    return observations
+
+
+def _digest_may_have_lost_qq_private(digest: str, observations: list[dict[str, Any]]) -> bool:
+    haystack = str(digest or "")
+    if not haystack.strip():
+        return True
+    for observation in observations:
+        probes: list[str] = []
+        label = str(observation.get("label") or "")
+        if label:
+            probes.extend(_meaningful_tokens(label))
+        for line in observation.get("message_lines") or []:
+            probes.extend(_meaningful_tokens(str(line or "")))
+        probes = [probe for probe in probes if len(probe) >= 2]
+        if probes and not any(probe in haystack for probe in probes[:8]):
+            return True
+    return False
+
+
+def _recent_message_lines(content: str, *, limit: int = 3) -> list[str]:
+    lines = [line.strip() for line in str(content or "").splitlines() if line.strip()]
+    message_lines: list[str] = []
+    in_recent = False
+    for line in lines:
+        if "最近消息" in line or "recent" in line.lower():
+            in_recent = True
+            continue
+        if in_recent:
+            message_lines.append(line)
+    if not message_lines:
+        message_lines = [line for line in lines if re.search(r"\[\d{1,2}:\d{2}:\d{2}\]", line)]
+    return message_lines[-max(1, int(limit)) :]
+
+
+def _meaningful_tokens(text: str) -> list[str]:
+    raw = str(text or "")
+    tokens = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9_]{3,}", raw)
+    ignored = {
+        "QQ",
+        "private",
+        "group",
+        "chat",
+        "message",
+        "source",
+        "metadata",
+    }
+    return [token for token in tokens if token not in ignored]
+
+
+def _compact_snippet(text: str, *, limit: int = 500) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)] + "…"
+
+
 def _character_profile_text(session) -> str:
     data = getattr(session, "character_data", {}) or {}
     parts = []
@@ -1239,11 +1534,23 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     try:
         data = json.loads(raw)
     except Exception:
+        normalized = _normalize_json_punctuation(raw)
+        if normalized != raw:
+            try:
+                data = json.loads(normalized)
+            except Exception:
+                data = None
+            else:
+                return data if isinstance(data, dict) else None
         match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
         if not match:
             return None
         try:
-            data = json.loads(match.group(0))
+            candidate = match.group(0)
+            try:
+                data = json.loads(candidate)
+            except Exception:
+                data = json.loads(_normalize_json_punctuation(candidate))
         except Exception:
             return None
     return data if isinstance(data, dict) else None
@@ -1265,6 +1572,16 @@ def _json_parse_error(text: str) -> str:
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return "json root is not an object"
+
+
+def _normalize_json_punctuation(text: str) -> str:
+    return (
+        str(text or "")
+        .replace("\u201c", '"')
+        .replace("\u201d", '"')
+        .replace("\u2018", "'")
+        .replace("\u2019", "'")
+    )
 
 
 def _extract_action_plan(text: str) -> dict[str, Any] | None:
@@ -1316,6 +1633,131 @@ def _preserve_search_query_anchors(action_plan: dict[str, Any] | None, context: 
         if query and not _latin_anchor_re().search(query):
             args["query"] = f"{anchor} {query}"
     return action_plan
+
+
+def _plan_has_self_expression(plan: dict[str, Any] | None) -> bool:
+    return any(tool in {"send_qq_message", "say", "say_precomputed"} for tool in _plan_tool_names(plan))
+
+
+def _first_self_expression_message(plan: dict[str, Any] | None) -> str:
+    if not isinstance(plan, dict):
+        return ""
+    raw_actions = plan.get("actions") or plan.get("nodes") or []
+    if not isinstance(raw_actions, list):
+        return ""
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        tool = str(item.get("tool") or item.get("action") or "").strip()
+        if tool not in {"send_qq_message", "say", "say_precomputed"}:
+            continue
+        args = item.get("args")
+        if not isinstance(args, dict):
+            args = item
+        message = str(args.get("message") or args.get("content") or args.get("text") or "").strip()
+        if message:
+            return message
+    return ""
+
+
+def _first_self_expression_conversation_id(plan: dict[str, Any] | None) -> str:
+    if not isinstance(plan, dict):
+        return ""
+    raw_actions = plan.get("actions") or plan.get("nodes") or []
+    if not isinstance(raw_actions, list):
+        return ""
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        tool = str(item.get("tool") or item.get("action") or "").strip()
+        if tool != "send_qq_message":
+            continue
+        args = item.get("args")
+        if not isinstance(args, dict):
+            args = item
+        conversation_id = str(args.get("conversation_id") or "").strip()
+        if conversation_id:
+            return conversation_id
+    return ""
+
+
+def _self_expression_closure_text(plan: dict[str, Any] | None, results: dict[str, str] | None) -> str:
+    message = _first_self_expression_message(plan)
+    if not message:
+        return ""
+    return (
+        "刚才这次对外表达已经完成；这个表达意图已经落地。"
+        "后续如果出现新的输入、追问或新信息，再自然形成新的回应。"
+    )
+
+
+def _expression_similarity(left: str, right: str) -> float:
+    left_normalized = _normalize_expression_text(left)
+    right_normalized = _normalize_expression_text(right)
+    if not left_normalized or not right_normalized:
+        return 0.0
+    if left_normalized == right_normalized:
+        return 1.0
+    if left_normalized in right_normalized or right_normalized in left_normalized:
+        shorter = min(len(left_normalized), len(right_normalized))
+        longer = max(len(left_normalized), len(right_normalized))
+        if shorter >= 8:
+            return max(0.82, shorter / max(1, longer))
+    sequence = SequenceMatcher(None, left_normalized, right_normalized).ratio()
+    overlap = _ngram_overlap(left_normalized, right_normalized, n=2)
+    return max(sequence, overlap)
+
+
+def _expression_duplicate_threshold(left: str, right: str) -> float:
+    shorter = min(len(_normalize_expression_text(left)), len(_normalize_expression_text(right)))
+    if shorter >= 24:
+        return 0.62
+    if shorter >= 14:
+        return 0.72
+    return 0.86
+
+
+def _normalize_expression_text(text: str) -> str:
+    lowered = str(text or "").lower()
+    return re.sub(r"[\s\W_]+", "", lowered, flags=re.UNICODE)
+
+
+def _ngram_overlap(left: str, right: str, *, n: int = 2) -> float:
+    if len(left) < n or len(right) < n:
+        return 0.0
+    left_grams = {left[index : index + n] for index in range(0, len(left) - n + 1)}
+    right_grams = {right[index : index + n] for index in range(0, len(right) - n + 1)}
+    if not left_grams or not right_grams:
+        return 0.0
+    intersection = len(left_grams & right_grams)
+    shorter = min(len(left_grams), len(right_grams))
+    return intersection / max(1, shorter)
+
+
+def _plan_opens_followup(plan: dict[str, Any] | None) -> bool:
+    if not isinstance(plan, dict):
+        return False
+    tools = set(_plan_tool_names(plan))
+    if not tools:
+        return False
+    if tools.issubset({"send_qq_message", "say", "say_precomputed", "wait", "stay_silent"}):
+        return False
+    return True
+
+
+def _plan_tool_names(plan: dict[str, Any] | None) -> list[str]:
+    if not isinstance(plan, dict):
+        return []
+    raw_actions = plan.get("actions") or plan.get("nodes") or []
+    tools: list[str] = []
+    if not isinstance(raw_actions, list):
+        return tools
+    for item in raw_actions:
+        if isinstance(item, dict):
+            tool = str(item.get("tool") or item.get("action") or "").strip()
+            if tool:
+                tools.append(tool)
+    return tools
 
 
 def _first_latin_anchor(text: str) -> str:

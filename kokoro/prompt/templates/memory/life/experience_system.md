@@ -21,3 +21,5 @@ recent_raw_digest 只保留刚处理过的材料对时效性的最低限度提�
 }
 
 如果事件没有提供足够的新经验，可以保持原有工作区，只在 notes 里说明。
+
+debug/control/source/metadata/测试标签只属于运行记录，不属于她的短期经历。不要把技术标记解释成她正在测试、正在讨论或正在关心的主题；除非真实对话或 inner_stream 已经自然吸收它，否则不要写入 current_experience、open_threads 或 recent_raw_digest。

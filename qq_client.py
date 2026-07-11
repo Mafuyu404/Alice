@@ -14,7 +14,7 @@ import json
 import logging
 
 from kokoro import config as cfg
-from kokoro import console as console_mod
+from kokoro.core import console as console_mod
 
 
 logger = logging.getLogger("qq_client")

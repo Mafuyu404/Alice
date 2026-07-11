@@ -51,6 +51,7 @@ class QQBridge:
             assert self.runtime is not None
             assert self.stop_event is not None
             clients: set = set()
+            sender_ws = [None]
             loop = asyncio.get_running_loop()
             poll_lock = threading.Lock()
 
@@ -58,11 +59,14 @@ class QQBridge:
                 await ws.send(json.dumps({"action": action, "params": params}, ensure_ascii=False))
 
             def _send_qq_message_from_llm(
+                ws,
                 message: str,
                 *,
                 conversation_id: str = "",
                 reason: str = "llm_decided",
             ) -> str:
+                if ws is None:
+                    return "QQ send failed: no active QQ transport."
                 target_id = (conversation_id or "").strip() or self.runtime.recent_conversation_id()
                 if not target_id:
                     return "QQ send failed: no recent conversation."
@@ -108,7 +112,6 @@ class QQBridge:
 
             async def handler(ws) -> None:
                 clients.add(ws)
-                self.tool_sender[0] = _send_qq_message_from_llm
                 print(f"\n[qq] transport connected: {ws.remote_address}")
                 stop_client = asyncio.Event()
 
@@ -127,6 +130,13 @@ class QQBridge:
                             payload = json.loads(raw)
                         except json.JSONDecodeError:
                             continue
+                        if isinstance(payload, dict) and payload.get("kind") == "onebot_event":
+                            sender_ws[0] = ws
+                            self.tool_sender[0] = lambda *args, **kwargs: _send_qq_message_from_llm(
+                                sender_ws[0],
+                                *args,
+                                **kwargs,
+                            )
                         event = payload.get("event") if isinstance(payload, dict) else None
                         if not isinstance(event, dict):
                             continue
@@ -142,7 +152,10 @@ class QQBridge:
                     except asyncio.CancelledError:
                         pass
                     clients.discard(ws)
-                    if not clients:
+                    if sender_ws[0] is ws:
+                        sender_ws[0] = None
+                        self.tool_sender[0] = None
+                    elif not clients:
                         self.tool_sender[0] = None
                     print("\n[qq] transport disconnected")
 

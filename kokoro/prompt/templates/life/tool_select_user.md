@@ -3,6 +3,9 @@
 行动意向：
 {{ action_intent }}
 
+最近进入的信息：
+{{ event_batch }}
+
 当前 inner_stream：
 {{ inner_stream }}
 

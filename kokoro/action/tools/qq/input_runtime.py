@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from kokoro.core import input_events
+from kokoro.core import lifecycle_debug
 from kokoro.action.tools.qq import media as qq_media
 
 from kokoro.action.tools.qq.environment import QQEnvironment
@@ -49,25 +50,39 @@ class QQInputRuntime:
         )
         self.batch_quiet_seconds = _config_float(self.config, "batch_quiet_seconds", 4.0)
         self.batch_min_unread = _config_int(self.config, "batch_min_unread", 1)
+        self.group_chat_enabled = bool(self.config.get("group_chat_enabled", self.config.get("enable_group_chat", True)))
 
     def ingest_onebot_event(self, event: dict) -> QQRawMessage | None:
         message = build_raw_message_from_onebot(event)
         if message is None:
             return None
+        if self._should_drop_message(message):
+            return None
         if message.self_id:
             self.self_id = message.self_id
-        self.environment.ingest(message)
-        self._record_social_feedback_candidate(message)
-        self._record_search_request_candidate(message)
-        self.image_processor.consider_message(
-            message,
-            recent_lines=self.environment.recent_lines(message.conversation_id, limit=20),
-        )
+        self._ingest_allowed_message(message)
         return message
 
     def ingest_message(self, message: QQRawMessage) -> None:
+        if self._should_drop_message(message):
+            return
         if message.self_id:
             self.self_id = message.self_id
+        self._ingest_allowed_message(message)
+
+    def _should_drop_message(self, message: QQRawMessage) -> bool:
+        if message.message_type == "group" and not self.group_chat_enabled:
+            lifecycle_debug.log(
+                "qq.input.drop_group_message",
+                tool="qq",
+                conversation_id=message.conversation_id,
+                message_id=message.message_id,
+                nickname=message.nickname,
+            )
+            return True
+        return False
+
+    def _ingest_allowed_message(self, message: QQRawMessage) -> None:
         self.environment.ingest(message)
         self._record_social_feedback_candidate(message)
         self._record_search_request_candidate(message)

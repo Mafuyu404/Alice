@@ -6,8 +6,11 @@ import json
 import re
 import sys
 
+from kokoro.core import lifecycle_debug
+
 
 def _debug_log(event: str, **fields) -> None:
+    lifecycle_debug.log("qq_image.debug", tool="qq_image", qq_image_event=event, **fields)
     parts = [f"[qq_image] {event}"]
     for key, value in fields.items():
         text = str(value)

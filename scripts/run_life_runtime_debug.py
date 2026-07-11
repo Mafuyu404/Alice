@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from datetime import datetime
@@ -19,6 +18,7 @@ from kokoro.core import input_events
 from kokoro.core import lifecycle_debug
 from kokoro.core import memory as memory_mod
 from kokoro.memory import create_memory_system
+from kokoro.action.tools import qq as qq_tool
 from kokoro.action.tools import search_web as search_web_tool
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
 
@@ -168,7 +168,16 @@ def main(args: argparse.Namespace | None = None) -> int:
     out_dir = Path(args.out_dir or Path("test_runs") / f"life_runtime_debug_{args.character}_{mode}_{stamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
     trace_path = out_dir / "lifecycle_trace.jsonl"
-    os.environ["KOKORO_LIFECYCLE_TRACE"] = str(trace_path)
+    lifecycle_debug.configure_run(
+        out_dir,
+        metadata={
+            "character": args.character,
+            "output_mode": "life-debug",
+            "scripted": not args.real_llm,
+            "duration_seconds": args.duration_seconds,
+            "ticks": args.ticks,
+        },
+    )
     full_config = cfg.load()
     web_search_runtime = _start_web_search_runtime(full_config, out_dir=out_dir)
 
@@ -233,6 +242,8 @@ def main(args: argparse.Namespace | None = None) -> int:
     session.autonomous_step = None
     session.event_bus = input_events.InputEventBus()
     session.event_bus.subscribe(runtime.submit)
+    qq_bridge = _start_qq_bridge(args, session=session, config=full_config)
+    _attach_qq_sender(runtime, qq_bridge)
 
     lifecycle_debug.log(
         "life_debug.start",
@@ -241,15 +252,14 @@ def main(args: argparse.Namespace | None = None) -> int:
         duration_seconds=args.duration_seconds,
         out_dir=str(out_dir),
         scripted=not args.real_llm,
+        initial_event=args.initial_event,
     )
     guide_events = _parse_guide_events(args.guide_event)
     memory_events = _parse_timed_text_events(args.memory_event)
-    session.record_input_event(
-        args.initial_event,
-        source="life_runtime_debug",
-        metadata={"debug_run": True, "phase": "start"},
-        priority="high",
-        lifetime="session",
+    lifecycle_debug.log(
+        "life_debug.control.initial_event",
+        text=args.initial_event,
+        memory_policy="control",
     )
     results = []
     error = ""
@@ -271,7 +281,7 @@ def main(args: argparse.Namespace | None = None) -> int:
                     session.record_input_event(
                         text,
                         source="life_runtime_debug_guide",
-                        metadata={"debug_run": True, "phase": "guide", "at_seconds": seconds},
+                        metadata={"debug_run": True, "phase": "guide", "at_seconds": seconds, "memory_policy": "debug"},
                         priority="high",
                         lifetime="session",
                     )
@@ -280,7 +290,7 @@ def main(args: argparse.Namespace | None = None) -> int:
                     session.record_input_event(
                         text,
                         source="life_runtime_debug_memory_candidate",
-                        metadata={"debug_run": True, "phase": "memory_candidate", "at_seconds": seconds},
+                        metadata={"debug_run": True, "phase": "memory_candidate", "at_seconds": seconds, "memory_policy": "debug"},
                         priority="normal",
                         lifetime="memorize_candidate",
                     )
@@ -297,6 +307,7 @@ def main(args: argparse.Namespace | None = None) -> int:
                 time.sleep(0.05)
     finally:
         runtime.stop(wait=True, timeout=5.0)
+        _stop_runtime(qq_bridge)
         _stop_runtime(web_search_runtime)
         _write_memory_snapshot(backend, memory_user_id, out_dir / "memory_after.json")
         close = getattr(backend, "close", None)
@@ -386,6 +397,38 @@ def _start_web_search_runtime(config: dict, *, out_dir: Path):
         process_started=bool(getattr(runtime, "process", None)),
     )
     return runtime
+
+
+def _start_qq_bridge(args: argparse.Namespace, *, session, config: dict):
+    section = config.get("qq", {}) if isinstance(config, dict) else {}
+    if not isinstance(section, dict):
+        section = {}
+    enabled = bool(getattr(args, "qq", False) or section.get("enabled", False))
+    if not enabled:
+        lifecycle_debug.log("life_debug.transport.qq", enabled=False, has_runtime=False)
+        return None
+    bridge = qq_tool.create_from_cli(args=args, session=session, config=config)
+    bridge.start()
+    runtime = getattr(bridge, "runtime", None)
+    lifecycle_debug.log(
+        "life_debug.transport.qq",
+        enabled=bool(getattr(bridge, "enabled", False)),
+        has_runtime=runtime is not None,
+        host=getattr(bridge, "host", ""),
+        port=getattr(bridge, "port", None),
+        group_chat_enabled=bool(getattr(runtime, "group_chat_enabled", True)) if runtime is not None else None,
+    )
+    return bridge
+
+
+def _attach_qq_sender(runtime, qq_bridge) -> None:
+    action_runtime = getattr(runtime, "action_runtime", None)
+    if qq_bridge is None or action_runtime is None or not hasattr(action_runtime, "tool_context"):
+        return
+    action_runtime.tool_context["qq_send_message"] = qq_bridge.send_message
+    attach = getattr(runtime, "attach_action_runtime", None)
+    if callable(attach):
+        attach(action_runtime)
 
 
 def _stop_runtime(runtime: object) -> None:

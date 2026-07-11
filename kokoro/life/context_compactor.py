@@ -64,6 +64,14 @@ class ContextCompactor:
         (self.path / "pending_threads.txt").write_text(text[-self.max_chars :].strip() + "\n", encoding="utf-8")
         lifecycle_debug.log("life.context.pending_threads_write", character_id=self.character_id, chars=len(text))
 
+    def clear_pending_threads(self) -> None:
+        (self.path / "pending_threads.txt").write_text("", encoding="utf-8")
+        lifecycle_debug.log("life.context.pending_threads_clear", character_id=self.character_id)
+
+    def clear_tool_results(self) -> None:
+        (self.path / "tool_results_digest.txt").write_text("", encoding="utf-8")
+        lifecycle_debug.log("life.context.tool_results_clear", character_id=self.character_id)
+
     def compact_once(self, *, time_context: str, inner_stream: str) -> str:
         live_path = self.path / "live_timeline.txt"
         digest_path = self.path / "recent_digest.txt"

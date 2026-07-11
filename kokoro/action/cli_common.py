@@ -16,6 +16,7 @@ from pathlib import Path
 
 from kokoro.core import console as console_mod
 from kokoro.core import config as cfg
+from kokoro.core import lifecycle_debug
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +83,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling (use legacy regex commands)")
     parser.add_argument("--debug-input", action="store_true", help="Enable persistent local JSONL debug input")
     parser.add_argument("--no-debug-input", action="store_true", help="Disable persistent local JSONL debug input")
+    parser.add_argument("--debug-run", action="store_true", help="Write verbose per-run debug logs split by thinking, memory, and tools")
+    parser.add_argument("--debug-run-dir", default="", help="Directory for --debug-run output")
     parser.add_argument("--qq", action="store_true", help="Enable local QQ input WebSocket server for qq_client.py")
     parser.add_argument("--qq-host", default=None, help="Local QQ input server host")
     parser.add_argument("--qq-port", type=int, default=None, help="Local QQ input server port")
@@ -123,6 +126,30 @@ def get_args() -> argparse.Namespace:
     if args.life_debug:
         args.output_mode = "life-debug"
     return args
+
+
+def configure_debug_run(args: argparse.Namespace, config: dict) -> Path | None:
+    if not bool(getattr(args, "debug_run", False)):
+        return None
+    character = str(getattr(args, "character", "") or "default")
+    target = str(getattr(args, "debug_run_dir", "") or "").strip()
+    if not target:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = str(_PROJECT_ROOT / "debug_runs" / f"{character}_{stamp}")
+    run_dir = lifecycle_debug.configure_run(
+        target,
+        metadata={
+            "character": character,
+            "output_mode": getattr(args, "output_mode", "full"),
+            "argv": sys.argv,
+        },
+    )
+    life_section = config.setdefault("life_runtime", {})
+    if isinstance(life_section, dict):
+        life_section["debug"] = True
+        life_section["prompt_trace_dir"] = str(run_dir / "prompts")
+    print(f"[debug-run] Run directory: {run_dir}")
+    return run_dir
 
 
 def display_user(text: str) -> None:

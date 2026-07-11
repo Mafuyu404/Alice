@@ -170,6 +170,7 @@ stt_echo_filter_similarity = 0.68
 
 ```toml
 [qq]
+group_chat_enabled = true
 packet_max_lines = 40
 packet_max_age_seconds = 180.0
 idle_packet_max_age_seconds = 90.0
@@ -187,6 +188,8 @@ save_screenshots = false
 save_photos = false
 sticker_dir = "data/stickers"
 ```
+
+`group_chat_enabled = false` 时，QQ 模块只处理私聊；群聊消息会在输入入口被丢弃，不进入内在叙事流，也不会触发后续工具调用。
 
 `absorb_before_decide = false` 时，QQ 消息会先注册到输入事件，再由 QQ 参与判断读取当前 inner stream 和最新环境包快速决定是否回应；内在叙事流随后异步吸收。主动搜索可以继续并行触发，搜索结果回来后再作为输入影响后续内在叙事流。图片和表情包仍会被识别并反馈进内在叙事流，但截图/照片默认不会进入表情包库。
 

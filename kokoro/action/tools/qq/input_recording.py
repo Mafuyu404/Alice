@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from kokoro.core import lifecycle_debug
 from kokoro.action.tools.qq.environment import QQConversationState
 from kokoro.action.tools.qq.helpers import (
     _looks_like_search_request,
@@ -133,14 +134,9 @@ def record_sent_decision(
                 state = QQConversationState(max_messages=runtime.environment.max_messages_per_conversation)
                 runtime.environment._states[message.conversation_id] = state
             state.append(message, count_unread=False)
-        record = getattr(runtime.session, "record_self_action", None)
-        if callable(record):
-            record(
-                f"鎴戝湪 QQ 閲屼富鍔ㄨ浜嗭細{decision.message}",
-                source="qq",
-                action="send_message",
-                metadata={
-                    "conversation_id": decision.conversation_id,
-                    "reason": decision.reason,
-                },
-            )
+        lifecycle_debug.log(
+            "qq.record_sent.self_message_buffered",
+            conversation_id=decision.conversation_id,
+            message=decision.message,
+            reason=decision.reason,
+        )

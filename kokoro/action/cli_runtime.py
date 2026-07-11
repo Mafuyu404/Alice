@@ -9,11 +9,12 @@ import traceback
 
 from kokoro.action.tools.speech_input import stt as stt_mod
 from kokoro.action import single_cli_runtime, multi_cli_runtime
-from kokoro.action.cli_common import _install_cli_log, get_args
+from kokoro.action.cli_common import CONFIG, _install_cli_log, configure_debug_run, get_args
 
 
 def main() -> None:
     args = get_args()
+    configure_debug_run(args, CONFIG)
     if args.list_devices:
         stt_mod.list_devices()
         return

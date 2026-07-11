@@ -49,5 +49,5 @@ def execute_send_qq_message(
         )
     return tool_spec.ToolResult(
         str(result or "QQ send completed."),
-        metadata={**metadata, "sent": True},
+        metadata={**metadata, "sent": True, "suppress_feedback": True, "self_expression": True},
     )

@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 
+@dataclass
 class QQRawMessage:
     message_type: str
     content: str
@@ -40,6 +41,7 @@ class QQRawMessage:
         return f"[{clock}] {speaker}: {self.content}"
 
 
+@dataclass
 class QQContextPacket:
     conversation_id: str
     message_type: str

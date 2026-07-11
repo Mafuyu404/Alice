@@ -138,8 +138,23 @@ Alice 是一个以内在叙事流为核心的本地 AI 生命体实验框架，�
 常用调试入口：
 - `python cli.py --output-mode life-debug -c lerwa --ticks 3`
 - `python cli.py --life-debug -c lerwa --duration-seconds 600 --real-llm`
-- `python cli.py -c lerwa --no-stt --no-tts --debug-input`
+- `python cli.py -c lerwa --no-stt --no-tts --debug-input --debug-run`
 - `scripts/analyze_life_runtime_debug.py <run_dir>` 只负责分析已有运行记录，不作为生命体启动入口。
+
+`--debug-run` 会为单次运行创建完整记录目录，默认在 `debug_runs/<character>_<timestamp>/`。LifeRuntime debug 模式会在指定 `--out-dir` 或 `test_runs/life_runtime_debug_*` 下使用同一套记录结构。
+
+debug run 目录应包含分流日志：
+- `lifecycle_trace.jsonl`：全量生命周期事件。
+- `all/events.jsonl`：全量事件副本。
+- `thinking/events.jsonl`、`thinking/thoughts.jsonl`、`thinking/prompts.jsonl`：思考、模型调用、提示词渲染和 LLM 原始输出。
+- `memory/events.jsonl`：记忆写入、召回、沉淀、维护、工作区变化。
+- `context/events.jsonl`：上下文压缩、digest、工具结果缓冲、短期时间线。
+- `tools/events.jsonl`：工具注册、选择、prepare、execute、after、结果发布。
+- `tools/<tool_name>/events.jsonl`：每个工具单独的完整事件流。
+- `inputs/events.jsonl`：外部输入、debug input、QQ/语音/环境事件入池。
+- `errors/events.jsonl`：错误、失败、拒绝和异常事件。
+
+调试模式可以大量写日志，不需要为空间节省牺牲可诊断性；但这些输出必须留在 `debug_runs/` 或 `test_runs/`，不能进入模型可见上下文，也不能提交到 git。
 
 测试原则：
 - 重要改动后至少跑短测 smoke。

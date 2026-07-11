@@ -10,6 +10,10 @@
 # 类型: bool
 enabled = true
 
+# 是否接收群聊消息。关闭后 QQ 模块只处理私聊，群聊不会进入内在叙事流，也不会触发工具发送。
+# 类型: bool
+group_chat_enabled = false
+
 # qq_client.py 连接到 cli.py 的本地地址。
 # 类型: string / int
 alice_ws_url = "ws://127.0.0.1:58911"
