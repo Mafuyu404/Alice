@@ -32,8 +32,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--duration-seconds", type=float, default=360.0)
     parser.add_argument("--port", type=int, default=58931)
     parser.add_argument("--out-dir", default="")
-    parser.add_argument("--model", default="qwen2.5:7b")
-    parser.add_argument("--api-style", default="ollama", choices=["auto", "ollama", "openai"])
+    parser.add_argument("--model", default="")
+    parser.add_argument("--api-style", default="", choices=["", "auto", "ollama", "openai"])
     parser.add_argument("--sender-id", default="282170001")
     parser.add_argument("--sender-name", default="真冬")
     parser.add_argument(
@@ -71,13 +71,13 @@ def main(argv: list[str] | None = None) -> int:
         "--qq-port",
         str(args.port),
         "--real-llm",
-        "--llm-model",
-        args.model,
-        "--api-style",
-        args.api_style,
         "--initial-event",
         "QQ模拟对话测试开始：外部会像真实私聊一样逐句输入。",
     ]
+    if str(args.model or "").strip():
+        cmd.extend(["--llm-model", str(args.model).strip()])
+    if str(args.api_style or "").strip():
+        cmd.extend(["--api-style", str(args.api_style).strip()])
     process = subprocess.Popen(
         cmd,
         cwd=str(ROOT),

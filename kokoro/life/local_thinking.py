@@ -38,7 +38,16 @@ class LocalThinking:
     def __init__(self, section: dict[str, Any] | None = None) -> None:
         section = dict(section or {})
         self.enabled = bool(section.get("enabled", True))
-        self.model = str(section.get("model") or section.get("local_model") or cfg.stt_refine_model() or cfg.llm_model())
+        fallback_model = str(section.get("model") or cfg.llm_model())
+        self.primary_model = str(section.get("primary_model") or fallback_model).strip()
+        self.auxiliary_model = str(
+            section.get("auxiliary_model")
+            or section.get("local_model")
+            or cfg.stt_refine_model()
+            or "qwen2.5:7b"
+        ).strip()
+        # Kept for compatibility with callers that inspect the selected model.
+        self.model = self.primary_model
         self.base_url = str(section.get("base_url") or cfg.llm_url()).rstrip("/")
         self.api_style = str(section.get("api_style") or "auto").strip().lower() or "auto"
         self.api_key = str(section.get("api_key") or "").strip()
@@ -130,9 +139,9 @@ class LocalThinking:
                 self._queue.task_done()
 
     def _chat_now(self, messages: list[dict], options: dict[str, Any]) -> str:
-        model = str(options.get("model") or self.model)
-        max_tokens = int(options.get("max_tokens", 384) or 384)
         function = str(options.get("function") or "life_local_thinking")
+        model = str(options.get("model") or self._model_for_function(function))
+        max_tokens = int(options.get("max_tokens", 384) or 384)
         timeout = int(options.get("timeout", self.timeout))
         temperature = float(options.get("temperature", self.temperature))
         lifecycle_debug.log(
@@ -169,6 +178,13 @@ class LocalThinking:
             api_style=self.api_style,
         )
         return content
+
+    def _model_for_function(self, function: str) -> str:
+        # The life tick is the character's central act of thought. Everything
+        # else in this caller is auxiliary processing unless explicitly routed.
+        if str(function or "").strip() in {"life_tick"}:
+            return self.primary_model
+        return self.auxiliary_model
 
     def _chat_local(
         self,

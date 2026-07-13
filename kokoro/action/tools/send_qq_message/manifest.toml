@@ -1,7 +1,7 @@
 id = "send_qq_message"
 name = "send_qq_message"
 actions = ["send_qq_message"]
-description = "Send a text message through the connected QQ channel."
+description = "当内在叙事流已经形成具体表达冲动时，通过已连接的 QQ 通道发送一条自然文本。这个工具只承接一次话语，不承接一批重复关心或近义改写的连续回复。"
 needs_prepare_llm = true
 needs_after_llm = true
 prepare_prompt = "prepare.md"

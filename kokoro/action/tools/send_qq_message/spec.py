@@ -10,7 +10,10 @@ SEND_QQ_MESSAGE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "send_qq_message",
-        "description": "Send a text message through the connected QQ channel as the character.",
+        "description": (
+            "当角色已经形成具体表达冲动时，通过已连接的 QQ 通道发送一条自然文本。"
+            "一次只承接一句话，不用于批量发送重复关心。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {

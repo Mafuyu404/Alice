@@ -22,6 +22,12 @@ def execute_send_qq_message(
         "conversation_id": conversation_id,
         "reason": reason,
     }
+    if prepared.metadata.get("blocked"):
+        return tool_spec.ToolResult(
+            f"QQ message blocked by send audit: {reason}",
+            status="skipped",
+            metadata={**metadata, "sent": False, "suppress_feedback": True, "blocked": True},
+        )
     if not message:
         return tool_spec.ToolResult(
             "QQ message is empty; nothing was sent.",
@@ -47,7 +53,14 @@ def execute_send_qq_message(
             status="failed",
             metadata={**metadata, "sent": False, "error": error},
         )
+    result_text = str(result or "").strip()
+    if result_text.lower().startswith("qq send failed"):
+        return tool_spec.ToolResult(
+            result_text,
+            status="failed",
+            metadata={**metadata, "sent": False, "error": result_text},
+        )
     return tool_spec.ToolResult(
-        str(result or "QQ send completed."),
+        result_text or "QQ send completed.",
         metadata={**metadata, "sent": True, "suppress_feedback": True, "self_expression": True},
     )

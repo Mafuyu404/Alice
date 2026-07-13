@@ -130,6 +130,13 @@ def get_args() -> argparse.Namespace:
 
 def configure_debug_run(args: argparse.Namespace, config: dict) -> Path | None:
     if not bool(getattr(args, "debug_run", False)):
+        life_section = config.get("life_runtime", {}) if isinstance(config, dict) else {}
+        debug_section = life_section.get("debug_cli", {}) if isinstance(life_section, dict) else {}
+        if isinstance(debug_section, dict) and getattr(args, "output_mode", "") == "life-debug":
+            args.debug_run = bool(debug_section.get("debug_run", False))
+            if not str(getattr(args, "debug_run_dir", "") or "").strip():
+                args.debug_run_dir = str(debug_section.get("debug_run_dir") or "")
+    if not bool(getattr(args, "debug_run", False)):
         return None
     character = str(getattr(args, "character", "") or "default")
     target = str(getattr(args, "debug_run_dir", "") or "").strip()

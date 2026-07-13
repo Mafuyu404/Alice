@@ -49,10 +49,10 @@ min_tick_seconds = 0.25
 max_tick_seconds = 8.0
 
 [life_runtime.local_thinking]
-# Local/high-frequency thinking is the intended default. Keep this explicit so
-# life runtime does not fall back to lighter audio/refine models.
+# Core life thinking and auxiliary prompt/tool processing use separate models.
 enabled = true
-model = "qwen2.5:7b"
+primary_model = "deepseek-v4-flash"
+auxiliary_model = "qwen2.5:7b"
 
 # auto tries Ollama first, then OpenAI-compatible on 404. Use "ollama" or
 # "openai" to force a protocol.
@@ -63,3 +63,21 @@ api_style = "auto"
 base_url = ""
 temperature = 0.4
 timeout = 20
+
+[life_runtime.debug_cli]
+# Defaults for `python cli.py --life-debug --character lerwa`.
+# Keep operational choices here instead of repeating long command-line flags.
+real_llm = true
+real_memory = false
+debug_run = true
+qq = true
+duration_seconds = 1200.0
+ticks = 3
+out_dir = ""
+debug_run_dir = ""
+initial_event = "正常调试验收开始。"
+
+# Empty values reuse [life_runtime.local_thinking].
+llm_model = ""
+llm_url = ""
+api_style = ""

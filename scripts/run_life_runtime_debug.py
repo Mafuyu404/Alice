@@ -163,6 +163,15 @@ def main(args: argparse.Namespace | None = None) -> int:
     if args is None:
         args = build_parser().parse_args()
 
+    full_config = cfg.load()
+    _apply_config_defaults(args, full_config)
+    life_config = full_config.get("life_runtime", {}) if isinstance(full_config, dict) else {}
+    if not isinstance(life_config, dict):
+        life_config = {}
+    local_config = life_config.get("local_thinking", {})
+    if not isinstance(local_config, dict):
+        local_config = {}
+
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     mode = "real" if args.real_llm else "scripted"
     out_dir = Path(args.out_dir or Path("test_runs") / f"life_runtime_debug_{args.character}_{mode}_{stamp}")
@@ -178,7 +187,6 @@ def main(args: argparse.Namespace | None = None) -> int:
             "ticks": args.ticks,
         },
     )
-    full_config = cfg.load()
     web_search_runtime = _start_web_search_runtime(full_config, out_dir=out_dir)
 
     section = {
@@ -206,7 +214,9 @@ def main(args: argparse.Namespace | None = None) -> int:
         "memory_experience_catch_up_tail_events": 96,
         "local_thinking": {
             "enabled": True,
-            **({"model": args.llm_model} if args.llm_model else {}),
+            "primary_model": str(local_config.get("primary_model") or local_config.get("model") or ""),
+            "auxiliary_model": str(local_config.get("auxiliary_model") or local_config.get("local_model") or ""),
+            **({"primary_model": args.llm_model} if args.llm_model else {}),
             **({"base_url": args.llm_url} if args.llm_url else {}),
             **({"api_style": args.api_style} if args.api_style else {}),
         },
@@ -230,6 +240,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         user_name=cfg.user_name(),
         inner_stream=DebugInnerStream(out_dir / "characters" / args.character / "inner_stream.txt"),
         inner_stream_loop=object(),
+        auto_life_runtime=False,
     )
     session.inner_stream_loop = None
 
@@ -335,6 +346,51 @@ def main(args: argparse.Namespace | None = None) -> int:
     lifecycle_debug.log("life_debug.done", summary=summary)
     print(str(out_dir))
     return 0
+
+
+def _apply_config_defaults(args: argparse.Namespace, config: dict) -> None:
+    life = config.get("life_runtime", {}) if isinstance(config, dict) else {}
+    if not isinstance(life, dict):
+        life = {}
+    debug = life.get("debug_cli", {})
+    if not isinstance(debug, dict):
+        debug = {}
+    local = life.get("local_thinking", {})
+    if not isinstance(local, dict):
+        local = {}
+    qq = config.get("qq", {}) if isinstance(config, dict) else {}
+    if not isinstance(qq, dict):
+        qq = {}
+
+    if not bool(getattr(args, "real_llm", False)):
+        args.real_llm = bool(debug.get("real_llm", True))
+    if not bool(getattr(args, "real_memory", False)):
+        args.real_memory = bool(debug.get("real_memory", False))
+    if not str(getattr(args, "llm_model", "") or "").strip():
+        args.llm_model = str(
+            debug.get("llm_model")
+            or local.get("primary_model")
+            or local.get("model")
+            or ""
+        )
+    if not str(getattr(args, "llm_url", "") or "").strip():
+        args.llm_url = str(debug.get("llm_url") or local.get("base_url") or "")
+    if not str(getattr(args, "api_style", "") or "").strip():
+        args.api_style = str(debug.get("api_style") or local.get("api_style") or "")
+    if not float(getattr(args, "duration_seconds", 0.0) or 0.0):
+        args.duration_seconds = float(debug.get("duration_seconds", 0.0) or 0.0)
+    if int(getattr(args, "ticks", 0) or 0) == 3:
+        args.ticks = int(debug.get("ticks", args.ticks) or args.ticks)
+    if not str(getattr(args, "initial_event", "") or "").strip() or str(args.initial_event).startswith("LifeRuntime debug start:"):
+        args.initial_event = str(debug.get("initial_event") or args.initial_event)
+    if not str(getattr(args, "out_dir", "") or "").strip():
+        args.out_dir = str(debug.get("out_dir") or "")
+    if not str(getattr(args, "debug_run_dir", "") or "").strip():
+        args.debug_run_dir = str(debug.get("debug_run_dir") or "")
+    if not bool(getattr(args, "debug_run", False)):
+        args.debug_run = bool(debug.get("debug_run", True))
+    if not bool(getattr(args, "qq", False)):
+        args.qq = bool(debug.get("qq", qq.get("enabled", False)))
 
 
 def _tick_result_summary(index: int, result) -> dict:

@@ -246,6 +246,7 @@ class LifeRuntime:
                 observations=qq_private_observations,
                 thought_snippet=str(thought or "")[:800],
             )
+        action_intent = _extract_action_intent_from_data(data)
         action_plan = self._select_action_plan_from_data(
             data,
             inner_stream=inner_stream,
@@ -253,6 +254,8 @@ class LifeRuntime:
             digest=digest,
             event_text=event_text,
         )
+        if action_plan and action_intent:
+            action_plan = _attach_expression_intent(action_plan, action_intent)
         if qq_private_observations and _extract_action_intent_from_data(data) and not action_plan:
             lifecycle_debug.log(
                 "life.runtime.qq_private.tool_select_no_plan",
@@ -304,9 +307,15 @@ class LifeRuntime:
                 action_plan = followup["action_plan"]
                 action_plan_status = str(followup.get("action_plan_status") or action_plan_status)
                 action_plan_error = str(followup.get("action_plan_error") or action_plan_error)
-        elif action_plan_status == "executed" and action_results and _plan_has_self_expression(action_plan or {}):
+        elif (
+            action_plan_status == "executed"
+            and action_results
+            and _plan_has_self_expression(action_plan or {})
+            and not _action_results_indicate_blocked_expression(action_results)
+        ):
             self._close_self_expression_loop(
                 reason="self_expression_completed",
+                action_intent=action_intent,
                 plan=action_plan or {},
                 results=action_results,
             )
@@ -712,6 +721,14 @@ class LifeRuntime:
                     audience="tool_select",
                     role="environment",
                 ),
+                "recent_self_expressions": self._context_fragment(
+                    "recent_self_expressions",
+                    self._recent_self_expression_context(),
+                    max_chars=1600,
+                    kind="recent_actions",
+                    audience="tool_select",
+                    role="environment",
+                ),
                 "tool_capabilities": self._context_fragment(
                     "tool_capabilities",
                     self._tool_capabilities_text(),
@@ -827,14 +844,15 @@ class LifeRuntime:
         self,
         *,
         reason: str,
+        action_intent: str = "",
         plan: dict[str, Any],
         results: dict[str, str],
     ) -> None:
-        self._record_recent_self_expression(plan)
+        self._record_recent_self_expression(plan, action_intent=action_intent)
         self._close_recent_qq_context(reason=reason, plan=plan)
         self.compactor.clear_pending_threads()
         self.compactor.clear_tool_results()
-        closure = _self_expression_closure_text(plan, results)
+        closure = _self_expression_closure_text(plan, results, action_intent=action_intent)
         if closure:
             stream = getattr(self.session, "inner_stream", None)
             current = _inner_stream_text(self.session)
@@ -1167,7 +1185,7 @@ class LifeRuntime:
                     return duplicate
         return ""
 
-    def _record_recent_self_expression(self, plan: dict[str, Any]) -> None:
+    def _record_recent_self_expression(self, plan: dict[str, Any], *, action_intent: str = "") -> None:
         if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
             return
         message = _first_self_expression_message(plan)
@@ -1182,6 +1200,8 @@ class LifeRuntime:
             "at": time.monotonic(),
             "conversation_id": conversation_id,
             "message": message,
+            "intent": str(action_intent or _plan_expression_intent(plan) or "").strip(),
+            "intent_key": _expression_intent_key(action_intent or _plan_expression_intent(plan) or ""),
         }
         recent = self.action_runtime.tool_context.setdefault("recent_self_expressions", [])
         if not isinstance(recent, list):
@@ -1194,7 +1214,34 @@ class LifeRuntime:
             "life.runtime.self_expression_recorded",
             conversation_id=conversation_id,
             message=message,
+            intent=record["intent"],
+            intent_key=record["intent_key"],
         )
+
+    def _recent_self_expression_context(self) -> str:
+        if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
+            return "(none)"
+        recent = self.action_runtime.tool_context.get("recent_self_expressions", [])
+        if not isinstance(recent, list) or not recent:
+            return "(none)"
+        now = time.monotonic()
+        lines: list[str] = []
+        for item in reversed(recent[-8:]):
+            if not isinstance(item, dict):
+                continue
+            try:
+                age = int(max(0.0, now - float(item.get("at") or 0.0)))
+            except Exception:
+                age = 0
+            message = str(item.get("message") or "").strip()
+            intent = str(item.get("intent") or "").strip()
+            if not message:
+                continue
+            line = f"- {age}秒前已经发送：{message}"
+            if intent:
+                line += f"；当时的表达意图：{intent}"
+            lines.append(line)
+        return "\n".join(lines) if lines else "(none)"
 
     def _recent_self_expression_duplicate(self, args: dict[str, Any]) -> str:
         if self.action_runtime is None or not hasattr(self.action_runtime, "tool_context"):
@@ -1228,6 +1275,11 @@ class LifeRuntime:
             if conversation_id and previous_conversation and conversation_id != previous_conversation:
                 continue
             previous = str(item.get("message") or "").strip()
+            previous_intent_key = str(item.get("intent_key") or "").strip()
+            current_intent_key = str(args.get("_intent_key") or "").strip()
+            if current_intent_key and previous_intent_key and current_intent_key == previous_intent_key:
+                duplicate = item
+                break
             similarity = _expression_similarity(message, previous)
             if similarity >= _expression_duplicate_threshold(message, previous):
                 duplicate = item
@@ -1639,6 +1691,42 @@ def _plan_has_self_expression(plan: dict[str, Any] | None) -> bool:
     return any(tool in {"send_qq_message", "say", "say_precomputed"} for tool in _plan_tool_names(plan))
 
 
+def _attach_expression_intent(plan: dict[str, Any] | None, action_intent: str) -> dict[str, Any] | None:
+    if not isinstance(plan, dict):
+        return plan
+    intent = str(action_intent or "").strip()
+    if not intent or not _plan_has_self_expression(plan):
+        return plan
+    key = _expression_intent_key(intent)
+    actions = plan.get("actions") or plan.get("nodes") or []
+    if not isinstance(actions, list):
+        return plan
+    for item in actions:
+        if not isinstance(item, dict):
+            continue
+        tool = str(item.get("tool") or item.get("action") or "").strip()
+        if tool not in {"send_qq_message", "say", "say_precomputed"}:
+            continue
+        args = item.get("args")
+        if not isinstance(args, dict):
+            args = {}
+            item["args"] = args
+        args.setdefault("_intent", intent)
+        args.setdefault("_intent_key", key)
+    return plan
+
+
+def _action_results_indicate_blocked_expression(results: dict[str, str] | None) -> bool:
+    if not isinstance(results, dict):
+        return False
+    text = "\n".join(str(value or "") for value in results.values())
+    return (
+        "blocked by send audit" in text
+        or "nothing was sent" in text
+        or "QQ send failed" in text
+    )
+
+
 def _first_self_expression_message(plan: dict[str, Any] | None) -> str:
     if not isinstance(plan, dict):
         return ""
@@ -1681,13 +1769,48 @@ def _first_self_expression_conversation_id(plan: dict[str, Any] | None) -> str:
     return ""
 
 
-def _self_expression_closure_text(plan: dict[str, Any] | None, results: dict[str, str] | None) -> str:
+def _plan_expression_intent(plan: dict[str, Any] | None) -> str:
+    if not isinstance(plan, dict):
+        return ""
+    raw_actions = plan.get("actions") or plan.get("nodes") or []
+    if not isinstance(raw_actions, list):
+        return ""
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        args = item.get("args")
+        if not isinstance(args, dict):
+            args = item
+        intent = str(args.get("_intent") or "").strip()
+        if intent:
+            return intent
+    return ""
+
+
+def _expression_intent_key(text: str) -> str:
+    normalized = _normalize_expression_text(text)
+    return normalized[:80]
+
+
+def _self_expression_closure_text(
+    plan: dict[str, Any] | None,
+    results: dict[str, str] | None,
+    *,
+    action_intent: str = "",
+) -> str:
     message = _first_self_expression_message(plan)
     if not message:
         return ""
+    intent = str(action_intent or _plan_expression_intent(plan) or "").strip()
+    if intent:
+        return (
+            f"刚才我已经把这个表达意图说出去了：{intent}。"
+            f"实际发给对方的是：“{message}”。"
+            "这个话轮已经落地；下一刻如果还想继续，必须来自新的现场变化、对方回应，或心里真的长出了新的意思。"
+        )
     return (
-        "刚才这次对外表达已经完成；这个表达意图已经落地。"
-        "后续如果出现新的输入、追问或新信息，再自然形成新的回应。"
+        f"刚才我已经对外说了：“{message}”。"
+        "这个话轮已经落地；下一刻如果还想继续，必须来自新的现场变化、对方回应，或心里真的长出了新的意思。"
     )
 
 

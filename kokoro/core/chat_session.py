@@ -55,6 +55,7 @@ class ChatSession:
     inner_stream_loop: object = field(default=None)  # InnerStreamLoop
     autonomous_step: object = field(default=None)  # AutonomousStep
     life_runtime: object = field(default=None)  # LifeRuntime
+    auto_life_runtime: bool = True
     # Scene type — determines information source layout and guidance prompt
     _scene: object = field(default=None)  # scene_mod.SceneType | None
     # Config overrides — applied on top of the per-character config.toml
@@ -115,7 +116,7 @@ class ChatSession:
             self.event_bus = input_events.InputEventBus()
         from kokoro.core import config as _cfg
         life_primary = False
-        if self.life_runtime is None:
+        if self.life_runtime is None and self.auto_life_runtime:
             life_section = _cfg.life_runtime_config()
             if bool(life_section.get("enabled", False)):
                 try:

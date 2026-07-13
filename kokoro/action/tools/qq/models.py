@@ -72,7 +72,7 @@ class QQContextPacket:
         scene_note = (
             "这是当前QQ群现场的一部分，群友的发言可以自然成为当下社交输入。"
             if self.message_type == "group"
-            else "这是当前QQ私聊现场的一部分；如果没有新话题，它不必压过其他活跃现场。"
+            else "这是当前QQ私聊现场的一部分；这里的发言来自正在和角色直接说话的人。"
         )
         return (
             f"【QQ环境】\n"

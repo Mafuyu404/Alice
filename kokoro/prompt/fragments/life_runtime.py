@@ -42,6 +42,7 @@ def register(registry: PromptRegistry) -> None:
             "time_context": ctx.get("time_context", "(none)") or "(none)",
             "event_batch": ctx.get("event_batch", "(none)") or "(none)",
             "context_digest": ctx.get("context_digest", "(none)") or "(none)",
+            "recent_self_expressions": ctx.get("recent_self_expressions", "(none)") or "(none)",
             "tool_capabilities": ctx.get("tool_capabilities", "(none)") or "(none)",
         },
     )

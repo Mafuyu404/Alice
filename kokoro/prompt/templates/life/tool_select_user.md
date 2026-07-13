@@ -15,6 +15,9 @@
 最近连续经历：
 {{ context_digest }}
 
+最近已发送表达：
+{{ recent_self_expressions }}
+
 可用能力：
 {{ tool_capabilities }}
 
