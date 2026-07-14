@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 from kokoro.action import model as action_model
 from kokoro.action import tool_spec
@@ -11,6 +12,7 @@ from kokoro.core import lifecycle_debug
 
 
 def prepare_message(ctx: tool_spec.ToolContext, action: action_model.Action) -> tool_spec.PreparedAction:
+    started = time.monotonic()
     internal_args = {
         key: value
         for key, value in dict(action.args).items()
@@ -30,6 +32,12 @@ def prepare_message(ctx: tool_spec.ToolContext, action: action_model.Action) -> 
     ).strip()
     recent_conversation_id = str(ctx.get("recent_qq_conversation_id", "") or "").strip()
     conversation_id = requested_conversation_id or recent_conversation_id
+    lifecycle_debug.log(
+        "send_qq_message.prepare.start",
+        message_chars=len(message),
+        requested_conversation_id=requested_conversation_id,
+        recent_conversation_id=recent_conversation_id,
+    )
     if recent_conversation_id and requested_conversation_id and requested_conversation_id != recent_conversation_id:
         lifecycle_debug.log(
             "send_qq_message.prepare.conversation_id_corrected",
@@ -38,7 +46,20 @@ def prepare_message(ctx: tool_spec.ToolContext, action: action_model.Action) -> 
         )
         conversation_id = recent_conversation_id
     reason = str(args.get("reason") or action.reason or "llm_decided").strip()
-    audit = _audit_message(ctx, message=message, reason=reason)
+    audit = _local_boundary_check(message=message)
+    if not audit.get("blocked") and _needs_llm_audit(message):
+        lifecycle_debug.log(
+            "send_qq_message.prepare.audit_needed",
+            message_chars=len(message),
+            reason=reason,
+        )
+        audit = _audit_message(ctx, message=message, reason=reason)
+    elif not audit.get("blocked"):
+        lifecycle_debug.log(
+            "send_qq_message.prepare.fast_allowed",
+            message_chars=len(message),
+            reason=audit.get("reason"),
+        )
     if audit.get("blocked"):
         lifecycle_debug.log(
             "send_qq_message.prepare.audit_blocked",
@@ -65,8 +86,64 @@ def prepare_message(ctx: tool_spec.ToolContext, action: action_model.Action) -> 
             "audit": audit,
             "blocked": bool(audit.get("blocked")),
             "internal": internal_args,
+            "prepare_elapsed_seconds": round(time.monotonic() - started, 3),
         },
     )
+
+
+def _local_boundary_check(*, message: str) -> dict:
+    text = str(message or "").strip()
+    if not text:
+        return {"blocked": True, "block_type": "empty", "reason": "empty message"}
+    if _looks_like_generator_payload(text):
+        return {
+            "blocked": True,
+            "block_type": "assistant_style",
+            "reason": "message looks like generator/tool payload, not chat text",
+        }
+    return {"blocked": False, "block_type": "none", "reason": "ordinary chat text"}
+
+
+def _looks_like_generator_payload(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    if stripped.startswith("```") or stripped.endswith("```"):
+        return True
+    if re.fullmatch(r"\{[\s\S]*\}", stripped):
+        try:
+            data = json.loads(stripped)
+        except Exception:
+            data = None
+        if isinstance(data, dict) and any(key in data for key in ("action", "tool", "args", "arguments")):
+            return True
+    control_markers = (
+        "send_qq_message",
+        '"action"',
+        '"tool"',
+        '"args"',
+        "tool_call",
+        "function_call",
+        "作为ai助手",
+        "作为 ai 助手",
+    )
+    return any(marker in lower for marker in control_markers)
+
+
+def _needs_llm_audit(message: str) -> bool:
+    text = str(message or "").strip()
+    if len(text) > 800:
+        return True
+    risk_markers = (
+        "根据搜索",
+        "搜索结果",
+        "工具返回",
+        "系统提示",
+        "日志显示",
+        "后台显示",
+    )
+    return any(marker in text for marker in risk_markers)
 
 
 def _audit_message(ctx: tool_spec.ToolContext, *, message: str, reason: str) -> dict:
@@ -104,7 +181,13 @@ def _audit_message(ctx: tool_spec.ToolContext, *, message: str, reason: str) -> 
     try:
         raw = chat(
             [{"role": "system", "content": prompt}, {"role": "user", "content": user}],
-            {"function": "send_qq_message_audit", "max_tokens": 180, "timeout": 30},
+            {
+                "function": "send_qq_message_audit",
+                "max_tokens": 120,
+                "timeout": 5,
+                "priority": 0,
+                "bypass_priority_queue": True,
+            },
         )
     except Exception as exc:
         lifecycle_debug.log("send_qq_message.prepare.audit_error", error=str(exc))

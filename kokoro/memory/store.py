@@ -58,6 +58,65 @@ class MemoryStore:
         self._link_new_record(record_id)
         return self.get(record_id)  # type: ignore[return-value]
 
+    def write_or_merge(self, draft: MemoryRecordDraft, *, recent_limit: int = 24) -> tuple[MemoryRecord, bool]:
+        target = self._find_similar_recent(draft, limit=recent_limit)
+        if target is None:
+            return self.write(draft), False
+        return self.merge(target.id, draft), True
+
+    def merge(self, record_id: str, draft: MemoryRecordDraft) -> MemoryRecord:
+        current = self.get(record_id)
+        if current is None:
+            return self.write(draft)
+        now = now_iso()
+        keywords = _merge_lists(current.keywords, draft.keywords, _keywords(draft.content))
+        tags = _merge_lists(current.tags, draft.tags)
+        source_event_ids = _merge_lists(current.source_event_ids, draft.source_event_ids)
+        related_memory_ids = _merge_lists(current.related_memory_ids, draft.related_memory_ids)
+        evidence = _merge_evidence(current.evidence, draft.evidence)
+        metadata = dict(current.metadata or {})
+        metadata.update(draft.metadata or {})
+        content = _merge_text(current.content, draft.content, max_chars=1600)
+        summary = _merge_summary(current.summary, draft.summary, content)
+        emotional = current.emotional_impact
+        if abs(float(draft.emotional_impact or 0.0)) > abs(emotional):
+            emotional = float(draft.emotional_impact or 0.0)
+        with closing(self._connect()) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    update memory_records
+                    set content = ?,
+                        summary = ?,
+                        updated_at = ?,
+                        importance = ?,
+                        emotional_impact = ?,
+                        keywords_json = ?,
+                        tags_json = ?,
+                        source_event_ids_json = ?,
+                        evidence_json = ?,
+                        related_memory_ids_json = ?,
+                        metadata_json = ?,
+                        index_status = 'pending'
+                    where id = ? and deleted_at = ''
+                    """,
+                    (
+                        content,
+                        summary,
+                        now,
+                        max(clamp01(current.importance, 0.5), clamp01(draft.importance, 0.5)),
+                        max(-1.0, min(1.0, emotional)),
+                        json.dumps(keywords, ensure_ascii=False),
+                        json.dumps(tags, ensure_ascii=False),
+                        json.dumps(source_event_ids, ensure_ascii=False),
+                        json.dumps(evidence, ensure_ascii=False, default=str),
+                        json.dumps(related_memory_ids, ensure_ascii=False),
+                        json.dumps(metadata, ensure_ascii=False, default=str),
+                        record_id,
+                    ),
+                )
+        return self.get(record_id)  # type: ignore[return-value]
+
     def get(self, record_id: str) -> MemoryRecord | None:
         with closing(self._connect()) as conn:
             row = conn.execute("select * from memory_records where id = ? and deleted_at = ''", (record_id,)).fetchone()
@@ -92,6 +151,17 @@ class MemoryStore:
                 (self.character_id, max(1, int(limit))),
             ).fetchall()
         return [MemoryRecord.from_row(row) for row in rows]
+
+    def _find_similar_recent(self, draft: MemoryRecordDraft, *, limit: int) -> MemoryRecord | None:
+        recent = self.recent(limit=limit)
+        best: tuple[float, MemoryRecord] | None = None
+        for record in recent:
+            if record.record_form != draft.record_form:
+                continue
+            score = _record_similarity(record, draft)
+            if score >= 0.78 and (best is None or score > best[0]):
+                best = (score, record)
+        return best[1] if best else None
 
     def link(self, from_id: str, to_id: str, *, link_type: str, weight: float = 0.5) -> None:
         if not from_id or not to_id or from_id == to_id:
@@ -260,6 +330,118 @@ def _clean_list(values: list[Any]) -> list[str]:
         if text and text not in result:
             result.append(text)
     return result[:24]
+
+
+def _merge_lists(*groups: list[Any]) -> list[str]:
+    result: list[str] = []
+    for group in groups:
+        for value in group or []:
+            text = str(value or "").strip()
+            if text and text not in result:
+                result.append(text)
+    return result[:32]
+
+
+def _merge_evidence(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in [*(left or []), *(right or [])]:
+        key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+    return result[:24]
+
+
+def _merge_text(left: str, right: str, *, max_chars: int) -> str:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not right_text:
+        return left_text[-max_chars:].strip()
+    if not left_text:
+        return right_text[-max_chars:].strip()
+    compact_left = re.sub(r"\s+", "", left_text)
+    compact_right = re.sub(r"\s+", "", right_text)
+    if compact_right in compact_left:
+        return left_text[-max_chars:].strip()
+    if compact_left in compact_right:
+        return right_text[-max_chars:].strip()
+    merged = f"{left_text}\n{right_text}"
+    return merged[-max_chars:].strip()
+
+
+def _merge_summary(left: str, right: str, content: str) -> str:
+    left_text = str(left or "").strip()
+    right_text = str(right or "").strip()
+    if not left_text:
+        return right_text or content[:120]
+    if not right_text:
+        return left_text
+    compact_left = re.sub(r"\s+", "", left_text)
+    compact_right = re.sub(r"\s+", "", right_text)
+    if compact_right in compact_left:
+        return left_text
+    if compact_left in compact_right:
+        return right_text
+    return f"{left_text}；{right_text}"[:180]
+
+
+def _record_similarity(record: MemoryRecord, draft: MemoryRecordDraft) -> float:
+    left = " ".join([record.content, record.summary, " ".join(record.keywords), " ".join(record.tags)])
+    right = " ".join([draft.content, draft.summary, " ".join(draft.keywords), " ".join(draft.tags)])
+    compact_left = re.sub(r"\s+", "", left)
+    compact_right = re.sub(r"\s+", "", right)
+    if not compact_left or not compact_right:
+        return 0.0
+    shorter = min(len(compact_left), len(compact_right))
+    if shorter >= 24 and (compact_left in compact_right or compact_right in compact_left):
+        return 1.0
+    terms_left = set(_query_terms(left))
+    terms_right = set(_query_terms(right))
+    if terms_left and terms_right:
+        term_score = len(terms_left & terms_right) / max(1, min(len(terms_left), len(terms_right)))
+    else:
+        term_score = 0.0
+    gram_score = _ngram_containment(compact_left, compact_right)
+    keyword_score = 0.0
+    if str(record.summary or "").strip() and str(draft.summary or "").strip():
+        keyword_score = _keyword_overlap(record.keywords, draft.keywords)
+    return max(term_score, gram_score, keyword_score)
+
+
+def _keyword_overlap(left: list[str], right: list[str]) -> float:
+    left_keywords = {item for item in _clean_list(left) if len(item) >= 3}
+    right_keywords = {item for item in _clean_list(right) if len(item) >= 3}
+    if not left_keywords or not right_keywords:
+        return 0.0
+    shared = left_keywords & right_keywords
+    if not shared:
+        return 0.0
+    longest = max(len(item) for item in shared)
+    base = len(shared) / max(1, min(len(left_keywords), len(right_keywords)))
+    if longest >= 6:
+        return max(0.82, base)
+    if longest >= 4:
+        return max(0.72, base)
+    return base
+
+
+def _ngram_containment(left: str, right: str, *, size: int = 2) -> float:
+    left_grams = _char_ngrams(left, size=size)
+    right_grams = _char_ngrams(right, size=size)
+    if not left_grams or not right_grams:
+        return 0.0
+    smaller = left_grams if len(left_grams) <= len(right_grams) else right_grams
+    larger = right_grams if smaller is left_grams else left_grams
+    return len(smaller & larger) / max(1, len(smaller))
+
+
+def _char_ngrams(text: str, *, size: int) -> set[str]:
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if len(compact) < size:
+        return set()
+    return {compact[index : index + size] for index in range(0, len(compact) - size + 1)}
 
 
 def _keywords(text: str) -> list[str]:

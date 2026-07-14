@@ -90,6 +90,7 @@ class MemoryRecord:
     source_event_ids: list[str] = field(default_factory=list)
     evidence: list[dict[str, Any]] = field(default_factory=list)
     related_memory_ids: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     index_status: str = "pending"
     deleted_at: str = ""
     score: float = 0.0
@@ -124,6 +125,7 @@ class MemoryRecord:
             source_event_ids=loads(row["source_event_ids_json"], []),
             evidence=loads(row["evidence_json"], []),
             related_memory_ids=loads(row["related_memory_ids_json"], []),
+            metadata=loads(row["metadata_json"], {}),
             index_status=row["index_status"] or "pending",
             deleted_at=row["deleted_at"] or "",
         )

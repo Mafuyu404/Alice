@@ -17,6 +17,7 @@ from kokoro.core.inner_stream import InnerStream
 from kokoro.life.context_compactor import _clean_digest
 from kokoro.life.local_thinking import LocalThinking
 from kokoro.life import InformationPool, LifeRuntime, TimeAwareness
+import kokoro.life.runtime as life_runtime_mod
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
 
 
@@ -139,6 +140,24 @@ class LifeRuntimeTests(unittest.TestCase):
         self.assertIn("I notice time passing", result.text)
         self.assertIn("unfinished thread", result.text)
 
+    def test_apply_inner_stream_patch_accepts_replacement_field(self) -> None:
+        patch = InnerStreamPatch.from_raw(
+            {
+                "patches": [
+                    {
+                        "op": "replace",
+                        "target": "I am waiting",
+                        "replacement": "I am already answering",
+                    }
+                ]
+            }
+        )
+
+        result = apply_inner_stream_patch("I am waiting, still here.", patch)
+
+        self.assertTrue(result.applied)
+        self.assertIn("I am already answering", result.text)
+
     def test_apply_inner_stream_full_text_strips_code_fence(self) -> None:
         patch = InnerStreamPatch.from_raw({"full_text": "```txt\nI remain continuous.\n```"})
 
@@ -170,6 +189,24 @@ class LifeRuntimeTests(unittest.TestCase):
 
         self.assertFalse(result.applied)
         self.assertEqual(result.text, "old stream")
+
+    def test_apply_inner_stream_skips_highly_similar_append(self) -> None:
+        current = "还在琢磨民国背景里异能和枪械的力量差，枪弱的话小人物才有能钻的缝。"
+        patch = InnerStreamPatch.from_raw(
+            {
+                "patches": [
+                    {
+                        "op": "append",
+                        "text": "继续想民国背景中异能和枪械的力量差：如果枪弱，小人物才可能找到缝隙。",
+                    }
+                ]
+            }
+        )
+
+        result = apply_inner_stream_patch(current, patch)
+
+        self.assertFalse(result.applied)
+        self.assertEqual(result.text, current)
 
     def test_context_digest_cleaner_removes_markdown_wrapping(self) -> None:
         digest = _clean_digest("**当前时间：**\n```plaintext\nunfinished thread\n```")
@@ -330,8 +367,8 @@ class LifeRuntimeTests(unittest.TestCase):
 
             text = runtime._tool_capabilities_text()
 
-        self.assertIn("你在为 search_web 工具提炼搜索请求", text)
-        self.assertIn("query 要保留当前注意力里的具体对象", text)
+        self.assertIn("你在为网页搜索工具提炼 query", text)
+        self.assertIn("query 必须保留当前注意力里的具体对象", text)
 
     def test_life_runtime_records_inner_activity_as_memory_events(self) -> None:
         response = json.dumps(
@@ -482,7 +519,149 @@ class LifeRuntimeTests(unittest.TestCase):
 
         rendered_messages = "\n".join(str(message.get("content", "")) for message in llm.calls[1][0])
         self.assertIn("Current event batch: 1 item(s), oldest waited 45s", rendered_messages)
-        self.assertIn('age="45s"', rendered_messages)
+
+    def test_life_runtime_defers_context_compaction_for_foreground_chat(self) -> None:
+        response = json.dumps({"thinking_intensity": 40, "notes": "answer the live message first"})
+        session = DummySession()
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={"enabled": True, "local_thinking": {"enabled": True}},
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.submit(
+                input_events.build_chat_environment_event(
+                    "private chat message",
+                    source="qq",
+                    metadata={"message_type": "private", "conversation_id": "private:test"},
+                    priority="high",
+                )
+            )
+            runtime.tick_once()
+
+        functions = [call[1]["function"] for call in llm.calls]
+        self.assertEqual(functions, ["life_tick"])
+
+    def test_life_runtime_uses_smaller_foreground_tick_budget(self) -> None:
+        response = json.dumps({"thinking_intensity": 40, "notes": "short live response path"})
+        session = DummySession()
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={
+                    "enabled": True,
+                    "local_thinking": {"enabled": True},
+                    "tick_max_tokens": 900,
+                    "foreground_tick_max_tokens": 333,
+                    "context_fragment_max_chars": 5000,
+                    "foreground_context_fragment_max_chars": 777,
+                },
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.submit(
+                input_events.build_chat_environment_event(
+                    "private chat message",
+                    source="qq",
+                    metadata={"message_type": "private", "conversation_id": "private:test"},
+                    priority="high",
+                )
+            )
+            runtime.tick_once()
+
+        options = llm.calls[-1][1]
+        prompt_text = "\n".join(str(message.get("content", "")) for message in llm.calls[-1][0])
+        self.assertEqual(options["max_tokens"], 333)
+        self.assertIn('max_chars="777"', prompt_text)
+
+    def test_life_runtime_uses_smaller_idle_tick_budget(self) -> None:
+        response = json.dumps({"thinking_intensity": 30, "notes": "light idle thought"})
+        session = DummySession()
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={
+                    "enabled": True,
+                    "local_thinking": {"enabled": True},
+                    "tick_max_tokens": 900,
+                    "idle_tick_max_tokens": 222,
+                    "context_fragment_max_chars": 5000,
+                    "idle_context_fragment_max_chars": 666,
+                },
+                llm=llm,
+                root=Path(tmp),
+            )
+            runtime.tick_once(force=True)
+
+        options = llm.calls[-1][1]
+        prompt_text = "\n".join(str(message.get("content", "")) for message in llm.calls[-1][0])
+        self.assertEqual(options["max_tokens"], 222)
+        self.assertIn('max_chars="666"', prompt_text)
+
+    def test_life_runtime_defers_memory_core_when_input_arrives_during_idle_tick(self) -> None:
+        response = json.dumps({"thinking_intensity": 40, "notes": "idle thought"})
+        session = DummySession()
+        memory = DummyMemorySystem()
+        session.memory_system = memory
+        llm = FakeLlm(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={
+                    "enabled": True,
+                    "local_thinking": {"enabled": True},
+                    "memory_core_interval_seconds": 0,
+                },
+                llm=llm,
+                root=Path(tmp),
+            )
+            original_think = runtime._think
+
+            def think_and_receive_input(**kwargs):
+                runtime.submit(input_events.build_text_event("arrived while thinking", source="debug", priority="high"))
+                return original_think(**kwargs)
+
+            runtime._think = think_and_receive_input
+            runtime.tick_once(force=True)
+
+        self.assertEqual(memory.maintenance_calls, 0)
+
+    def test_life_runtime_loop_prioritizes_pending_input_after_wait_race(self) -> None:
+        session = DummySession()
+        llm = FakeLlm("{}")
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={"enabled": True, "local_thinking": {"enabled": True}},
+                llm=llm,
+                root=Path(tmp),
+            )
+
+            class RaceWake:
+                def wait(self, timeout=None):
+                    return False
+
+                def clear(self):
+                    runtime.submit(input_events.build_text_event("arrived during wake clear", source="debug", priority="high"))
+
+                def set(self):
+                    pass
+
+            forces = []
+            runtime._wake = RaceWake()
+
+            def fake_tick_once(*, force=False):
+                forces.append(force)
+                runtime._stop.set()
+
+            runtime.tick_once = fake_tick_once
+            runtime._run()
+
+        self.assertEqual(forces, [False])
 
     def test_life_runtime_repairs_invalid_json_tick_output(self) -> None:
         bad = '{"thinking_intensity": 61, "inner_stream_patch": {"patches": [{"op": "append", "text": "I keep the repaired thread alive."}]'
@@ -610,6 +789,27 @@ class LifeRuntimeTests(unittest.TestCase):
         self.assertNotIn("search_web", text)
         self.assertNotIn("claude_code_exec", text)
 
+    def test_life_runtime_clips_tool_schema_descriptions(self) -> None:
+        session = DummySession()
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = LifeRuntime(
+                session=session,
+                section={
+                    "enabled": True,
+                    "local_thinking": {"enabled": True},
+                    "tool_schema_description_max_chars": 32,
+                },
+                llm=FakeLlm("{}"),
+                root=Path(tmp),
+            )
+            runtime._available_actions.add("get_current_time")
+
+            text = runtime._tool_capabilities_text()
+
+        schema_lines = [line for line in text.splitlines() if line.startswith("- get_current_time:")]
+        self.assertTrue(schema_lines)
+        self.assertLessEqual(len(schema_lines[0]), 80)
+
     def test_life_runtime_rejects_unavailable_or_incomplete_action_plan(self) -> None:
         session = DummySession()
         llm = FakeLlm("{}")
@@ -729,6 +929,20 @@ class LifeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result, "fallback ok")
         self.assertEqual(calls, ["http://127.0.0.1:14515/api/chat", "http://127.0.0.1:14515/v1/chat/completions"])
+
+    def test_local_thinking_routes_foreground_tool_select_to_primary_model(self) -> None:
+        thinker = LocalThinking(
+            {
+                "enabled": True,
+                "primary_model": "deepseek-v4-flash",
+                "auxiliary_model": "qwen2.5:7b",
+            }
+        )
+
+        self.assertEqual(thinker._model_for_function("life_tick"), "deepseek-v4-flash")
+        self.assertEqual(thinker._model_for_function("life_tool_select"), "deepseek-v4-flash")
+        self.assertEqual(thinker._model_for_function("life_context_compact"), "qwen2.5:7b")
+        self.assertEqual(thinker._model_for_function("memory_experience_workspace"), "qwen2.5:7b")
 
     def test_local_thinking_priority_queue_runs_life_tick_before_memory(self) -> None:
         thinker = LocalThinking(
@@ -1108,6 +1322,59 @@ class LifeRuntimeTests(unittest.TestCase):
         self.assertIsNone(session.inner_stream_loop)
         self.assertIsNone(session.autonomous_step)
         self.assertEqual(runtime.submitted[-1], event)
+
+    def test_expression_intent_does_not_overwrite_explicit_tool_message(self) -> None:
+        plan = {
+            "actions": [
+                {
+                    "tool": "send_qq_message",
+                    "args": {"message": "那——是遇到什么好事了？还是看到什么好玩的？"},
+                }
+            ]
+        }
+
+        result = life_runtime_mod._attach_expression_intent(
+            plan,
+            "我想回他一句：那——是遇到什么好事了？还是看到什么好玩的？",
+        )
+
+        args = result["actions"][0]["args"]
+        self.assertEqual(args["message"], "那——是遇到什么好事了？还是看到什么好玩的？")
+        self.assertEqual(args["_intent"], "我想回他一句：那——是遇到什么好事了？还是看到什么好玩的？")
+
+    def test_life_runtime_stop_does_not_shutdown_action_runtime_while_thread_is_alive(self) -> None:
+        class AliveThread:
+            def __init__(self) -> None:
+                self.joined = False
+
+            def is_alive(self) -> bool:
+                return True
+
+            def join(self, timeout=None) -> None:
+                self.joined = True
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.flushed = False
+                self.shutdown_called = False
+
+            def flush_pending(self) -> None:
+                self.flushed = True
+
+            def shutdown(self, **kwargs) -> None:
+                self.shutdown_called = True
+
+        runtime = object.__new__(LifeRuntime)
+        runtime._stop = threading.Event()
+        runtime._wake = threading.Event()
+        runtime._thread = AliveThread()
+        runtime.action_runtime = Runtime()
+        runtime.session = DummySession()
+
+        runtime.stop(wait=True, timeout=0.01)
+
+        self.assertTrue(runtime.action_runtime.flushed)
+        self.assertFalse(runtime.action_runtime.shutdown_called)
 
 
 if __name__ == "__main__":

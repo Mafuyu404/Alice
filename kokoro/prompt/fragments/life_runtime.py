@@ -38,10 +38,7 @@ def register(registry: PromptRegistry) -> None:
         user_values=lambda ctx: {
             "name": ctx.character_name or ctx.character_id or "AI",
             "action_intent": ctx.get("action_intent", "(none)") or "(none)",
-            "inner_stream": ctx.get("inner_stream", "(empty)") or "(empty)",
-            "time_context": ctx.get("time_context", "(none)") or "(none)",
             "event_batch": ctx.get("event_batch", "(none)") or "(none)",
-            "context_digest": ctx.get("context_digest", "(none)") or "(none)",
             "recent_self_expressions": ctx.get("recent_self_expressions", "(none)") or "(none)",
             "tool_capabilities": ctx.get("tool_capabilities", "(none)") or "(none)",
         },

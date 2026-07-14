@@ -6,15 +6,6 @@
 最近进入的信息：
 {{ event_batch }}
 
-当前 inner_stream：
-{{ inner_stream }}
-
-时间观念：
-{{ time_context }}
-
-最近连续经历：
-{{ context_digest }}
-
 最近已发送表达：
 {{ recent_self_expressions }}
 

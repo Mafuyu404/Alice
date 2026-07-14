@@ -137,7 +137,7 @@ class ActionRuntime:
                 "tool_timeout": self.tool_context.get("tool_timeout"),
             },
         )
-        lifecycle_debug.log("action_runtime.tool_lifecycle.start", action=action, context=ctx.data)
+        lifecycle_debug.log("action_runtime.tool_lifecycle.start", action=action, context=_context_summary(ctx.data))
         return self.registry.execute(ctx, action)
 
     def _publish_started(self, batch: ActionBatch, action: Action) -> None:
@@ -324,3 +324,23 @@ def _normalize_priority(priority: object) -> input_events.InputPriority:
     if text in ("low", "normal", "high", "urgent"):
         return text  # type: ignore[return-value]
     return "normal"
+
+
+def _context_summary(data: dict) -> dict:
+    summary: dict = {}
+    for key, value in dict(data or {}).items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            summary[str(key)] = value
+        elif isinstance(value, (list, tuple, set, dict)):
+            try:
+                summary[str(key)] = {
+                    "type": type(value).__name__,
+                    "size": len(value),
+                }
+            except Exception:
+                summary[str(key)] = {"type": type(value).__name__}
+        elif callable(value):
+            summary[str(key)] = {"type": "callable", "name": getattr(value, "__name__", type(value).__name__)}
+        else:
+            summary[str(key)] = {"type": type(value).__name__}
+    return summary

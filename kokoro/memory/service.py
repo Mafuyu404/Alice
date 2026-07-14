@@ -92,15 +92,15 @@ class MemorySystem:
         )
         if draft is None:
             return None
-        record = self.store.write(draft)
+        record, merged = self.store.write_or_merge(draft)
         self.index.sync_record(content=record.content, summary=record.summary, tags=record.tags)
-        self.working_context.append_recent_memory(record.summary or record.content, source="written")
+        self.working_context.append_recent_memory(record.summary or record.content, source="merged" if merged else "written")
         return record
 
     def write_draft(self, draft: MemoryRecordDraft):
-        record = self.store.write(draft)
+        record, merged = self.store.write_or_merge(draft)
         self.index.sync_record(content=record.content, summary=record.summary, tags=record.tags)
-        self.working_context.append_recent_memory(record.summary or record.content, source="written")
+        self.working_context.append_recent_memory(record.summary or record.content, source="merged" if merged else "written")
         return record
 
     def default_context(self, **kwargs) -> str:

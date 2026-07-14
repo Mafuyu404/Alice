@@ -163,11 +163,14 @@ class LifeRuntime:
         thread = self._thread
         if wait and thread and thread.is_alive():
             thread.join(timeout=max(0.0, float(timeout)))
+        thread_still_running = bool(thread and thread.is_alive())
+        if thread_still_running:
+            lifecycle_debug.log("life.runtime.stop.thread_still_running", timeout=timeout)
         flush_pending = getattr(self.action_runtime, "flush_pending", None)
         if callable(flush_pending):
             flush_pending()
         shutdown = getattr(self.action_runtime, "shutdown", None)
-        if callable(shutdown):
+        if callable(shutdown) and not thread_still_running:
             shutdown(wait=False)
         memory_system = getattr(self.session, "memory_system", None)
         stop_lifecycle = getattr(memory_system, "stop_lifecycle_worker", None)
@@ -207,16 +210,30 @@ class LifeRuntime:
             return LifeTickResult(processed_events=0)
         if batch:
             self._last_processed_sequence = max(item.sequence for item in batch)
+        idle_thinking = force and not batch
         inner_stream = _inner_stream_text(self.session)
         time_context = self.time.render(pending_lines=self.pool.timing_lines(batch))
         event_text = self.pool.format_batch(batch, max_chars=int(self.section.get("batch_max_chars", 4000) or 4000))
+        foreground_interaction = _is_foreground_interaction_batch(batch)
         qq_private_observations = _qq_private_observations(batch)
         for observation in qq_private_observations:
             lifecycle_debug.log("life.runtime.qq_private_observed", **observation)
         if qq_private_observations:
             self._update_recent_qq_context(qq_private_observations[-1], event_text=event_text)
-        digest = self.compactor.compact_once(time_context=time_context, inner_stream=inner_stream)
-        if qq_private_observations and _digest_may_have_lost_qq_private(digest, qq_private_observations):
+        if foreground_interaction:
+            digest = self.compactor.recent_digest()
+            lifecycle_debug.log(
+                "life.context.compact_deferred",
+                reason="foreground_interaction",
+                processed_events=len(batch),
+            )
+        else:
+            digest = self.compactor.compact_once(time_context=time_context, inner_stream=inner_stream)
+        if (
+            qq_private_observations
+            and not foreground_interaction
+            and _digest_may_have_lost_qq_private(digest, qq_private_observations)
+        ):
             lifecycle_debug.log(
                 "life.context.compact.qq_private_possible_drop",
                 observations=qq_private_observations,
@@ -235,6 +252,8 @@ class LifeRuntime:
             time_context=time_context,
             digest=digest,
             event_text=event_text,
+            foreground_interaction=foreground_interaction,
+            idle_thinking=idle_thinking,
         )
         thought, data = self._record_and_parse_thought(thought, processed_events=len(batch))
         self.time.mark_llm_thought()
@@ -319,7 +338,7 @@ class LifeRuntime:
                 plan=action_plan or {},
                 results=action_results,
             )
-        hot_path = bool(batch) or bool(action_plan_status)
+        hot_path = bool(batch) or bool(action_plan_status) or self._has_unprocessed_events()
         self._run_memory_core_cycle(defer_if_hot=hot_path)
         lifecycle_debug.log(
             "life.runtime.tick_done",
@@ -341,6 +360,9 @@ class LifeRuntime:
             action_plan_status=action_plan_status,
             action_plan_error=action_plan_error,
         )
+
+    def _has_unprocessed_events(self) -> bool:
+        return bool(self.pool.batch_since(self._last_processed_sequence, max_items=1))
 
     def _record_and_parse_thought(self, thought: str, *, processed_events: int) -> tuple[str, dict[str, Any] | None]:
         data = _extract_json(thought)
@@ -564,14 +586,20 @@ class LifeRuntime:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            woke = self._wake.wait(timeout=max(0.05, self._loop_interval))
-            self._wake.clear()
+            if self._has_unprocessed_events():
+                force_idle = False
+            else:
+                woke = self._wake.wait(timeout=max(0.05, self._loop_interval))
+                self._wake.clear()
+                force_idle = not woke and not self._has_unprocessed_events()
             if self._stop.is_set():
                 break
             try:
-                self.tick_once(force=not woke)
+                self.tick_once(force=force_idle)
             except Exception as exc:
                 lifecycle_debug.log("life.runtime.loop_error", error=str(exc))
+            if self._has_unprocessed_events():
+                continue
 
     def _interval_from_intensity(self, intensity: int) -> float:
         min_seconds = float(self.section.get("min_tick_seconds", 0.25) or 0.25)
@@ -580,13 +608,36 @@ class LifeRuntime:
         ratio = 1.0 - (value / 100.0)
         return max(min_seconds, min(max_seconds, min_seconds + (max_seconds - min_seconds) * ratio))
 
-    def _think(self, *, inner_stream: str, time_context: str, digest: str, event_text: str) -> str:
+    def _think(
+        self,
+        *,
+        inner_stream: str,
+        time_context: str,
+        digest: str,
+        event_text: str,
+        foreground_interaction: bool = False,
+        idle_thinking: bool = False,
+    ) -> str:
         character_name = str(getattr(self.session, "character_name", "") or getattr(self.session, "character_id", "AI"))
         character_profile = _character_profile_text(self.session)
         active_event_text = event_text or self._recent_qq_context_text()
         cognition_context = _cognition_context_text(self.session, event_text=active_event_text)
         memory_context = self._memory_context(event_text=active_event_text, inner_stream=inner_stream, digest=digest)
         fragment_max = int(self.section.get("context_fragment_max_chars", 4000) or 4000)
+        if foreground_interaction:
+            fragment_max = int(self.section.get("foreground_context_fragment_max_chars", 2200) or 2200)
+        elif idle_thinking:
+            fragment_max = int(self.section.get("idle_context_fragment_max_chars", 2200) or 2200)
+        event_fragment_max = int(self.section.get("event_batch_fragment_max_chars", min(fragment_max, 2400)) or 2400)
+        if foreground_interaction:
+            event_fragment_max = int(self.section.get("foreground_event_batch_fragment_max_chars", 1800) or 1800)
+        elif idle_thinking:
+            event_fragment_max = int(self.section.get("idle_event_batch_fragment_max_chars", 800) or 800)
+        max_tokens = int(self.section.get("tick_max_tokens", 640) or 640)
+        if foreground_interaction:
+            max_tokens = int(self.section.get("foreground_tick_max_tokens", min(max_tokens, 420)) or 420)
+        elif idle_thinking:
+            max_tokens = int(self.section.get("idle_tick_max_tokens", min(max_tokens, 360)) or 360)
         trace_dir = None
         debug_dir = self.section.get("prompt_trace_dir")
         if debug_dir:
@@ -609,7 +660,7 @@ class LifeRuntime:
                 "event_batch": self._context_fragment(
                     "event_batch",
                     active_event_text or "(no new external event; this can be time passing or continued thinking)",
-                    max_chars=int(self.section.get("event_batch_fragment_max_chars", min(fragment_max, 2400)) or 2400),
+                    max_chars=event_fragment_max,
                 ),
                 "pending_threads": self._context_fragment(
                     "pending_threads",
@@ -629,7 +680,7 @@ class LifeRuntime:
             messages,
             {
                 "function": "life_tick",
-                "max_tokens": int(self.section.get("tick_max_tokens", 640) or 640),
+                "max_tokens": max_tokens,
                 "timeout": int(self.section.get("tick_timeout", 90) or 90),
             },
         )
@@ -672,7 +723,6 @@ class LifeRuntime:
         if not self._available_actions:
             lifecycle_debug.log("life.runtime.tool_select.no_available_actions", action_intent=action_intent)
             return None
-        fragment_max = int(self.section.get("context_fragment_max_chars", 4000) or 4000)
         active_event_text = event_text or self._recent_qq_context_text()
         trace_dir = str(Path(self._last_prompt_trace_dir) / "tool_select") if self._last_prompt_trace_dir else None
         ctx = PromptContext(
@@ -690,42 +740,18 @@ class LifeRuntime:
                     audience="tool_select",
                     role="subject",
                 ),
-                "inner_stream": self._context_fragment(
-                    "inner_stream",
-                    inner_stream or "(empty)",
-                    max_chars=fragment_max,
-                    kind="subject_state",
-                    audience="tool_select",
-                    role="subject",
-                ),
-                "time_context": self._context_fragment(
-                    "time_awareness",
-                    time_context,
-                    max_chars=1600,
-                    kind="time",
-                    audience="tool_select",
-                    role="environment",
-                ),
                 "event_batch": self._context_fragment(
                     "event_batch",
                     active_event_text or "(none)",
-                    max_chars=int(self.section.get("tool_select_event_max_chars", 2400) or 2400),
+                    max_chars=int(self.section.get("tool_select_event_max_chars", 1200) or 1200),
                     kind="event_batch",
-                    audience="tool_select",
-                    role="environment",
-                ),
-                "context_digest": self._context_fragment(
-                    "recent_digest",
-                    digest,
-                    max_chars=fragment_max,
-                    kind="digest",
                     audience="tool_select",
                     role="environment",
                 ),
                 "recent_self_expressions": self._context_fragment(
                     "recent_self_expressions",
                     self._recent_self_expression_context(),
-                    max_chars=1600,
+                    max_chars=int(self.section.get("tool_select_recent_expression_max_chars", 800) or 800),
                     kind="recent_actions",
                     audience="tool_select",
                     role="environment",
@@ -733,7 +759,7 @@ class LifeRuntime:
                 "tool_capabilities": self._context_fragment(
                     "tool_capabilities",
                     self._tool_capabilities_text(),
-                    max_chars=max(fragment_max, 6000),
+                    max_chars=int(self.section.get("tool_select_capability_max_chars", 2600) or 2600),
                     kind="tool_catalog",
                     audience="tool_select",
                     role="system",
@@ -752,8 +778,9 @@ class LifeRuntime:
                 messages,
                 {
                     "function": "life_tool_select",
-                    "max_tokens": int(self.section.get("tool_select_max_tokens", 700) or 700),
+                    "max_tokens": int(self.section.get("tool_select_max_tokens", 320) or 320),
                     "timeout": int(self.section.get("tool_select_timeout", 60) or 60),
+                    "priority": int(self.section.get("tool_select_priority", 1) or 1),
                 },
             )
         except Exception as exc:
@@ -1090,6 +1117,7 @@ class LifeRuntime:
         actions = sorted(self._available_actions)
         schemas = self.tool_registry.enabled_schemas()
         lines = ["Registered action names: " + ", ".join(actions)]
+        description_max = int(self.section.get("tool_schema_description_max_chars", 120) or 120)
         prompt_catalog = render_tool_catalog(
             self.tool_prompt_specs,
             actions,
@@ -1110,7 +1138,7 @@ class LifeRuntime:
                 required = fn.get("parameters", {}).get("required", []) if isinstance(fn.get("parameters"), dict) else []
                 required_text = f" Required args: {', '.join(required)}." if required else ""
                 if name:
-                    lines.append(f"- {name}: {description}{required_text}")
+                    lines.append(f"- {name}: {_clip_one_line(description, description_max)}{required_text}")
         return "\n".join(lines)
 
     def _resolve_available_actions(self) -> set[str]:
@@ -1505,6 +1533,20 @@ def _qq_private_observations(batch: list[Any]) -> list[dict[str, Any]]:
     return observations
 
 
+def _is_foreground_interaction_batch(batch: list[Any]) -> bool:
+    for item in batch or []:
+        event = getattr(item, "event", None)
+        if event is None:
+            continue
+        event_type = str(getattr(event, "type", "") or "")
+        priority = str(getattr(event, "priority", "") or "")
+        if event_type == "chat_environment" and priority in {"high", "urgent"}:
+            return True
+        if event_type == "text" and priority in {"high", "urgent"}:
+            return True
+    return False
+
+
 def _digest_may_have_lost_qq_private(digest: str, observations: list[dict[str, Any]]) -> bool:
     haystack = str(digest or "")
     if not haystack.strip():
@@ -1557,6 +1599,13 @@ def _compact_snippet(text: str, *, limit: int = 500) -> str:
     if len(value) <= limit:
         return value
     return value[: max(0, limit - 1)] + "…"
+
+def _clip_one_line(text: str, limit: int) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    max_chars = max(20, int(limit or 20))
+    if len(value) <= max_chars:
+        return value
+    return value[: max(0, max_chars - 3)].rstrip() + "..."
 
 
 def _character_profile_text(session) -> str:
@@ -1752,14 +1801,13 @@ def _attach_expression_intent(plan: dict[str, Any] | None, action_intent: str) -
             item["args"] = args
         args.setdefault("_intent", intent)
         args.setdefault("_intent_key", key)
-        if expression_text:
+        has_explicit_text = bool(
+            str(args.get("message") or args.get("text") or args.get("content") or "").strip()
+        )
+        if expression_text and not has_explicit_text:
             args["message"] = expression_text
             args["text"] = expression_text
             args["content"] = expression_text
-        else:
-            args.pop("message", None)
-            args.pop("text", None)
-            args.pop("content", None)
     return plan
 
 

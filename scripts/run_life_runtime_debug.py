@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from kokoro.core import chat_session
 from kokoro.core import character as character_mod
+from kokoro.core import console as console_mod
 from kokoro.core import config as cfg
 from kokoro.core import input_events
 from kokoro.core import lifecycle_debug
@@ -22,6 +23,9 @@ from kokoro.memory import create_memory_system
 from kokoro.action.tools import qq as qq_tool
 from kokoro.action.tools import search_web as search_web_tool
 from kokoro.life.stream_patch import InnerStreamPatch, apply_inner_stream_patch
+
+
+console_mod.ensure_utf8_console()
 
 
 class DebugInnerStream:
@@ -573,8 +577,11 @@ def _trace_counts(trace_path: Path) -> dict[str, int]:
 
 
 if __name__ == "__main__":
+    import os
     import subprocess
 
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     raise SystemExit(
         subprocess.call(
             [
@@ -583,6 +590,7 @@ if __name__ == "__main__":
                 "--output-mode",
                 "life-debug",
                 *sys.argv[1:],
-            ]
+            ],
+            env=env,
         )
     )

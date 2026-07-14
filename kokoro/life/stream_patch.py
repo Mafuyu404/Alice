@@ -67,7 +67,7 @@ def apply_inner_stream_patch(current: str, patch: InnerStreamPatch, *, max_chars
             continue
         if op in {"replace", "replace_section"}:
             target = str(item.get("target") or item.get("section_hint") or "").strip()
-            replacement = str(item.get("text") or "").strip()
+            replacement = str(item.get("replacement") or item.get("text") or "").strip()
             if not replacement:
                 continue
             if target and target in text:
@@ -105,8 +105,12 @@ def _already_present(text: str, addition: str) -> bool:
     normalized_text = _normalize_for_dedupe(text)
     if normalized_addition in normalized_text:
         return True
-    existing_lines = [_normalize_for_dedupe(line) for line in str(text or "").splitlines() if line.strip()]
-    return any(_similar_enough(line, normalized_addition) for line in existing_lines)
+    existing_parts = [
+        _normalize_for_dedupe(part)
+        for part in re.split(r"\n+|[。！？!?；;]", str(text or ""))
+        if part.strip()
+    ]
+    return any(_similar_enough(part, normalized_addition) for part in existing_parts)
 
 
 def _normalize_for_dedupe(text: str) -> str:
@@ -120,7 +124,28 @@ def _similar_enough(left: str, right: str) -> bool:
     if shorter < 32:
         return False
     overlap = _longest_common_substring_len(left, right)
-    return overlap / max(1, shorter) >= 0.92
+    if overlap / max(1, shorter) >= 0.88:
+        return True
+    bigram_containment = _ngram_containment(left, right, size=2)
+    shared_long_chunks = len(_char_ngrams(left, size=4) & _char_ngrams(right, size=4))
+    return bigram_containment >= 0.45 and shared_long_chunks >= 3
+
+
+def _ngram_containment(left: str, right: str, *, size: int = 2) -> float:
+    left_grams = _char_ngrams(left, size=size)
+    right_grams = _char_ngrams(right, size=size)
+    if not left_grams or not right_grams:
+        return 0.0
+    smaller = left_grams if len(left_grams) <= len(right_grams) else right_grams
+    larger = right_grams if smaller is left_grams else left_grams
+    return len(smaller & larger) / max(1, len(smaller))
+
+
+def _char_ngrams(text: str, *, size: int) -> set[str]:
+    compact = _normalize_for_dedupe(text)
+    if len(compact) < size:
+        return set()
+    return {compact[index : index + size] for index in range(0, len(compact) - size + 1)}
 
 
 def _longest_common_substring_len(left: str, right: str) -> int:

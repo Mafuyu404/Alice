@@ -52,6 +52,33 @@ class MemoryLifeSystemTests(unittest.TestCase):
             self.assertIn("村民交易大厅", text)
             self.assertIn("铁傀儡", text)
 
+    def test_similar_memory_drafts_merge_in_real_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            system = create_memory_system(character_id="xuezhi", root=tmp)
+            first = system.write_draft(
+                MemoryRecordDraft(
+                    character_id="xuezhi",
+                    content="真冬想写一部民国初期背景的都市异能小说，枪械存在但威力较弱。",
+                    summary="民国都市异能小说设定",
+                    keywords=["民国初期", "都市异能小说", "枪械"],
+                )
+            )
+            second = system.write_draft(
+                MemoryRecordDraft(
+                    character_id="xuezhi",
+                    content="真冬聊到民国背景都市异能小说：有枪，但枪的威胁被压弱，异能者和小人物之间有空间。",
+                    summary="民国都市异能小说的枪械威胁较弱",
+                    keywords=["民国背景", "都市异能小说", "枪械", "小人物"],
+                )
+            )
+
+            recent = system.store.recent(limit=5)
+
+            self.assertEqual(first.id, second.id)
+            self.assertEqual(len(recent), 1)
+            self.assertIn("小人物", recent[0].content)
+            self.assertIn("民国初期", recent[0].content)
+
     def test_recall_formats_memory_as_prompt_safe_material(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             system = create_memory_system(character_id="xuezhi", root=tmp)

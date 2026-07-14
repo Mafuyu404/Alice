@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -115,7 +116,7 @@ class ActionToolRegistry:
         if spec is None:
             lifecycle_debug.log("tool_registry.execute.unregistered", action=action)
             return ToolResult(content=f"action is not registered: {action.action}", status="failed")
-        lifecycle_debug.log("tool_registry.execute.start", tool=spec.name, action=action, context=ctx.data)
+        lifecycle_debug.log("tool_registry.execute.start", tool=spec.name, action=action, context=_context_summary(ctx.data))
         prepared = self.prepare(ctx, action, spec=spec)
         return self.execute_prepared(ctx, prepared, spec=spec)
 
@@ -136,9 +137,16 @@ class ActionToolRegistry:
                 prepared=prepared,
             )
             return prepared
-        lifecycle_debug.log("tool_registry.prepare.start", tool=spec.name, action=action, context=ctx.data)
+        started = time.monotonic()
+        lifecycle_debug.log("tool_registry.prepare.start", tool=spec.name, action=action, context=_context_summary(ctx.data))
         prepared = spec.prepare(ctx, action)
-        lifecycle_debug.log("tool_registry.prepare.done", tool=spec.name, action=action, prepared=prepared)
+        lifecycle_debug.log(
+            "tool_registry.prepare.done",
+            tool=spec.name,
+            action=action,
+            prepared=prepared,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+        )
         return prepared
 
     def execute_prepared(
@@ -154,6 +162,7 @@ class ActionToolRegistry:
             return ToolResult(content=f"action is not registered: {prepared.action.action}", status="failed")
         executor = self._executors[spec.name]
         lifecycle_debug.log("tool_registry.execute_prepared.start", tool=spec.name, prepared=prepared)
+        started = time.monotonic()
         try:
             future = executor.submit(spec.execute, ctx, prepared)
         except RuntimeError as exc:
@@ -167,7 +176,13 @@ class ActionToolRegistry:
         try:
             raw = future.result(timeout=max(0.1, float(spec.timeout_seconds)))
             result = raw if isinstance(raw, ToolResult) else ToolResult(content=str(raw or ""))
-            lifecycle_debug.log("tool_registry.execute_prepared.result", tool=spec.name, prepared=prepared, result=result)
+            lifecycle_debug.log(
+                "tool_registry.execute_prepared.result",
+                tool=spec.name,
+                prepared=prepared,
+                result=result,
+                elapsed_seconds=round(time.monotonic() - started, 3),
+            )
         except concurrent.futures.TimeoutError:
             logger.warning("tool '%s' timed out after %.0fs", spec.name, spec.timeout_seconds)
             result = ToolResult(content=f"tool timed out: {spec.name}", status="failed")
@@ -195,3 +210,23 @@ class ActionToolRegistry:
     def shutdown(self) -> None:
         for executor in self._executors.values():
             executor.shutdown(wait=False)
+
+
+def _context_summary(data: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key, value in dict(data or {}).items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            summary[str(key)] = value
+        elif isinstance(value, (list, tuple, set, dict)):
+            try:
+                summary[str(key)] = {
+                    "type": type(value).__name__,
+                    "size": len(value),
+                }
+            except Exception:
+                summary[str(key)] = {"type": type(value).__name__}
+        elif callable(value):
+            summary[str(key)] = {"type": "callable", "name": getattr(value, "__name__", type(value).__name__)}
+        else:
+            summary[str(key)] = {"type": type(value).__name__}
+    return summary

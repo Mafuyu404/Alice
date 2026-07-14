@@ -121,17 +121,46 @@ def _tool_name(record: dict[str, Any]) -> str:
         value = record.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    for key in ("action", "prepared"):
-        value = record.get(key)
-        if isinstance(value, dict):
-            action = value.get("action")
-            if isinstance(action, str) and action.strip():
-                return action.strip()
+    found = _find_nested_tool_name(record)
+    if found:
+        return found
     metadata = record.get("metadata")
     if isinstance(metadata, dict):
         action = metadata.get("action")
         if isinstance(action, str) and action.strip():
             return action.strip()
+    return ""
+
+
+def _find_nested_tool_name(value: Any, *, depth: int = 0) -> str:
+    if depth > 8:
+        return ""
+    if isinstance(value, dict):
+        for key in ("tool", "action"):
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            if isinstance(item, (dict, list)):
+                found = _find_nested_tool_name(item, depth=depth + 1)
+                if found:
+                    return found
+        for key in ("prepared", "metadata", "result"):
+            item = value.get(key)
+            if isinstance(item, (dict, list)):
+                found = _find_nested_tool_name(item, depth=depth + 1)
+                if found:
+                    return found
+        for item in value.values():
+            if isinstance(item, (dict, list)):
+                found = _find_nested_tool_name(item, depth=depth + 1)
+                if found:
+                    return found
+    if isinstance(value, list):
+        for item in value:
+            if isinstance(item, (dict, list)):
+                found = _find_nested_tool_name(item, depth=depth + 1)
+                if found:
+                    return found
     return ""
 
 
@@ -165,6 +194,11 @@ def _dedupe_paths(paths: list[Path]) -> list[Path]:
 def _safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if callable(value):
+        return {
+            "type": "callable",
+            "name": getattr(value, "__name__", type(value).__name__),
+        }
     if dataclasses.is_dataclass(value):
         return _safe(dataclasses.asdict(value))
     if isinstance(value, dict):
@@ -185,5 +219,8 @@ def _safe(value: Any) -> Any:
             "privacy": _safe(getattr(value, "privacy", None)),
         }
     if hasattr(value, "__dict__"):
+        module = str(getattr(type(value), "__module__", "") or "")
+        if module and not module.startswith("kokoro"):
+            return {"type": type(value).__name__, "repr": repr(value)[:200]}
         return _safe(vars(value))
     return repr(value)

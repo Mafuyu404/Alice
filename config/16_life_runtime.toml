@@ -32,6 +32,19 @@ context_max_chars = 8000
 # Max completion tokens for one life tick.
 tick_max_tokens = 640
 
+# Direct foreground interaction should be quick. These only narrow the prompt
+# budget for high-priority live inputs; normal autonomous thinking keeps the
+# wider context above.
+foreground_tick_max_tokens = 420
+foreground_context_fragment_max_chars = 2200
+foreground_event_batch_fragment_max_chars = 1800
+
+# Idle thoughts should keep life moving without occupying the foreground path
+# with a long generation.
+idle_tick_max_tokens = 360
+idle_context_fragment_max_chars = 2200
+idle_event_batch_fragment_max_chars = 800
+
 # Max completion tokens when patch-first fails and asks for a full rewrite.
 fallback_max_tokens = 640
 
@@ -47,6 +60,18 @@ idle_tick_seconds = 2.0
 # Runtime maps LLM-chosen thinking_intensity onto this interval range.
 min_tick_seconds = 0.25
 max_tick_seconds = 8.0
+
+# Memory maintenance is part of the life core, but it must not block live
+# thought and direct conversation. The runtime appends memory events on the
+# foreground path and wakes the memory lifecycle worker; consolidation runs
+# outside the life loop thread.
+memory_core_inline = false
+memory_core_wake_seconds = 20.0
+
+# Tool selection sees a compact capability catalog. Tool-specific prepare and
+# after prompts still own detailed behavior.
+tool_select_capability_max_chars = 2600
+tool_schema_description_max_chars = 120
 
 [life_runtime.local_thinking]
 # Core life thinking and auxiliary prompt/tool processing use separate models.

@@ -180,9 +180,11 @@ class LocalThinking:
         return content
 
     def _model_for_function(self, function: str) -> str:
-        # The life tick is the character's central act of thought. Everything
-        # else in this caller is auxiliary processing unless explicitly routed.
-        if str(function or "").strip() in {"life_tick"}:
+        # The life tick is the character's central act of thought. Tool
+        # selection is still on the foreground path: it translates the chosen
+        # intent into executable form and must not block live dialogue behind a
+        # slow auxiliary model.
+        if str(function or "").strip() in {"life_tick", "life_tool_select"}:
             return self.primary_model
         return self.auxiliary_model
 

@@ -9,6 +9,7 @@ import json
 import subprocess
 import sys
 import time
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,13 @@ import websockets
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from kokoro.core import console as console_mod
+
+
+console_mod.ensure_utf8_console()
 
 
 @dataclass(frozen=True)
@@ -78,12 +86,17 @@ def main(argv: list[str] | None = None) -> int:
         cmd.extend(["--llm-model", str(args.model).strip()])
     if str(args.api_style or "").strip():
         cmd.extend(["--api-style", str(args.api_style).strip()])
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     process = subprocess.Popen(
         cmd,
         cwd=str(ROOT),
         stdout=stdout_path.open("w", encoding="utf-8"),
         stderr=stderr_path.open("w", encoding="utf-8"),
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
     )
     (out_dir / "pid.txt").write_text(str(process.pid), encoding="utf-8")
     try:
