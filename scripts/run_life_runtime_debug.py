@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 import time
 from datetime import datetime
@@ -154,7 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--real-memory",
         action="store_true",
-        help="Use the configured memory backend instead of NoMemoryBackend and write before/after memory snapshots.",
+        help="Use the configured vector memory backend as an index. Alice-owned role memory is always real.",
     )
     return parser
 
@@ -226,12 +227,12 @@ def main(args: argparse.Namespace | None = None) -> int:
         raise KeyError(args.character)
     backend = memory_mod.create_backend(full_config) if args.real_memory else memory_mod.NoMemoryBackend()
     memory_user_id = memory_mod.scoped_user_id(args.character)
-    _write_memory_snapshot(backend, memory_user_id, out_dir / "memory_before.json")
     memory_system = create_memory_system(
         character_id=args.character,
-        root=out_dir,
+        root=ROOT,
         vector_backend=backend,
     )
+    _write_memory_snapshot(memory_system, memory_user_id, out_dir / "memory_before.json")
     session = chat_session.ChatSession(
         character_id=args.character,
         character_data=characters[args.character],
@@ -320,7 +321,7 @@ def main(args: argparse.Namespace | None = None) -> int:
         runtime.stop(wait=True, timeout=5.0)
         _stop_runtime(qq_bridge)
         _stop_runtime(web_search_runtime)
-        _write_memory_snapshot(backend, memory_user_id, out_dir / "memory_after.json")
+        _write_memory_snapshot(memory_system, memory_user_id, out_dir / "memory_after.json")
         close = getattr(backend, "close", None)
         if callable(close):
             close()
@@ -365,7 +366,7 @@ def _apply_config_defaults(args: argparse.Namespace, config: dict) -> None:
     if not bool(getattr(args, "real_llm", False)):
         args.real_llm = bool(debug.get("real_llm", True))
     if not bool(getattr(args, "real_memory", False)):
-        args.real_memory = bool(debug.get("real_memory", False))
+        args.real_memory = bool(debug.get("real_memory", True))
     if not str(getattr(args, "llm_model", "") or "").strip():
         args.llm_model = str(
             debug.get("llm_model")
@@ -493,10 +494,14 @@ def _stop_runtime(runtime: object) -> None:
         stop()
 
 
-def _write_memory_snapshot(backend: object, user_id: str, path: Path) -> None:
+def _write_memory_snapshot(source: object, user_id: str, path: Path) -> None:
     items = []
     try:
-        list_memories = getattr(backend, "list_memories", None)
+        store = getattr(source, "store", None)
+        store_path = getattr(store, "path", None)
+        if store_path:
+            items = _export_memory_store(Path(store_path))
+        list_memories = getattr(source, "list_memories", None)
         if callable(list_memories):
             items = list_memories(user_id=user_id, limit=500)
     except Exception as exc:
@@ -505,6 +510,23 @@ def _write_memory_snapshot(backend: object, user_id: str, path: Path) -> None:
         path.write_text(json.dumps(items, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
     except Exception as exc:
         lifecycle_debug.log("life_debug.memory_snapshot_error", path=str(path), error=str(exc))
+
+
+def _export_memory_store(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with sqlite3.connect(path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            select *
+            from memory_records
+            where deleted_at = ''
+            order by created_at desc
+            limit 1000
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _tick_summaries_from_trace(trace_path: Path) -> list[dict]:

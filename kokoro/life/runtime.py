@@ -319,7 +319,8 @@ class LifeRuntime:
                 plan=action_plan or {},
                 results=action_results,
             )
-        self._run_memory_core_cycle()
+        hot_path = bool(batch) or bool(action_plan_status)
+        self._run_memory_core_cycle(defer_if_hot=hot_path)
         lifecycle_debug.log(
             "life.runtime.tick_done",
             processed_events=len(batch),
@@ -911,7 +912,7 @@ class LifeRuntime:
         except Exception as exc:
             lifecycle_debug.log("life.runtime.memory_event_append_error", event_type=event_type, error=str(exc))
 
-    def _run_memory_core_cycle(self) -> None:
+    def _run_memory_core_cycle(self, *, defer_if_hot: bool = False) -> None:
         memory_system = getattr(self.session, "memory_system", None)
         if memory_system is not None and not bool(getattr(memory_system, "inline_maintenance_enabled", True)):
             wake = getattr(memory_system, "wake_lifecycle_worker", None)
@@ -927,6 +928,9 @@ class LifeRuntime:
             return
         maintenance = getattr(memory_system, "maintenance_once", None)
         if not callable(maintenance):
+            return
+        if defer_if_hot:
+            lifecycle_debug.log("life.runtime.memory_core_deferred", hot_path=True)
             return
         now = time.monotonic()
         interval = float(self.section.get("memory_core_interval_seconds", 20.0) or 20.0)
@@ -1287,7 +1291,11 @@ class LifeRuntime:
         self.action_runtime.tool_context["recent_self_expressions"] = kept
         if duplicate is None:
             return ""
-        return "self expression already completed for this conversation; wait for new input or new information before sending again"
+        return (
+            "this expression already landed in this conversation; do not repeat the same meaning. "
+            "If there is still a real impulse, let the inner stream form a new angle, attitude, question, or feeling; "
+            "otherwise let it fade."
+        )
 
     def _apply_patch_from_thought(self, thought: str, *, inner_stream: str) -> bool:
         return self._apply_patch_from_data(_extract_json(thought), inner_stream=inner_stream)
@@ -1583,28 +1591,16 @@ def _cognition_context_text(session, *, event_text: str) -> str:
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     raw = re.sub(r"```(?:json)?\s*\n?(.*?)```", r"\1", str(text or ""), flags=re.DOTALL).strip()
-    try:
-        data = json.loads(raw)
-    except Exception:
+    repaired = _repair_extra_close_before_known_top_key(raw)
+    if repaired != raw:
+        data = _load_json_object_prefix(repaired)
+        if isinstance(data, dict):
+            return data
+    data = _load_json_object_prefix(raw)
+    if data is None:
         normalized = _normalize_json_punctuation(raw)
-        if normalized != raw:
-            try:
-                data = json.loads(normalized)
-            except Exception:
-                data = None
-            else:
-                return data if isinstance(data, dict) else None
-        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if not match:
-            return None
-        try:
-            candidate = match.group(0)
-            try:
-                data = json.loads(candidate)
-            except Exception:
-                data = json.loads(_normalize_json_punctuation(candidate))
-        except Exception:
-            return None
+        repaired = _repair_extra_close_before_known_top_key(normalized)
+        data = _load_json_object_prefix(repaired)
     return data if isinstance(data, dict) else None
 
 
@@ -1624,6 +1620,44 @@ def _json_parse_error(text: str) -> str:
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return "json root is not an object"
+
+
+def _load_json_object_prefix(text: str) -> dict[str, Any] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    decoder = json.JSONDecoder()
+    starts = [0] if raw.startswith("{") else []
+    starts.extend(match.start() for match in re.finditer(r"\{", raw))
+    seen: set[int] = set()
+    for start in starts:
+        if start in seen:
+            continue
+        seen.add(start)
+        try:
+            data, _ = decoder.raw_decode(raw[start:])
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def _repair_extra_close_before_known_top_key(text: str) -> str:
+    keys = (
+        "thinking_intensity",
+        "inner_stream_patch",
+        "action_intent",
+        "pending_threads",
+        "notes",
+    )
+    pattern = r"\}\s*\}\s*,\s*(\"(?:" + "|".join(keys) + r")\"\s*:)"
+    previous = str(text or "")
+    while True:
+        current = re.sub(pattern, r"},\1", previous)
+        if current == previous:
+            return current
+        previous = current
 
 
 def _normalize_json_punctuation(text: str) -> str:
@@ -1688,7 +1722,11 @@ def _preserve_search_query_anchors(action_plan: dict[str, Any] | None, context: 
 
 
 def _plan_has_self_expression(plan: dict[str, Any] | None) -> bool:
-    return any(tool in {"send_qq_message", "say", "say_precomputed"} for tool in _plan_tool_names(plan))
+    return any(_is_self_expression_tool(tool) for tool in _plan_tool_names(plan))
+
+
+def _is_self_expression_tool(tool: str) -> bool:
+    return str(tool or "").strip() in {"send_qq_message", "say", "say_precomputed"}
 
 
 def _attach_expression_intent(plan: dict[str, Any] | None, action_intent: str) -> dict[str, Any] | None:
@@ -1698,6 +1736,7 @@ def _attach_expression_intent(plan: dict[str, Any] | None, action_intent: str) -
     if not intent or not _plan_has_self_expression(plan):
         return plan
     key = _expression_intent_key(intent)
+    expression_text = _extract_expression_text_from_intent(intent)
     actions = plan.get("actions") or plan.get("nodes") or []
     if not isinstance(actions, list):
         return plan
@@ -1705,7 +1744,7 @@ def _attach_expression_intent(plan: dict[str, Any] | None, action_intent: str) -
         if not isinstance(item, dict):
             continue
         tool = str(item.get("tool") or item.get("action") or "").strip()
-        if tool not in {"send_qq_message", "say", "say_precomputed"}:
+        if not _is_self_expression_tool(tool):
             continue
         args = item.get("args")
         if not isinstance(args, dict):
@@ -1713,7 +1752,54 @@ def _attach_expression_intent(plan: dict[str, Any] | None, action_intent: str) -
             item["args"] = args
         args.setdefault("_intent", intent)
         args.setdefault("_intent_key", key)
+        if expression_text:
+            args["message"] = expression_text
+            args["text"] = expression_text
+            args["content"] = expression_text
+        else:
+            args.pop("message", None)
+            args.pop("text", None)
+            args.pop("content", None)
     return plan
+
+
+def _extract_expression_text_from_intent(action_intent: str) -> str:
+    text = str(action_intent or "").strip()
+    if not text:
+        return ""
+    quoted = _quoted_expression_candidates(text)
+    if quoted:
+        return quoted[-1]
+    colon = re.search(r"(?:回|说|问|告诉|回复)[^：:]{0,12}[：:]\s*(.+)$", text)
+    if colon:
+        return _clean_expression_text(colon.group(1))
+    if not re.match(r"^\s*(?:我想|想|准备|打算|要|可以|应该)", text):
+        return _clean_expression_text(text)
+    return ""
+
+
+def _quoted_expression_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    patterns = [
+        r"[“\"']([^“”\"']{1,120})[”\"']",
+        r"[‘']([^‘’']{1,120})[’']",
+        r"「([^」]{1,120})」",
+        r"『([^』]{1,120})』",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            value = _clean_expression_text(match.group(1))
+            if value:
+                candidates.append(value)
+    return candidates
+
+
+def _clean_expression_text(text: str) -> str:
+    value = str(text or "").strip()
+    value = re.split(r"\s*[—-]{2,}\s*", value, maxsplit=1)[0].strip()
+    value = re.sub(r"^(?:比如|例如|就说|可以说|先说|回复|回他|回她|问他|问她)\s*", "", value).strip()
+    value = re.sub(r"(?:。)?\s*(?:语气|口吻|感觉|效果|目的|用意|不是|不是真的|让他|让她|这样|像在).*$", "", value).strip()
+    return value.strip(" \t\r\n，,；;：:、")
 
 
 def _action_results_indicate_blocked_expression(results: dict[str, str] | None) -> bool:
@@ -1737,7 +1823,7 @@ def _first_self_expression_message(plan: dict[str, Any] | None) -> str:
         if not isinstance(item, dict):
             continue
         tool = str(item.get("tool") or item.get("action") or "").strip()
-        if tool not in {"send_qq_message", "say", "say_precomputed"}:
+        if not _is_self_expression_tool(tool):
             continue
         args = item.get("args")
         if not isinstance(args, dict):
@@ -1806,11 +1892,13 @@ def _self_expression_closure_text(
         return (
             f"刚才我已经把这个表达意图说出去了：{intent}。"
             f"实际发给对方的是：“{message}”。"
-            "这个话轮已经落地；下一刻如果还想继续，必须来自新的现场变化、对方回应，或心里真的长出了新的意思。"
+            "这句话已经落地；下一刻可以等，也可以因为真实余波继续长出新的说法。"
+            "继续表达时要来自新的角度、态度、追问或情绪，不要重复同一个意思。"
         )
     return (
         f"刚才我已经对外说了：“{message}”。"
-        "这个话轮已经落地；下一刻如果还想继续，必须来自新的现场变化、对方回应，或心里真的长出了新的意思。"
+        "这句话已经落地；下一刻可以等，也可以因为真实余波继续长出新的说法。"
+        "继续表达时要来自新的角度、态度、追问或情绪，不要重复同一个意思。"
     )
 
 

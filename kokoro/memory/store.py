@@ -63,17 +63,18 @@ class MemoryStore:
             row = conn.execute("select * from memory_records where id = ? and deleted_at = ''", (record_id,)).fetchone()
         return MemoryRecord.from_row(row) if row else None
 
-    def search(self, query: str, *, limit: int = 8) -> list[MemoryRecord]:
-        terms = _keywords(query)
+    def search(self, query: str, *, limit: int = 8, use_access: bool = True) -> list[MemoryRecord]:
+        terms = _query_terms(query)
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 "select * from memory_records where character_id = ? and deleted_at = ''",
                 (self.character_id,),
             ).fetchall()
         records = [MemoryRecord.from_row(row) for row in rows]
+        term_weights = _term_weights(terms, records)
         now_ranked: list[MemoryRecord] = []
         for record in records:
-            record.score = self._score(record, terms)
+            record.score = self._score(record, terms, term_weights, use_access=use_access)
             if record.score > 0:
                 now_ranked.append(record)
         now_ranked.sort(key=lambda item: item.score, reverse=True)
@@ -165,20 +166,29 @@ class MemoryStore:
                             (inc, inc, now, now, link["to_memory_id"]),
                         )
 
-    def _score(self, record: MemoryRecord, terms: list[str]) -> float:
+    def _score(
+        self,
+        record: MemoryRecord,
+        terms: list[str],
+        term_weights: dict[str, float],
+        *,
+        use_access: bool = True,
+    ) -> float:
         text = " ".join([record.content, record.summary, " ".join(record.keywords), " ".join(record.tags)]).lower()
         if not terms:
             lexical = 0.1
         else:
-            hits = sum(1 for term in terms if term.lower() in text)
-            lexical = hits / max(1, len(terms))
+            hit_strength = sum(term_weights.get(term, 1.0) for term in terms if term.lower() in text)
+            lexical = hit_strength / max(4.0, min(18.0, sum(term_weights.values())))
         if lexical <= 0 and record.record_form != "open_thread":
             return 0.0
-        access = min(0.25, math.log1p(record.access_count) * 0.05)
-        importance = record.importance * 0.25
-        emotional = abs(record.emotional_impact) * 0.08
-        open_thread = 0.12 if record.record_form == "open_thread" else 0.0
-        return lexical + access + importance + emotional + open_thread
+        if lexical <= 0:
+            return 0.03 if record.record_form == "open_thread" else 0.0
+        access = min(0.12, math.log1p(record.access_count) * 0.025) if use_access else 0.0
+        importance = clamp01(record.importance, 0.5) * 0.18
+        emotional = abs(record.emotional_impact) * 0.06
+        open_thread = 0.04 if record.record_form == "open_thread" else 0.0
+        return lexical * (1.0 + importance + emotional + access) + open_thread
 
     def _link_new_record(self, record_id: str) -> None:
         recent = self.recent(limit=8)
@@ -253,9 +263,66 @@ def _clean_list(values: list[Any]) -> list[str]:
 
 
 def _keywords(text: str) -> list[str]:
-    raw = re.findall(r"[\w\u4e00-\u9fff]{2,}", str(text or "").lower())
+    raw = _text_terms(text)
     result: list[str] = []
     for item in raw:
         if item not in result:
             result.append(item)
     return result[:24]
+
+
+def _query_terms(text: str) -> list[str]:
+    raw = _text_terms(text)
+    terms: list[str] = []
+    for item in raw:
+        if item not in terms:
+            terms.append(item)
+    for token in list(terms):
+        for gram in _cjk_ngrams(token):
+            if gram not in terms:
+                terms.append(gram)
+    return terms[:128]
+
+
+def _text_terms(text: str) -> list[str]:
+    return re.findall(r"[\u4e00-\u9fff]{2,}|[a-z0-9_]{2,}", str(text or "").lower())
+
+
+def _cjk_ngrams(text: str) -> list[str]:
+    grams: list[str] = []
+    for match in re.finditer(r"[\u4e00-\u9fff]{4,}", str(text or "")):
+        chars = match.group(0)
+        for size in (2, 3):
+            for index in range(0, max(0, len(chars) - size + 1)):
+                gram = chars[index : index + size]
+                if gram not in grams:
+                    grams.append(gram)
+    return grams
+
+
+def _term_weights(terms: list[str], records: list[MemoryRecord]) -> dict[str, float]:
+    if not terms:
+        return {}
+    texts = [
+        " ".join([record.content, record.summary, " ".join(record.keywords), " ".join(record.tags)]).lower()
+        for record in records
+    ]
+    total = max(1, len(texts))
+    weights: dict[str, float] = {}
+    for term in terms:
+        lowered = term.lower()
+        doc_hits = sum(1 for text in texts if lowered in text)
+        rarity = math.log((total + 1) / (doc_hits + 1)) + 1.0
+        weights[term] = _term_specificity(term) * rarity
+    return weights
+
+
+def _term_specificity(term: str) -> float:
+    text = str(term or "")
+    if re.fullmatch(r"[\u4e00-\u9fff]+", text):
+        if len(text) <= 2:
+            return 0.45
+        if len(text) == 3:
+            return 0.9
+        return min(2.2, 1.2 + len(text) * 0.12)
+    return min(2.0, 0.7 + len(text) * 0.08)

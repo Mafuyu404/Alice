@@ -201,6 +201,90 @@ class MemoryLifeSystemTests(unittest.TestCase):
             self.assertNotIn("old backend", context)
 
 
+    def test_memory_search_splits_continuous_cjk_query(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            system = create_memory_system(character_id="xuezhi", root=tmp)
+            system.remember(
+                "\u771f\u51ac\u60f3\u5199\u90fd\u5e02\u5f02\u80fd\u5c0f\u8bf4\uff0c"
+                "\u80cc\u666f\u8bbe\u5b9a\u5728\u6c11\u56fd\u521d\u671f\uff0c"
+                "\u67aa\u68b0\u5b58\u5728\u4f46\u5a01\u529b\u8f83\u5f31\u3002",
+                importance="medium",
+            )
+
+            recalled = system.deep_recall(
+                "\u6c11\u56fd\u65f6\u671f\u80cc\u666f\u90fd\u5e02\u5f02\u80fd\u5c0f\u8bf4",
+                limit=5,
+            )
+
+            self.assertIn("\u90fd\u5e02\u5f02\u80fd\u5c0f\u8bf4", recalled)
+            self.assertIn("\u6c11\u56fd\u521d\u671f", recalled)
+
+    def test_default_context_anchors_current_event_before_old_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            system = create_memory_system(character_id="xuezhi", root=tmp)
+            distractor = system.remember(
+                "\u96ea\u5431\u7814\u7a76 Minecraft \u6a21\u7ec4\u65f6\uff0c"
+                "\u5173\u6ce8 loot progression \u548c Fabric Forge \u533a\u522b\u3002",
+                importance="high",
+            )
+            target = system.remember(
+                "\u771f\u51ac\u60f3\u5199\u4e00\u90e8\u90fd\u5e02\u5f02\u80fd\u5c0f\u8bf4\uff0c"
+                "\u80cc\u666f\u8bbe\u5b9a\u5728\u6c11\u56fd\u521d\u671f\uff0c"
+                "\u6709\u67aa\u68b0\u4f46\u5a01\u529b\u8f83\u5f31\u3002",
+                importance="medium",
+            )
+            self.assertIsNotNone(distractor)
+            self.assertIsNotNone(target)
+            system.store.record_access([distractor.id], diffuse=False)
+            system.store.record_access([distractor.id], diffuse=False)
+            event_text = (
+                "\u3010QQ\u73af\u5883\u3011\n"
+                "\u4f4d\u7f6e\uff1aQQ\u79c1\u804a \u771f\u51ac\n"
+                "\u73b0\u573a\u8bf4\u660e\uff1a\u8fd9\u662f\u5f53\u524dQQ\u79c1\u804a\u73b0\u573a\u7684\u4e00\u90e8\u5206\u3002\n"
+                "\u793e\u4ea4\u4fe1\u53f7\uff1a\u771f\u51ac\uff1a\u79c1\u804a\u91cc\u50cf\u662f\u5728\u629b\u95ee\u9898 -> "
+                "\u6628\u5929\u6211\u8bf4\u5230\u6211\u60f3\u5199\u5c0f\u8bf4\uff0c\u4f60\u8fd8\u8bb0\u5f97\u5417\n"
+                "\u6700\u8fd1\u6d88\u606f\uff1a\n"
+                "[15:33:49] \u771f\u51ac: \u6628\u5929\u6211\u8bf4\u5230\u6211\u60f3\u5199\u5c0f\u8bf4\uff0c\u4f60\u8fd8\u8bb0\u5f97\u5417\n"
+                "[15:35:53] \u771f\u51ac: \u90a3\u4f60\u8bf4\u8bf4\u5177\u4f53\u7684\u80cc\u666f\u8bbe\u5b9a\u662f\u4ec0\u4e48\u6837\u7684"
+            )
+
+            context = system.default_context(
+                event_text=event_text,
+                inner_stream="\u8fd8\u5728\u60f3 Minecraft \u6a21\u7ec4\u548c loot progression\u3002",
+                recent_digest="\u521a\u624d\u5728\u7814\u7a76 Minecraft \u6a21\u7ec4\u3002",
+            )
+
+            self.assertIn("\u90fd\u5e02\u5f02\u80fd\u5c0f\u8bf4", context)
+            self.assertIn("\u6c11\u56fd\u521d\u671f", context)
+
+    def test_memory_search_relevance_beats_generic_importance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            system = create_memory_system(character_id="xuezhi", root=tmp)
+            distractor = system.remember(
+                "\u96ea\u5431\u5f00\u59cb\u7814\u7a76 Minecraft loot progression \u548c Fabric Forge\u3002",
+                importance="high",
+            )
+            target = system.remember(
+                "\u771f\u51ac\u60f3\u5199\u4e00\u90e8\u90fd\u5e02\u5f02\u80fd\u5c0f\u8bf4\uff0c"
+                "\u80cc\u666f\u8bbe\u5b9a\u5728\u6c11\u56fd\u521d\u671f\uff0c"
+                "\u6709\u67aa\u68b0\u4f46\u5a01\u529b\u8f83\u5f31\u3002",
+                importance="medium",
+            )
+            self.assertIsNotNone(distractor)
+            self.assertIsNotNone(target)
+            system.store.record_access([distractor.id], diffuse=False)
+            system.store.record_access([distractor.id], diffuse=False)
+
+            hits = system.store.search(
+                "\u6628\u5929\u6211\u8bf4\u5230\u60f3\u5199\u5c0f\u8bf4\uff0c"
+                "\u5177\u4f53\u80cc\u666f\u8bbe\u5b9a\u662f\u4ec0\u4e48\uff1f",
+                limit=5,
+                use_access=False,
+            )
+
+            self.assertGreater(len(hits), 0)
+            self.assertEqual(hits[0].id, target.id)
+
     def test_memory_lifecycle_sediments_event_log_by_llm_decision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             def llm_call(messages, options):

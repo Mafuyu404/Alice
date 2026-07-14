@@ -89,6 +89,7 @@ def _audit_message(ctx: tool_spec.ToolContext, *, message: str, reason: str) -> 
         "日常寒暄、问今天忙什么、问最近怎么样、追问对方刚说的事、轻微调侃、半成品表达和关系表达都不是事实越界。\n"
         "不要把对话内的夸张、反问、昵称调侃或关系玩笑当成外部事实声明；它们通常是在接现场语气，不需要按字面证明成长期事实。\n"
         "只有明确硬边界才阻止：发到错误对象；编造最近现场没有出现过的人、群、消息或事件；把外部搜索/研究结果说成已经发生；用助手建议口吻代替角色本人说话。\n"
+        "如果准备发送的文本包含给生成器看的写作说明、语气说明、效果说明或行动说明，而不是角色会直接发给对方的话，这属于 assistant_style。\n"
         "只输出 JSON object：{\"allow\":true|false,\"block_type\":\"none|wrong_target|fabricated_scene_fact|unsupported_external_fact|assistant_style\",\"reason\":\"简短原因\",\"message\":\"可选的更贴近现场的自然消息\"}。\n"
         "只有 block_type 是 wrong_target、fabricated_scene_fact、unsupported_external_fact 或 assistant_style 时才能 allow=false；其他情况 block_type 必须是 none。\n"
         "如果不能确定，倾向于允许并在 reason 里说明不确定点。"

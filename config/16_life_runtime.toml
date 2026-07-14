@@ -68,7 +68,7 @@ timeout = 20
 # Defaults for `python cli.py --life-debug --character lerwa`.
 # Keep operational choices here instead of repeating long command-line flags.
 real_llm = true
-real_memory = false
+real_memory = true
 debug_run = true
 qq = true
 duration_seconds = 1200.0

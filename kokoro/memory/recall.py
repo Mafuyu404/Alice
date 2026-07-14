@@ -48,14 +48,22 @@ class MemoryRecall:
         pending_threads: str = "",
         limit: int = 6,
     ) -> str:
-        query = "\n".join(
+        parts = [
             part
             for part in (event_text, inner_stream, recent_digest, recent_memory_digest, pending_threads)
             if str(part or "").strip()
-        )
+        ]
+        query = "\n".join(parts)
         if not query.strip():
             query = inner_stream or recent_digest or recent_memory_digest or pending_threads
-        result = self.recall(query, limit=limit, include_vector=False, record_usage=False)
+        if not query.strip():
+            return ""
+
+        result = self.recall(query, limit=limit, include_vector=False, record_usage=False, use_access=False)
+        event_query = _event_recall_query(event_text)
+        if event_query:
+            event_result = self.recall(event_query, limit=limit, include_vector=False, record_usage=False, use_access=False)
+            result = _merge_recall_results(event_result, result, focus_limit=min(3, max(1, int(limit))), side_limit=4)
         return self.format_for_prompt(result)
 
     def deep_recall(self, query: str, *, limit: int = 8) -> str:
@@ -69,11 +77,12 @@ class MemoryRecall:
         limit: int = 8,
         include_vector: bool = True,
         record_usage: bool = True,
+        use_access: bool = True,
     ) -> RecallResult:
         query = str(query or "").strip()
         if not query:
             return RecallResult()
-        hits = self.store.search(query, limit=limit)
+        hits = self.store.search(query, limit=limit, use_access=use_access)
         focus = hits[: max(1, min(3, len(hits)))]
         side: list[MemoryRecord] = []
         faint: list[str] = []
@@ -137,6 +146,59 @@ class MemoryRecall:
 
     def _vector_context(self, query: str) -> str:
         return self.index.context(query) if self.index is not None else ""
+
+
+def _merge_recall_results(primary: RecallResult, secondary: RecallResult, *, focus_limit: int, side_limit: int) -> RecallResult:
+    focus: list[MemoryRecord] = []
+    side: list[MemoryRecord] = []
+    faint: list[str] = []
+    seen: set[str] = set()
+
+    def add_focus(record: MemoryRecord) -> None:
+        if record.id in seen:
+            return
+        if len(focus) < focus_limit:
+            focus.append(record)
+        elif len(side) < side_limit:
+            side.append(record)
+        else:
+            faint.append(_short_hint(record))
+        seen.add(record.id)
+
+    def add_side(record: MemoryRecord) -> None:
+        if record.id in seen:
+            return
+        if len(side) < side_limit:
+            side.append(record)
+        else:
+            faint.append(_short_hint(record))
+        seen.add(record.id)
+
+    for record in primary.focus:
+        add_focus(record)
+    for record in secondary.focus:
+        add_focus(record)
+    for record in primary.side:
+        add_side(record)
+    for record in secondary.side:
+        add_side(record)
+    for hint in primary.faint + secondary.faint:
+        if hint and hint not in faint:
+            faint.append(hint)
+
+    vector_text = primary.vector_text or secondary.vector_text
+    return RecallResult(focus=focus, side=side[:side_limit], faint=faint[:5], vector_text=vector_text)
+
+
+def _event_recall_query(event_text: str) -> str:
+    text = str(event_text or "").strip()
+    if not text:
+        return ""
+    marker = "最近消息："
+    if marker in text:
+        tail = text.rsplit(marker, 1)[-1].strip()
+        return tail or text
+    return text
 
 
 def _record_line(record: MemoryRecord, *, compact: bool = False) -> str:
